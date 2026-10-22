@@ -1,7 +1,7 @@
 # StayProductive
 
 An open-source focus and self-control app for Linux, built to be **behaviourally
-compatible** with Stay Focused 13.0.2 on Android: app and website blocking,
+compatible** with Stay Focused 13 on Android: app and website blocking,
 time limits, schedules, profiles, strict mode, content filtering, usage
 statistics, and the companion tools around them — reimplemented natively for the
 Linux desktop.
