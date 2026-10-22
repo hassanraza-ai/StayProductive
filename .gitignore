@@ -1,0 +1,48 @@
+# Third-party reference material — never commit
+/reference/*
+!/reference/README.md
+
+# Build output
+/target/
+/dist/
+/build/
+**/*.rs.bk
+*.apk
+*.aab
+*.apks
+*.so
+*.dylib
+*.dll
+
+# Local state and databases
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+/state.json
+*.stayproductive.zip
+
+# Packaging artifacts
+/packaging/out/
+*.deb
+*.rpm
+*.flatpak
+*.AppImage
+
+# Secrets and local configuration
+.env
+.env.*
+*.pem
+*.p12
+*.jks
+*.keystore
+
+# Editors and OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.iml
