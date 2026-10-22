@@ -22,6 +22,19 @@ licensed.
 | Implementation | **M0 core engine in progress**, see `crates/core` and [`docs/spec/implementation-notes.md`](docs/spec/implementation-notes.md) |
 | Runtime parity verification | impossible against the reference without a device; parity is defined by the acceptance suite |
 
+## Try the engine
+
+The core decision engine is runnable today, without a desktop session:
+
+```sh
+cargo run -p stayproductive-core --example demo
+```
+
+It walks through schedules, keyword/site rules, daily limits, pause, strict
+mode, quick blocks, and a commitment, printing the verdict, reason code, end
+time, and rule owner for each decision. There is no daemon or GUI yet, so the
+demo feeds observations to the engine directly and does not block real apps.
+
 ## What "identical behaviour" means here
 
 The goal is feature and behaviour parity as a user experiences it, not
