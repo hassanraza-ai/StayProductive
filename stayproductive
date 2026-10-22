@@ -1,0 +1,10 @@
+#!/bin/sh
+# Launch the real StayProductive desktop application.
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$ROOT"
+
+cargo build --quiet --release -p stayproductive-daemon
+PYTHONPATH="$ROOT/crates/ui${PYTHONPATH:+:$PYTHONPATH}" \
+  exec python3 -m stayproductive "$@"

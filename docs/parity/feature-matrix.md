@@ -9,9 +9,15 @@ behavioural parity; **P2** = platform extra / honest gap.
 Status values: `todo`, `wip`, `done`, `gap` (documented, deliberately not
 implemented), `decision` (blocked on a product/architecture decision).
 
-`wip` means the **core** behaviour and its acceptance scenario are
-implemented in `crates/core`; daemon, adapter, UI, or persistence evidence is
-still outstanding. See [`../spec/implementation-notes.md`](../spec/implementation-notes.md).
+`wip` means some implementation exists (core, daemon, or GTK UI) but at least
+one required layer or automated acceptance evidence is still outstanding. See
+[`../spec/implementation-notes.md`](../spec/implementation-notes.md).
+
+The runnable build (October 2026) has the core engine, a local JSON state
+service, and a GTK 4 + libadwaita UI. It does **not** include a desktop
+enforcement adapter, so every row whose user-visible result depends on blocking
+a real app, window, or browser remains `wip` or `todo` even when its rules,
+state, and UI are present. The app reports enforcement as offline.
 
 ## 1. Profiles and rules
 
@@ -20,7 +26,7 @@ still outstanding. See [`../spec/implementation-notes.md`](../spec/implementatio
 | F-PROF-01 | Create, rename, duplicate, delete profiles | P0 | core + SQLite | domain §3 | A-PROF-01 | wip |
 | F-PROF-02 | Activate a profile manually; deactivate it | P0 | D-Bus + UI | sched §6 | A-PROF-02 | wip |
 | F-PROF-03 | Only one manually activated profile at a time | P0 | engine invariant | domain §4 | A-PROF-03 | wip |
-| F-PROF-04 | Profile templates (Focus, Sleep, Detox, Exam, …) | P1 | bundled presets | sched §7 | A-PROF-04 | todo |
+| F-PROF-04 | Profile templates (Focus, Sleep, Detox, Exam, …) | P1 | bundled presets | sched §7 | A-PROF-04 | wip |
 | F-PROF-05 | Copy items from an existing profile | P1 | UI | ux §4 | A-PROF-05 | wip |
 | F-PROF-06 | Mark profile as strict-mode eligible | P1 | engine | strict §3 | A-PROF-06 | wip |
 | F-RULE-01 | Block selected apps | P0 | compositor adapter | block §5 | A-RULE-01 | wip |
@@ -64,17 +70,17 @@ still outstanding. See [`../spec/implementation-notes.md`](../spec/implementatio
 
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-STR-01 | Activate strict mode until an expiry time | P0 | commitment state | strict §4 | A-STR-01 | todo |
+| F-STR-01 | Activate strict mode until an expiry time | P0 | commitment state | strict §4 | A-STR-01 | wip |
 | F-STR-02 | Activate strict mode for a schedule | P1 | commitment state | strict §4 | A-STR-02 | todo |
-| F-STR-03 | Cool-down deactivation with visible timer | P0 | timer + state | strict §5 | A-STR-03 | todo |
+| F-STR-03 | Cool-down deactivation with visible timer | P0 | timer + state | strict §5 | A-STR-03 | wip |
 | F-STR-04 | Random-text challenge | P1 | challenge | strict §5 | A-STR-04 | todo |
 | F-STR-05 | QR challenge using a saved code | P1 | challenge | strict §5 | A-STR-05 | todo |
 | F-STR-06 | Friend approval (optional, self-hosted) | P2 | HTTP + state | strict §5 | A-STR-06 | decision |
 | F-STR-07 | Password gates app/settings/edits | P1 | argon2id + policy | strict §6 | A-STR-07 | todo |
 | F-STR-08 | Block phone-settings access while locked | P1 | portal/overlay | strict §6 | A-STR-08 | todo |
-| F-STR-09 | Block restriction edits while locked | P0 | policy | strict §6 | A-STR-09 | todo |
+| F-STR-09 | Block restriction edits while locked | P0 | policy | strict §6 | A-STR-09 | wip |
 | F-STR-10 | Lock mode with normal-mode exit | P1 | state machine | strict §6 | A-STR-10 | todo |
-| F-STR-11 | Survive restart; commitment cannot be silently cleared | P0 | atomic store | strict §7 | A-STR-11 | todo |
+| F-STR-11 | Survive restart; commitment cannot be silently cleared | P0 | atomic store | strict §7 | A-STR-11 | wip |
 | F-STR-12 | Uninstall/settings hardening | — | no safe equivalent | strict §8 | — | gap |
 | F-STR-13 | Strict alarm with challenge | P2 | timer + challenge | strict §9 | A-STR-13 | todo |
 
@@ -109,13 +115,13 @@ still outstanding. See [`../spec/implementation-notes.md`](../spec/implementatio
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | F-UX-01 | Onboarding: purpose, permissions, first profile | P0 | GTK wizard | ux §2 | A-UX-01 | todo |
-| F-UX-02 | Dashboard: status, profile, remaining time, quick actions | P0 | GTK | ux §3 | A-UX-02 | todo |
+| F-UX-02 | Dashboard: status, profile, remaining time, quick actions | P0 | GTK | ux §3 | A-UX-02 | wip |
 | F-UX-03 | Block screen explains reason and end time | P0 | overlay | ux §5 | A-UX-03 | todo |
 | F-UX-04 | Break countdown screen | P1 | overlay | ux §5 | A-UX-04 | todo |
-| F-UX-05 | Profile editor with apps, sites, keywords, limits | P0 | GTK | ux §4 | A-UX-05 | todo |
-| F-UX-06 | Schedule editor per schedule type | P0 | GTK | ux §4 | A-UX-06 | todo |
-| F-UX-07 | Strict-mode setup and deactivation flows | P1 | GTK | ux §6 | A-UX-07 | todo |
-| F-UX-08 | Settings: start of day, notifications, autostart, theme | P1 | GTK | ux §8 | A-UX-08 | todo |
+| F-UX-05 | Profile editor with apps, sites, keywords, limits | P0 | GTK | ux §4 | A-UX-05 | wip |
+| F-UX-06 | Schedule editor per schedule type | P0 | GTK | ux §4 | A-UX-06 | wip |
+| F-UX-07 | Strict-mode setup and deactivation flows | P1 | GTK | ux §6 | A-UX-07 | wip |
+| F-UX-08 | Settings: start of day, notifications, autostart, theme | P1 | GTK | ux §8 | A-UX-08 | wip |
 | F-UX-09 | Tray icon with pause/resume/quick block | P1 | StatusNotifier | ux §9 | A-UX-09 | todo |
 | F-UX-10 | Keyboard-first navigation and screen-reader labels | P0 | GTK/a11y | ux §10 | A-UX-10 | todo |
 | F-UX-11 | Localisation-ready strings | P1 | gettext | ux §10 | A-UX-11 | todo |
@@ -146,7 +152,22 @@ still outstanding. See [`../spec/implementation-notes.md`](../spec/implementatio
 | F-DATA-03 | Daemon/UI version skew tolerated | P1 | IPC versioning | arch §8 | A-DATA-03 | todo |
 | F-DATA-04 | Full local reset with confirmation | P1 | store | ux §8 | A-DATA-04 | todo |
 
-## Milestones
+## Current build evidence (October 2026)
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --check` | pass |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| `cargo test` | pass, including 32 acceptance tests and the daemon protocol test |
+| `cargo build --release -p stayproductive-daemon` | pass |
+| GTK app launch | pass on X11/XWayland with GTK 4 and libadwaita |
+| Dashboard, profiles, schedules, strict, activity, settings | rendered from live daemon state and manually inspected |
+| Profile editor round-trip | created and updated a scheduled profile with apps, site daily limit, keywords, allowlist, and multiple windows; persisted state re-read correctly |
+| Strict cool-down | core test rejects `finish_commitment_end` before the cool-down and accepts it afterwards; locked edits/pauses are rejected |
+| Desktop blocking | **not measured; not implemented** |
+
+Manual UI inspection is not a substitute for the acceptance suite. Rows that
+depend on the UI remain `wip` until their `A-UX-*` scenarios are automated.
 
 | Milestone | Contents | Exit criterion |
 | --- | --- | --- |

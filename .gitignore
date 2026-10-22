@@ -14,6 +14,11 @@
 *.dylib
 *.dll
 
+# Python frontend
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
 # Local state and databases
 *.db
 *.db-wal

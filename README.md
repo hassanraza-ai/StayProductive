@@ -6,11 +6,12 @@ time limits, schedules, profiles, strict mode, content filtering, usage
 statistics, and the companion tools around them — reimplemented natively for the
 Linux desktop.
 
-This repository currently contains the **specification and handoff pack**: the
-behavioural model, parity matrix, Linux architecture, and acceptance criteria
-needed to implement the app. The code is written clean-room from these
-documents; no code, resources, or assets from the reference app are included or
-licensed.
+This repository contains the **specification and a runnable local application**.
+The behavioural model, parity matrix, Linux architecture, and acceptance criteria
+define what to build; `crates/core` implements the deterministic engine,
+`crates/daemon` owns local state, and `crates/ui` is a GTK 4 + libadwaita desktop
+front end. Everything is written clean-room from these documents; no code,
+resources, or assets from the reference app are included or licensed.
 
 ## Status
 
@@ -19,21 +20,78 @@ licensed.
 | Behavioural analysis (static) | complete, see `docs/parity/` |
 | Product specification | complete for P0/P1, see `docs/spec/` |
 | Linux architecture | decided, see `docs/architecture/` |
-| Implementation | **M0 core engine in progress**, see `crates/core` and [`docs/spec/implementation-notes.md`](docs/spec/implementation-notes.md) |
+| Core engine | **implemented** — profiles, rules, limits, schedules, commitments, 32 acceptance scenarios |
+| Local state service | **implemented** — versioned atomic JSON, profiles, quick blocks, strict cool-down, settings |
+| Desktop UI | **implemented** — dashboard, profiles and editor, schedules, strict session, activity, settings |
+| Desktop enforcement | **not connected** — no compositor adapter yet; the app reports this honestly |
 | Runtime parity verification | impossible against the reference without a device; parity is defined by the acceptance suite |
 
-## Try the engine
+The current build is useful as a real, persistent focus planner: profiles,
+schedules, limits, strict commitments, and state survive restarts. It does not
+yet block a foreground application or website, because the compositor/browser
+adapters in `docs/architecture/linux-design.md` are not implemented. The
+dashboard and Settings page say so rather than pretending.
 
-The core decision engine is runnable today, without a desktop session:
+### Implemented today
+
+- Rust core with a pure `(state, event, now)` decision function.
+- Local state service over newline-delimited JSON on stdio; the UI never writes
+  the state file directly.
+- Versioned state at
+  `$XDG_DATA_HOME/stayproductive/state.json` (fallback
+  `~/.local/share/stayproductive/state.json`), written atomically with mode
+  `0600`, parent directory `0700`.
+- GTK 4 + libadwaita UI: dashboard, profile CRUD and editor (apps, sites,
+  keywords, allowlists, limits, pickup limits, six schedule kinds), schedules,
+  quick blocks, strict sessions with a real cool-down, activity, and settings.
+- Timezone defaults to the system zone through `iana-time-zone`; the start of day
+  and timezone are editable.
+- Strict commitments block profile edits and pauses in both the UI and the
+  daemon, and survive restart.
+
+### Not implemented yet
+
+Desktop enforcement, block overlays, tray integration, browser extension,
+DNS helper, SQLite history/migrations, usage statistics, onboarding,
+low-time notifications, backup/restore, full translation catalogs, and a
+complete screen-reader audit. These remain tracked as `todo`/`wip`/`gap` in
+[`docs/parity/feature-matrix.md`](docs/parity/feature-matrix.md).
+
+## Run the desktop app
+
+Prerequisites: Rust stable, Python 3.10+, PyGObject, GTK 4, and libadwaita 1.
 
 ```sh
-cargo run -p stayproductive-core --example demo
+./stayproductive
 ```
 
-It walks through schedules, keyword/site rules, daily limits, pause, strict
-mode, quick blocks, and a commitment, printing the verdict, reason code, end
-time, and rule owner for each decision. There is no daemon or GUI yet, so the
-demo feeds observations to the engine directly and does not block real apps.
+The launcher builds the release state service if needed and starts the GTK
+window. To use a different state file (for testing or a portable profile):
+
+```sh
+STAYPRODUCTIVE_STATE=/tmp/stayproductive-test.json ./stayproductive
+```
+
+The state service is a child of the UI. Closing the window shuts it down; the
+state is already persisted. There is no account, network call, or telemetry.
+
+On distributions where the Python GTK bindings are packaged separately, install
+`python3-gi`, `gir1.2-gtk-4.0`, and `gir1.2-adw-1` first. The app deliberately
+does not use `pip` for PyGObject.
+
+### Verify the engine
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+The acceptance suite is `crates/core/tests/acceptance.rs`; every test names the
+`A-*` identifier from `docs/acceptance/parity-tests.md`. The end-to-end service
+test is `crates/daemon/tests/protocol.rs`; it drives the real daemon binary over
+stdio and checks strict locks, the cool-down refusal, restart persistence, and
+state-file permissions.
 
 ## What "identical behaviour" means here
 
@@ -86,17 +144,25 @@ equivalent exists, the spec says so instead of pretending. See
 | [`docs/acceptance/parity-tests.md`](docs/acceptance/parity-tests.md) | Given/When/Then acceptance suite |
 | [`docs/legal/clean-room.md`](docs/legal/clean-room.md) | IP rules for contributors |
 
-## Planned stack
+## Implementation stack
 
-- **Core daemon**: Rust — deterministic rule engine, scheduler, SQLite store,
-  D-Bus service.
-- **Desktop UI**: GTK 4 + libadwaita (primary), with a documented adapter
-  boundary so a Qt/KDE front end can be added.
-- **Desktop integration**: compositor adapters (X11 EWMH, sway/i3 IPC,
+- **Core**: Rust, no runtime, no desktop dependency.
+- **Local state service**: Rust binary that owns `State` and persists versioned
+  JSON atomically. The current boundary is newline-delimited JSON over stdio;
+  the D-Bus surface in the architecture document replaces it without moving
+  decision logic out of `core`.
+- **Desktop UI**: GTK 4 + libadwaita through PyGObject. The Python layer only
+  renders state and sends commands; it contains no blocking decisions.
+- **Planned integration**: compositor adapters (X11 EWMH, sway/i3 IPC,
   Hyprland IPC, GNOME Shell extension, KWin script), browser extension
   (Manifest V3), optional privileged helper for system DNS.
-- **Packaging**: Flatpak (user mode, no system-wide blocking), `.deb`, `.rpm`,
-  Arch package, and a systemd user unit.
+- **Planned packaging**: Flatpak (user mode, no system-wide blocking), `.deb`,
+  `.rpm`, Arch package, and a systemd user unit.
+
+The architecture document still specifies SQLite, D-Bus, and gtk-rs as the
+target M1 stack. The runnable build uses JSON and PyGObject as a deliberate,
+documented first step; both are behind the same daemon boundary and can be
+replaced without changing the core engine.
 
 All features are free. There is no paywall, account requirement, telemetry, or
 cloud dependency; sync and accountability are optional and self-hostable.

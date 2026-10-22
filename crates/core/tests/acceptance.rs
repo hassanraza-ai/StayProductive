@@ -781,6 +781,60 @@ fn a_data_02_backwards_clock_jump_does_not_double_count_or_shorten_a_commitment(
 }
 
 #[test]
+fn a_con_commitment_cooldown_keeps_rules_locked_until_it_finishes() {
+    let mut state = State::fixture();
+    let profile = manual(
+        &mut state,
+        Profile::new("Focus", thu(8, 0))
+            .unwrap()
+            .block_app("firefox")
+            .unwrap(),
+        thu(8, 0),
+    );
+    let id = state
+        .add_commitment(
+            Commitment::new(
+                CommitmentKind::Strict,
+                thu(8, 0),
+                Some(thu(12, 0)),
+                stayproductive_core::DeactivationMethod::Cooldown(Duration::from_secs(600)),
+            )
+            .with_restrictions([
+                stayproductive_core::Restriction::BlockPause,
+                stayproductive_core::Restriction::BlockEdits,
+            ]),
+        )
+        .map(|_| state.commitments[0].id)
+        .unwrap();
+
+    let cooldown_end = state.request_commitment_end(id, thu(9, 0)).unwrap();
+    assert_eq!(cooldown_end, thu(9, 10));
+    assert_eq!(
+        state.request_commitment_end(id, thu(9, 2)).unwrap(),
+        cooldown_end,
+        "repeating the request must not extend the cool-down"
+    );
+    assert_eq!(
+        state.commitments[0].state,
+        stayproductive_core::CommitmentState::CoolingDown
+    );
+    assert!(state.finish_commitment_end(id, thu(9, 5)).is_err());
+    assert!(state.edits_blocked(thu(9, 5)));
+    assert!(
+        state
+            .pause_profile(profile, Some(thu(10, 0)), PauseReason::User, thu(9, 5))
+            .is_err()
+    );
+
+    state.finish_commitment_end(id, thu(9, 10)).unwrap();
+    assert!(!state.edits_blocked(thu(9, 10)));
+    assert_eq!(
+        state.commitments[0].state,
+        stayproductive_core::CommitmentState::Ended
+    );
+}
+
+#[test]
 fn a_con_06_keyword_folds_full_width_and_case() {
     let mut state = State::fixture();
     manual(

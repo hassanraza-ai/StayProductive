@@ -1,0 +1,21 @@
+[package]
+name = "stayproductive-daemon"
+description = "Local state service for StayProductive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "stayproductive-daemon"
+path = "src/main.rs"
+
+[dependencies]
+stayproductive-core = { path = "../core" }
+chrono.workspace = true
+chrono-tz.workspace = true
+iana-time-zone.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true

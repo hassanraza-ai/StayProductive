@@ -460,6 +460,11 @@ impl State {
         Ok(())
     }
 
+    /// Remove quick blocks for a target. Used when a user ends one early.
+    pub fn clear_quick_block(&mut self, target: &Target) {
+        self.quick_blocks.retain(|block| &block.target != target);
+    }
+
     /// Add a commitment. It starts enforcing immediately.
     pub fn add_commitment(&mut self, commitment: Commitment) -> Result<()> {
         if commitment
@@ -474,6 +479,13 @@ impl State {
         Ok(())
     }
 
+    /// Whether an active commitment forbids changing rules.
+    pub fn edits_blocked(&self, now: Timestamp) -> bool {
+        self.commitments
+            .iter()
+            .any(|commitment| commitment.blocks_edits(now))
+    }
+
     /// The active commitment with the latest end, if any.
     pub fn active_commitment(&self, now: Timestamp) -> Option<&Commitment> {
         self.commitments
@@ -485,6 +497,30 @@ impl State {
                     commitment.ends_at,
                 )
             })
+    }
+
+    /// Request deactivation of a commitment, starting its cool-down.
+    pub fn request_commitment_end(
+        &mut self,
+        id: CommitmentId,
+        now: Timestamp,
+    ) -> Result<Timestamp> {
+        let commitment = self
+            .commitments
+            .iter_mut()
+            .find(|commitment| commitment.id == id)
+            .ok_or(Error::UnknownCommitment(id))?;
+        commitment.request_end(now)
+    }
+
+    /// Finish deactivation after the cool-down has elapsed.
+    pub fn finish_commitment_end(&mut self, id: CommitmentId, now: Timestamp) -> Result<()> {
+        let commitment = self
+            .commitments
+            .iter_mut()
+            .find(|commitment| commitment.id == id)
+            .ok_or(Error::UnknownCommitment(id))?;
+        commitment.finish_end(now)
     }
 
     /// Extend the active block of `id` by `duration`.

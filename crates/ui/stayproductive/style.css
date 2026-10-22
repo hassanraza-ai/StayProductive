@@ -1,0 +1,149 @@
+/* StayProductive — quiet, local, information-dense. */
+
+.card {
+  background-color: @card_bg_color;
+  border-radius: 18px;
+  border: 1px solid alpha(@borders, 0.55);
+  padding: 20px;
+}
+
+.hero-card {
+  background-image: linear-gradient(
+    135deg,
+    alpha(@accent_bg_color, 0.17),
+    alpha(@accent_bg_color, 0.04)
+  );
+  border: 1px solid alpha(@accent_bg_color, 0.28);
+}
+
+.warning-card {
+  background-color: alpha(@warning_color, 0.10);
+  border: 1px solid alpha(@warning_color, 0.26);
+}
+
+.banner-warning {
+  background-color: alpha(@warning_color, 0.12);
+  border: 1px solid alpha(@warning_color, 0.22);
+  border-radius: 12px;
+  padding: 10px 14px;
+}
+
+.page-title {
+  font-size: 1.9rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+
+.hero-title {
+  font-size: 2.05rem;
+  font-weight: 800;
+  letter-spacing: -0.025em;
+}
+
+.card-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+.row-title {
+  font-weight: 600;
+}
+
+.muted {
+  color: alpha(@window_fg_color, 0.63);
+}
+
+.small {
+  font-size: 0.86rem;
+}
+
+.metric-value {
+  font-size: 1.9rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+
+.metric-caption {
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: alpha(@window_fg_color, 0.55);
+}
+
+.pill {
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  background-color: alpha(@window_fg_color, 0.08);
+  color: alpha(@window_fg_color, 0.78);
+}
+
+.pill-active {
+  background-color: alpha(@success_color, 0.18);
+  color: @success_color;
+}
+
+.pill-accent {
+  background-color: alpha(@accent_bg_color, 0.18);
+  color: @accent_color;
+}
+
+.pill-warning {
+  background-color: alpha(@warning_color, 0.18);
+  color: @warning_color;
+}
+
+.pill-idle {
+  background-color: alpha(@window_fg_color, 0.08);
+  color: alpha(@window_fg_color, 0.62);
+}
+
+.icon-badge {
+  background-color: alpha(@accent_bg_color, 0.16);
+  color: @accent_color;
+  border-radius: 12px;
+  padding: 9px;
+}
+
+.sidebar-status {
+  background-color: alpha(@window_fg_color, 0.045);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+
+.status-dot-offline {
+  color: @warning_color;
+  font-size: 0.75rem;
+}
+
+.status-dot-online {
+  color: @success_color;
+  font-size: 0.75rem;
+}
+
+.nav-row {
+  border-radius: 10px;
+  margin-top: 2px;
+  margin-bottom: 2px;
+}
+
+.template-row {
+  background-color: alpha(@window_fg_color, 0.045);
+  border-radius: 12px;
+  padding: 8px 12px;
+}
+
+.day-toggle {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 2px 6px;
+  font-weight: 600;
+}
+
+entry,
+spinbutton,
+dropdown {
+  border-radius: 9px;
+}

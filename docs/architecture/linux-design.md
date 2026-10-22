@@ -61,6 +61,21 @@ Kotlin/JVM (rejected: daemon footprint and packaging complexity).
   adapter is enabled, so enforcement resumes with the restrictions intact.
 - The UI is optional: blocking continues without it.
 
+### Current runnable build (transitional)
+
+The first runnable build deviates from the target stack in three narrow ways,
+without moving decisions out of `core`:
+
+| Target | Current build | Why |
+| --- | --- | --- |
+| D-Bus + Unix socket | newline-delimited JSON on stdio | fastest safe UI boundary; one request/response line, started by the UI |
+| SQLite | versioned atomic JSON | no queryable history is needed until trackers exist |
+| gtk-rs | PyGObject | GTK 4 development headers were unavailable in the build environment; the widget layer is still GTK 4 + libadwaita |
+
+The daemon is still the only writer. The UI still has no decision logic. Both
+are expected to be replaced at M1; the matrix and implementation notes record
+the limitation rather than presenting it as the final architecture.
+
 ## 3. D-Bus surface (session bus)
 
 ```

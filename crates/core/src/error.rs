@@ -37,6 +37,8 @@ pub enum Error {
     DuplicateProfileName(String),
     #[error("unknown profile: {0}")]
     UnknownProfile(Ulid),
+    #[error("unknown commitment: {0}")]
+    UnknownCommitment(Ulid),
 
     #[error("invalid schedule: {0}")]
     InvalidSchedule(String),
@@ -51,6 +53,10 @@ pub enum Error {
     DuplicateName,
     #[error("a commitment forbids this action")]
     CommitmentBlocksAction,
+    #[error("commitment deactivation is not ready yet")]
+    CommitmentNotReady,
+    #[error("this commitment method is not supported yet")]
+    UnsupportedCommitmentMethod,
 }
 
 /// Convenient result alias.

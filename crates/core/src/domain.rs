@@ -790,6 +790,9 @@ pub struct Commitment {
     pub allow_sites: Vec<HostPattern>,
     /// When it entered its current state.
     pub updated_at: Timestamp,
+    /// When a requested cool-down finishes; `None` unless cooling down.
+    #[serde(default)]
+    pub cooldown_ends_at: Option<Timestamp>,
 }
 
 impl Commitment {
@@ -811,6 +814,7 @@ impl Commitment {
             allow_apps: BTreeSet::new(),
             allow_sites: Vec::new(),
             updated_at: starts_at,
+            cooldown_ends_at: None,
         }
     }
 
@@ -840,6 +844,47 @@ impl Commitment {
             | CommitmentState::CoolingDown
             | CommitmentState::ReadyToEnd => self.ends_at.is_none_or(|end| now < end),
             CommitmentState::Armed | CommitmentState::Ended => false,
+        }
+    }
+
+    /// Request deactivation. Returns the instant the cool-down ends.
+    ///
+    /// Text/QR/approval challenges are not implemented yet; those methods
+    /// return [`Error::UnsupportedCommitmentMethod`] rather than silently
+    /// ending the commitment.
+    pub fn request_end(&mut self, now: Timestamp) -> Result<Timestamp> {
+        // Repeating the request must not extend an existing cool-down.
+        if self.state == CommitmentState::CoolingDown {
+            return self.cooldown_ends_at.ok_or(Error::CommitmentNotReady);
+        }
+        if self.state != CommitmentState::Active || !self.is_enforcing(now) {
+            return Err(Error::CommitmentNotReady);
+        }
+        match self.method {
+            DeactivationMethod::Cooldown(duration) => {
+                let delta = chrono::TimeDelta::from_std(duration)
+                    .map_err(|_| Error::InvalidDuration("cooldown is too large".into()))?;
+                let end = now + delta;
+                self.state = CommitmentState::CoolingDown;
+                self.cooldown_ends_at = Some(end);
+                self.updated_at = now;
+                Ok(end)
+            }
+            _ => Err(Error::UnsupportedCommitmentMethod),
+        }
+    }
+
+    /// Finish deactivation once the cool-down (or the commitment itself) has
+    /// expired.
+    pub fn finish_end(&mut self, now: Timestamp) -> Result<()> {
+        let commitment_expired = self.ends_at.is_some_and(|end| now >= end);
+        let cooldown_finished = self.cooldown_ends_at.is_some_and(|end| now >= end);
+        if self.state == CommitmentState::CoolingDown && (commitment_expired || cooldown_finished) {
+            self.state = CommitmentState::Ended;
+            self.updated_at = now;
+            Ok(())
+        } else {
+            Err(Error::CommitmentNotReady)
         }
     }
 
