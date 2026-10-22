@@ -19,7 +19,7 @@ licensed.
 | Behavioural analysis (static) | complete, see `docs/parity/` |
 | Product specification | complete for P0/P1, see `docs/spec/` |
 | Linux architecture | decided, see `docs/architecture/` |
-| Implementation | **not started** |
+| Implementation | **M0 core engine in progress**, see `crates/core` and [`docs/spec/implementation-notes.md`](docs/spec/implementation-notes.md) |
 | Runtime parity verification | impossible against the reference without a device; parity is defined by the acceptance suite |
 
 ## What "identical behaviour" means here

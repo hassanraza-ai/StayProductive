@@ -9,51 +9,55 @@ behavioural parity; **P2** = platform extra / honest gap.
 Status values: `todo`, `wip`, `done`, `gap` (documented, deliberately not
 implemented), `decision` (blocked on a product/architecture decision).
 
+`wip` means the **core** behaviour and its acceptance scenario are
+implemented in `crates/core`; daemon, adapter, UI, or persistence evidence is
+still outstanding. See [`../spec/implementation-notes.md`](../spec/implementation-notes.md).
+
 ## 1. Profiles and rules
 
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-PROF-01 | Create, rename, duplicate, delete profiles | P0 | core + SQLite | domain §3 | A-PROF-01 | todo |
-| F-PROF-02 | Activate a profile manually; deactivate it | P0 | D-Bus + UI | sched §6 | A-PROF-02 | todo |
-| F-PROF-03 | Only one manually activated profile at a time | P0 | engine invariant | domain §4 | A-PROF-03 | todo |
+| F-PROF-01 | Create, rename, duplicate, delete profiles | P0 | core + SQLite | domain §3 | A-PROF-01 | wip |
+| F-PROF-02 | Activate a profile manually; deactivate it | P0 | D-Bus + UI | sched §6 | A-PROF-02 | wip |
+| F-PROF-03 | Only one manually activated profile at a time | P0 | engine invariant | domain §4 | A-PROF-03 | wip |
 | F-PROF-04 | Profile templates (Focus, Sleep, Detox, Exam, …) | P1 | bundled presets | sched §7 | A-PROF-04 | todo |
-| F-PROF-05 | Copy items from an existing profile | P1 | UI | ux §4 | A-PROF-05 | todo |
-| F-PROF-06 | Mark profile as strict-mode eligible | P1 | engine | strict §3 | A-PROF-06 | todo |
-| F-RULE-01 | Block selected apps | P0 | compositor adapter | block §5 | A-RULE-01 | todo |
-| F-RULE-02 | Block selected websites | P0 | DNS + extension | content §2 | A-RULE-02 | todo |
-| F-RULE-03 | Block selected keywords | P1 | extension + URL pipe | content §3 | A-RULE-03 | todo |
-| F-RULE-04 | Allowlist apps (override non-strict rules) | P0 | engine | block §4 | A-RULE-04 | todo |
-| F-RULE-05 | Allowlist websites | P1 | engine + resolver | content §2 | A-RULE-05 | todo |
+| F-PROF-05 | Copy items from an existing profile | P1 | UI | ux §4 | A-PROF-05 | wip |
+| F-PROF-06 | Mark profile as strict-mode eligible | P1 | engine | strict §3 | A-PROF-06 | wip |
+| F-RULE-01 | Block selected apps | P0 | compositor adapter | block §5 | A-RULE-01 | wip |
+| F-RULE-02 | Block selected websites | P0 | DNS + extension | content §2 | A-RULE-02 | wip |
+| F-RULE-03 | Block selected keywords | P1 | extension + URL pipe | content §3 | A-RULE-03 | wip |
+| F-RULE-04 | Allowlist apps (override non-strict rules) | P0 | engine | block §4 | A-RULE-04 | wip |
+| F-RULE-05 | Allowlist websites | P1 | engine + resolver | content §2 | A-RULE-05 | wip |
 | F-RULE-06 | Goal-based unlock (spend time to earn access) | P1 | engine counters | block §6 | A-RULE-06 | todo |
-| F-RULE-07 | Wait timer after usage | P1 | engine timer | block §6 | A-RULE-07 | todo |
-| F-RULE-08 | Quick block for N minutes | P1 | UI + engine | block §6 | A-RULE-08 | todo |
+| F-RULE-07 | Wait timer after usage | P1 | engine timer | block §6 | A-RULE-07 | wip |
+| F-RULE-08 | Quick block for N minutes | P1 | UI + engine | block §6 | A-RULE-08 | wip |
 
 ## 2. Limits and counters
 
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-LIM-01 | Daily usage limit per app | P0 | event log + counters | block §4 | A-LIM-01 | todo |
-| F-LIM-02 | Hourly usage limit per app | P0 | event log + counters | block §4 | A-LIM-02 | todo |
-| F-LIM-03 | Daily/hourly launch limits | P1 | tracker | block §4 | A-LIM-03 | todo |
-| F-LIM-04 | Daily/hourly pickup (unlock) limits | P1 | logind | block §4 | A-LIM-04 | todo |
-| F-LIM-05 | Limits survive restart and crash | P0 | persisted events | block §7 | A-LIM-05 | todo |
-| F-LIM-06 | Counter day boundary honours start-of-day | P0 | period calculator | sched §2 | A-LIM-06 | todo |
+| F-LIM-01 | Daily usage limit per app | P0 | event log + counters | block §4 | A-LIM-01 | wip |
+| F-LIM-02 | Hourly usage limit per app | P0 | event log + counters | block §4 | A-LIM-02 | wip |
+| F-LIM-03 | Daily/hourly launch limits | P1 | tracker | block §4 | A-LIM-03 | wip |
+| F-LIM-04 | Daily/hourly pickup (unlock) limits | P1 | logind | block §4 | A-LIM-04 | wip |
+| F-LIM-05 | Limits survive restart and crash | P0 | persisted events | block §7 | A-LIM-05 | wip |
+| F-LIM-06 | Counter day boundary honours start-of-day | P0 | period calculator | sched §2 | A-LIM-06 | wip |
 | F-LIM-07 | Low-time alerts at thresholds | P1 | notifications | block §8 | A-LIM-07 | todo |
 
 ## 3. Schedules and activation
 
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-SCH-01 | Daily time window | P0 | scheduler | sched §3 | A-SCH-01 | todo |
-| F-SCH-02 | Day-of-week windows (per-day) | P0 | scheduler | sched §3 | A-SCH-02 | todo |
-| F-SCH-03 | Multiple intervals per day | P1 | scheduler | sched §3 | A-SCH-03 | todo |
-| F-SCH-04 | Full-day and one-time/custom windows | P1 | scheduler | sched §3 | A-SCH-04 | todo |
-| F-SCH-05 | Hourly pattern | P1 | scheduler | sched §3 | A-SCH-05 | todo |
-| F-SCH-06 | Start-of-day offset | P0 | period calculator | sched §2 | A-SCH-06 | todo |
-| F-SCH-07 | Pause profile for 1/5/10/15/30 min, 1 h, today | P0 | engine state | sched §5 | A-SCH-07 | todo |
-| F-SCH-08 | Indefinite pause (no duration) | P1 | engine state | sched §5 | A-SCH-08 | todo |
-| F-SCH-09 | Extend an active block | P1 | engine state | sched §5 | A-SCH-09 | todo |
-| F-SCH-10 | Schedule change detection (no restart needed) | P0 | scheduler invalidation | sched §4 | A-SCH-10 | todo |
+| F-SCH-01 | Daily time window | P0 | scheduler | sched §3 | A-SCH-01 | wip |
+| F-SCH-02 | Day-of-week windows (per-day) | P0 | scheduler | sched §3 | A-SCH-02 | wip |
+| F-SCH-03 | Multiple intervals per day | P1 | scheduler | sched §3 | A-SCH-03 | wip |
+| F-SCH-04 | Full-day and one-time/custom windows | P1 | scheduler | sched §3 | A-SCH-04 | wip |
+| F-SCH-05 | Hourly pattern | P1 | scheduler | sched §3 | A-SCH-05 | wip |
+| F-SCH-06 | Start-of-day offset | P0 | period calculator | sched §2 | A-SCH-06 | wip |
+| F-SCH-07 | Pause profile for 1/5/10/15/30 min, 1 h, today | P0 | engine state | sched §5 | A-SCH-07 | wip |
+| F-SCH-08 | Indefinite pause (no duration) | P1 | engine state | sched §5 | A-SCH-08 | wip |
+| F-SCH-09 | Extend an active block | P1 | engine state | sched §5 | A-SCH-09 | wip |
+| F-SCH-10 | Schedule change detection (no restart needed) | P0 | scheduler invalidation | sched §4 | A-SCH-10 | wip |
 | F-SCH-11 | Location activation | P2 | GeoClue2 | sched §6 | A-SCH-11 | decision |
 
 ## 4. Strict mode and lock mode
@@ -83,7 +87,7 @@ implemented), `decision` (blocked on a product/architecture decision).
 | F-CON-03 | Per-surface toggles (Shorts, Reels, Stories, …) | P1 | settings | content §4 | A-CON-03 | todo |
 | F-CON-04 | Adult-domain filtering | P1 | DNS lists | content §5 | A-CON-04 | todo |
 | F-CON-05 | Block unsupported browsers (policy) | P2 | engine | content §6 | A-CON-05 | todo |
-| F-CON-06 | Keyword matching is case-insensitive | P0 | engine | content §3 | A-CON-06 | todo |
+| F-CON-06 | Keyword matching is case-insensitive | P0 | engine | content §3 | A-CON-06 | wip |
 | F-CON-07 | Native mobile surfaces | — | not reproducible | content §7 | — | gap |
 | F-CON-08 | In-app browser webviews | — | not inspectable | content §7 | — | gap |
 
@@ -138,7 +142,7 @@ implemented), `decision` (blocked on a product/architecture decision).
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | F-DATA-01 | Atomic migrations; never lose rules/history | P0 | SQLite | domain §6 | A-DATA-01 | todo |
-| F-DATA-02 | Clock change and DST handled without double counting | P0 | monotonic + wall clock | block §7 | A-DATA-02 | todo |
+| F-DATA-02 | Clock change and DST handled without double counting | P0 | monotonic + wall clock | block §7 | A-DATA-02 | wip |
 | F-DATA-03 | Daemon/UI version skew tolerated | P1 | IPC versioning | arch §8 | A-DATA-03 | todo |
 | F-DATA-04 | Full local reset with confirmation | P1 | store | ux §8 | A-DATA-04 | todo |
 
