@@ -63,7 +63,7 @@ Kotlin/JVM (rejected: daemon footprint and packaging complexity).
 
 ### Current runnable build (transitional)
 
-The first runnable build deviates from the target stack in three narrow ways,
+The first runnable build deviates from the target stack in four narrow ways,
 without moving decisions out of `core`:
 
 | Target | Current build | Why |
@@ -71,6 +71,7 @@ without moving decisions out of `core`:
 | D-Bus + Unix socket | newline-delimited JSON on stdio | fastest safe UI boundary; one request/response line, started by the UI |
 | SQLite | versioned atomic JSON | no queryable history is needed until trackers exist |
 | gtk-rs | PyGObject | GTK 4 development headers were unavailable in the build environment; the widget layer is still GTK 4 + libadwaita |
+| D-Bus-driven GNOME extension | short-lived policy file + runtime heartbeat | no daemon D-Bus name yet; the file is same-user, atomic, and expires in 30 seconds |
 
 The daemon is still the only writer. The UI still has no decision logic. Both
 are expected to be replaced at M1; the matrix and implementation notes record
@@ -200,9 +201,10 @@ reference does (it sends the user home). Hiding an app is the faithful mapping.
   and run under a transaction after a file copy backup.
 - IPC payloads carry `schema_version`; the daemon rejects unknown newer versions
   with a clear error and the UI offers to update.
-- The extension stores a signed (HMAC with a per-install key) rule snapshot to
-  keep blocking during a daemon restart; it re-syncs on reconnect and marks
-  itself degraded after 10 minutes without a daemon.
+- The GNOME extension currently reads a short-lived unsigned policy snapshot
+  written by the daemon and writes a runtime heartbeat. It is same-user only and
+  expires after 30 seconds. Signed snapshots and blocking across daemon restarts
+  remain target behaviour, not current behaviour.
 
 ## 9. Performance budgets
 
@@ -264,6 +266,7 @@ offers a toggle. No system-wide daemon.
 | ADR-003 | Hide, do not kill, blocked applications |
 | ADR-004 | DNS helper is opt-in and separate; Flatpak is extension-only |
 | ADR-005 | Commitments use wall-clock expiry, monotonic cool-downs |
+| ADR-006 | Transitional GNOME enforcement uses an expiring policy file and heartbeat; D-Bus replaces it at M1 |
 
 Open decisions: see `docs/parity/feature-matrix.md` §Open decisions (D-1…D-4).
 

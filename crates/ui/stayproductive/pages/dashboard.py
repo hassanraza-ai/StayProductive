@@ -84,24 +84,35 @@ class DashboardPage:
         self.root.append(metrics)
 
         # --------------------------------------------------- enforcement
-        enforcement = w.Card(warning=True)
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
-        row.append(w.icon_badge("dialog-warning-symbolic", 20))
-        copy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        copy.append(w.label("Desktop enforcement is not connected", "card-title"))
-        copy.append(
+        self.enforcement_warning = w.Card(warning=True)
+        warning_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        warning_row.append(w.icon_badge("dialog-warning-symbolic", 20))
+        warning_copy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        warning_copy.append(w.label("Desktop enforcement is offline", "card-title"))
+        warning_copy.append(
             w.label(
-                "The rule engine and this state file are real. The GNOME adapter that "
-                "observes foreground apps and overlaid blocked pages is not built yet, so "
-                "nothing is being blocked at the desktop level. StayProductive will say so "
-                "until that adapter ships.",
+                "The rule engine is making real decisions, but no desktop adapter "
+                "is reporting. Install and enable the GNOME extension in Settings. "
+                "Until then, apps are not blocked and this card will stay visible.",
                 "muted",
             )
         )
-        copy.set_hexpand(True)
-        row.append(copy)
-        enforcement.append(row)
-        self.root.append(enforcement)
+        warning_copy.set_hexpand(True)
+        warning_row.append(warning_copy)
+        self.enforcement_warning.append(warning_row)
+        self.root.append(self.enforcement_warning)
+
+        self.enforcement_active = w.Card()
+        active_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        active_row.append(w.icon_badge("emblem-ok-symbolic", 20))
+        active_copy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        active_copy.append(w.label("Desktop enforcement is active", "card-title"))
+        self.enforcement_detail = w.label("", "muted")
+        active_copy.append(self.enforcement_detail)
+        active_copy.set_hexpand(True)
+        active_row.append(active_copy)
+        self.enforcement_active.append(active_row)
+        self.root.append(self.enforcement_active)
 
         # ------------------------------------------------------ quick block
         quick = w.Card()
@@ -229,6 +240,18 @@ class DashboardPage:
             else "Pause the active profile for 15 minutes."
         )
 
+        enforcement = snapshot.get("enforcement", {})
+        enforcement_active = enforcement.get("state") == "active"
+        self.enforcement_warning.set_visible(not enforcement_active)
+        self.enforcement_active.set_visible(enforcement_active)
+        if enforcement_active:
+            self.enforcement_detail.set_label(
+                enforcement.get(
+                    "message",
+                    "The GNOME Shell extension is applying app blocks now.",
+                )
+            )
+
         self.profile_metric[0].set_label(str(len(profiles)))
         enabled = sum(1 for profile in profiles if profile.get("enabled"))
         self.profile_metric[1].set_label(
@@ -297,8 +320,8 @@ class DashboardPage:
         history = snapshot.get("history", [])
         if not history:
             empty = w.label(
-                "No blocks recorded yet. Decisions will appear here once desktop "
-                "enforcement is connected.",
+                "No blocks recorded yet. Desktop blocks appear here once the "
+                "GNOME extension is active.",
                 "muted",
             )
             empty.add_css_class("small")

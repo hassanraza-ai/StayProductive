@@ -8,6 +8,7 @@
 //! This is deliberately a narrow boundary: replacing stdio with D-Bus later
 //! does not move decision logic out of `stayproductive-core`.
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -21,8 +22,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use stayproductive_core::{
     Activation, AppKey, AppRule, ClockSettings, Commitment, CommitmentKind, CountLimit, DateRange,
-    DayPattern, DeactivationMethod, HostPattern, HourlyPattern, Keyword, LimitPeriod, PauseReason,
-    Profile, Restriction, RuleSet, Schedule, SiteAction, State, Target, Timestamp, Window,
+    DayPattern, DeactivationMethod, Event, HostPattern, HourlyPattern, Keyword, LimitPeriod,
+    PauseReason, Profile, Restriction, RuleSet, Schedule, SiteAction, State, Target, Timestamp,
+    Window, decide,
 };
 
 type DResult<T> = Result<T, String>;
@@ -57,6 +59,7 @@ fn main() {
         path,
         shutdown: false,
     };
+    daemon.write_policy(Utc::now());
 
     println!(
         "{}",
@@ -131,6 +134,107 @@ fn load_state(path: &Path) -> State {
 fn backup(path: &Path) {
     let backup = path.with_extension(format!("invalid-{}.json", Utc::now().timestamp()));
     let _ = fs::rename(path, backup);
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> DResult<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let existed = parent.exists();
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        if !existed {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+    }
+    fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+fn runtime_dir() -> PathBuf {
+    env::var("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| env::temp_dir())
+}
+
+/// The extension writes this heartbeat while it is enabled. It is deliberately
+/// short-lived so a crashed or disabled extension cannot keep claiming
+/// enforcement.
+fn extension_heartbeat(now: Timestamp) -> bool {
+    let path = runtime_dir().join("stayproductive/gnome-extension.json");
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    if value.get("active").and_then(Value::as_bool) != Some(true)
+        || value.get("policy_loaded").and_then(Value::as_bool) != Some(true)
+    {
+        return false;
+    }
+    let Some(checked_at) = value
+        .get("checked_at")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<Timestamp>().ok())
+    else {
+        return false;
+    };
+    let age = now.signed_duration_since(checked_at);
+    age <= chrono::TimeDelta::seconds(5)
+}
+
+fn enforcement_policy(state: &State, now: Timestamp) -> Value {
+    let mut candidates: BTreeSet<AppKey> = BTreeSet::new();
+    for profile in &state.profiles {
+        for app in profile.rules.apps.keys() {
+            candidates.insert(app.clone());
+        }
+    }
+    for block in &state.quick_blocks {
+        if let Target::App(app) = &block.target {
+            candidates.insert(app.clone());
+        }
+    }
+
+    let mut apps = Vec::new();
+    for app in candidates {
+        let event = Event::ForegroundChanged {
+            app: app.clone(),
+            window: None,
+        };
+        let decision = decide(state, &event, now);
+        if !decision.is_block() {
+            continue;
+        }
+        let profile = decision
+            .profile
+            .and_then(|id| state.profile(id))
+            .map(|profile| profile.name.clone());
+        apps.push(json!({
+            "app": app.as_str(),
+            "reason": decision.reason.as_str(),
+            "until": decision.until,
+            "profile": profile,
+        }));
+    }
+
+    json!({
+        "version": 1,
+        "generated_at": now,
+        "valid_until": now + chrono::TimeDelta::seconds(30),
+        "apps": apps,
+    })
 }
 
 fn fresh_state() -> State {
@@ -354,36 +458,57 @@ impl Daemon {
         if dirty && result.is_ok() {
             self.persist()?;
         }
+        if result.is_ok() {
+            self.write_policy(now);
+        }
         result
     }
 
     fn persist(&self) -> DResult<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
-            }
-        }
         let payload = Persisted {
             version: FORMAT_VERSION,
             state: self.state.clone(),
         };
         let encoded = serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?;
-        let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, encoded).map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        write_private(&self.path, &encoded)
+    }
+
+    fn policy_path(&self) -> PathBuf {
+        self.path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("enforcement.json")
+    }
+
+    fn write_policy(&self, now: Timestamp) {
+        let policy = enforcement_policy(&self.state, now);
+        let Ok(encoded) = serde_json::to_vec_pretty(&policy) else {
+            eprintln!("stayproductive: could not encode enforcement policy");
+            return;
+        };
+        if let Err(error) = write_private(&self.policy_path(), &encoded) {
+            eprintln!("stayproductive: could not write enforcement policy: {error}");
         }
-        fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
-        Ok(())
     }
 
     fn snapshot(&self) -> Value {
         let now = Utc::now();
+        let heartbeat = extension_heartbeat(now);
+        let enforcement = if heartbeat {
+            json!({
+                "state": "active",
+                "adapter": "gnome-extension",
+                "message": "The GNOME Shell extension is enforcing app blocks for native Wayland and XWayland windows.",
+                "policy_path": self.policy_path().display().to_string(),
+            })
+        } else {
+            json!({
+                "state": "unavailable",
+                "adapter": "gnome-extension",
+                "message": "No enforcement adapter is reporting. The policy file is ready; install and enable the GNOME extension to apply it.",
+                "policy_path": self.policy_path().display().to_string(),
+            })
+        };
         let profiles: Vec<Value> = self
             .state
             .profiles
@@ -440,10 +565,7 @@ impl Daemon {
                 "until": block.until,
             })).collect::<Vec<_>>(),
             "history": history,
-            "enforcement": {
-                "state": "unavailable",
-                "message": "Desktop adapter is not connected yet. Decisions and state are live; nothing is hidden or overlaid."
-            },
+            "enforcement": enforcement,
             "state_path": self.path.display().to_string(),
         })
     }

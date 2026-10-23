@@ -23,14 +23,15 @@ resources, or assets from the reference app are included or licensed.
 | Core engine | **implemented** — profiles, rules, limits, schedules, commitments, 32 acceptance scenarios |
 | Local state service | **implemented** — versioned atomic JSON, profiles, quick blocks, strict cool-down, settings |
 | Desktop UI | **implemented** — dashboard, profiles and editor, schedules, strict session, activity, settings |
-| Desktop enforcement | **not connected** — no compositor adapter yet; the app reports this honestly |
+| Desktop enforcement | **implemented for GNOME app windows** — opt-in Shell extension; websites, limits, and other compositors remain |
 | Runtime parity verification | impossible against the reference without a device; parity is defined by the acceptance suite |
 
 The current build is useful as a real, persistent focus planner: profiles,
-schedules, limits, strict commitments, and state survive restarts. It does not
-yet block a foreground application or website, because the compositor/browser
-adapters in `docs/architecture/linux-design.md` are not implemented. The
-dashboard and Settings page say so rather than pretending.
+schedules, limits, strict commitments, and state survive restarts. On GNOME it
+can also block application windows once the bundled Shell extension is installed
+and enabled. Website, keyword, usage-limit, and non-GNOME enforcement are still
+missing; the dashboard and Settings page report the adapter state rather than
+pretending.
 
 ### Implemented today
 
@@ -41,20 +42,27 @@ dashboard and Settings page say so rather than pretending.
   `$XDG_DATA_HOME/stayproductive/state.json` (fallback
   `~/.local/share/stayproductive/state.json`), written atomically with mode
   `0600`, parent directory `0700`.
-- GTK 4 + libadwaita UI: dashboard, profile CRUD and editor (apps, sites,
-  keywords, allowlists, limits, pickup limits, six schedule kinds), schedules,
-  quick blocks, strict sessions with a real cool-down, activity, and settings.
+- GTK 4 + libadwaita UI: dashboard, profile CRUD and editor (installed-app
+  chooser by display name, sites, keywords, allowlists, limits, pickup limits,
+  six schedule kinds), schedules, quick blocks, strict sessions with a real
+  cool-down, activity, and settings.
 - Timezone defaults to the system zone through `iana-time-zone`; the start of day
   and timezone are editable.
 - Strict commitments block profile edits and pauses in both the UI and the
   daemon, and survive restart.
+- GNOME Shell integration: a short-lived `enforcement.json` policy, an opt-in
+  extension that overlays blocked application windows on Wayland and XWayland,
+  a runtime heartbeat, and an install/status flow in Settings.
+- The dashboard only says enforcement is active when the extension heartbeat is
+  fresh and reports a loaded policy; otherwise it explains what is missing.
 
 ### Not implemented yet
 
-Desktop enforcement, block overlays, tray integration, browser extension,
-DNS helper, SQLite history/migrations, usage statistics, onboarding,
-low-time notifications, backup/restore, full translation catalogs, and a
-complete screen-reader audit. These remain tracked as `todo`/`wip`/`gap` in
+Website and keyword enforcement, the browser extension, usage-limit tracking,
+launch/pickup limits, non-GNOME compositor adapters, tray integration, DNS
+helper, SQLite history/migrations, usage statistics, onboarding, low-time
+notifications, backup/restore, full translation catalogs, and a complete
+screen-reader audit. These remain tracked as `todo`/`wip`/`gap` in
 [`docs/parity/feature-matrix.md`](docs/parity/feature-matrix.md).
 
 ## Run the desktop app
@@ -79,6 +87,21 @@ On distributions where the Python GTK bindings are packaged separately, install
 `python3-gi`, `gir1.2-gtk-4.0`, and `gir1.2-adw-1` first. The app deliberately
 does not use `pip` for PyGObject.
 
+### Enable desktop blocking on GNOME
+
+1. Open **Settings → Desktop integration** and choose **Install**.
+2. Log out and back in once. GNOME Shell only loads a newly installed extension
+   after a Shell restart.
+3. Open StayProductive again. The sidebar and Settings page should show
+   **Enforcement active**, and blocking an application in an active profile
+   should cover its window.
+
+The extension is optional and local. It enforces application `block` rules and
+application quick blocks only; sites, keywords, and usage limits still need the
+browser extension and tracker. Closing StayProductive invalidates the policy
+within 30 seconds. See [`integrations/gnome/README.md`](integrations/gnome/README.md)
+for the policy format, emergency unblock, privacy notes, and uninstall steps.
+
 ### Verify the engine
 
 ```sh
@@ -90,8 +113,14 @@ cargo test
 The acceptance suite is `crates/core/tests/acceptance.rs`; every test names the
 `A-*` identifier from `docs/acceptance/parity-tests.md`. The end-to-end service
 test is `crates/daemon/tests/protocol.rs`; it drives the real daemon binary over
-stdio and checks strict locks, the cool-down refusal, restart persistence, and
-state-file permissions.
+stdio and checks strict locks, the cool-down refusal, restart persistence,
+state-file permissions, the generated enforcement policy, and the extension
+heartbeat gate. The GNOME matching helpers have a compositor-free test:
+
+```sh
+gjs -m integrations/gnome/tests/matching.test.js
+PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests
+```
 
 ## What "identical behaviour" means here
 
@@ -153,9 +182,10 @@ equivalent exists, the spec says so instead of pretending. See
   decision logic out of `core`.
 - **Desktop UI**: GTK 4 + libadwaita through PyGObject. The Python layer only
   renders state and sends commands; it contains no blocking decisions.
-- **Planned integration**: compositor adapters (X11 EWMH, sway/i3 IPC,
-  Hyprland IPC, GNOME Shell extension, KWin script), browser extension
-  (Manifest V3), optional privileged helper for system DNS.
+- **Desktop integration**: an opt-in GNOME Shell extension for application
+  windows, driven by a short-lived policy file and a runtime heartbeat. Further
+  adapters (X11 EWMH, sway/i3 IPC, Hyprland IPC, KWin script), the browser
+  extension (Manifest V3), and the optional privileged DNS helper are planned.
 - **Planned packaging**: Flatpak (user mode, no system-wide blocking), `.deb`,
   `.rpm`, Arch package, and a systemd user unit.
 

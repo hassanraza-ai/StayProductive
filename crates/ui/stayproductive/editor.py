@@ -7,6 +7,8 @@ import datetime as dt
 from gi.repository import Adw, Gtk
 
 from . import widgets as w
+from .app_picker import AppChooser
+from .apps import DesktopApp, installed_apps
 from .formatting import ACTION_LABELS, WEEKDAYS, error_text, rule_description
 
 ACTIVATIONS = [("manual", "Manual"), ("scheduled", "Scheduled"), ("always", "Always on")]
@@ -43,6 +45,8 @@ class ProfileEditor(Adw.Dialog):
         self.window = window
         self.profile = profile
         self.spec = self._spec_from_profile(profile)
+        self._installed_apps = installed_apps()
+        self._app_names = {app.key: app.name for app in self._installed_apps}
         self._app_rows: list[Gtk.Widget] = []
         self._site_rows: list[Gtk.Widget] = []
         self._keyword_rows: list[Gtk.Widget] = []
@@ -243,27 +247,47 @@ class ProfileEditor(Adw.Dialog):
 
     def _build_apps(self) -> None:
         self.apps_group = Adw.PreferencesGroup(title="Applications")
-        add_row = Adw.ActionRow(title="Add an app rule")
-        add_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        add_box.set_valign(Gtk.Align.CENTER)
-        self.app_entry = Gtk.Entry()
-        self.app_entry.set_placeholder_text("application id")
-        self.app_entry.set_width_chars(16)
-        self.app_entry.connect("activate", lambda _entry: self._add_app())
-        add_box.append(self.app_entry)
+        choose_row = Adw.ActionRow(
+            title="Add an application",
+            subtitle="Choose an installed app by name; no application ID needed.",
+        )
+        choose_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        choose_box.set_valign(Gtk.Align.CENTER)
         self.app_action = Gtk.DropDown.new_from_strings([label for _, label in APP_ACTIONS])
         self.app_action.connect("notify::selected", self._on_app_action_changed)
-        add_box.append(self.app_action)
+        choose_box.append(self.app_action)
         self.app_minutes = Gtk.SpinButton.new_with_range(1, 480, 5)
         self.app_minutes.set_value(30)
         self.app_minutes.set_tooltip_text("Allowed minutes")
         self.app_minutes.set_visible(False)
-        add_box.append(self.app_minutes)
+        choose_box.append(self.app_minutes)
+        choose_box.append(
+            w.button(
+                "Choose app…",
+                css="suggested-action",
+                tooltip="Choose an installed application",
+                on_click=lambda _button: self._choose_app(),
+            )
+        )
+        choose_row.add_suffix(choose_box)
+        self.apps_group.add(choose_row)
+
+        add_row = Adw.ActionRow(
+            title="Advanced: application ID",
+            subtitle="Only needed when an application is not in the chooser.",
+        )
+        add_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        add_box.set_valign(Gtk.Align.CENTER)
+        self.app_entry = Gtk.Entry()
+        self.app_entry.set_placeholder_text("e.g. firefox")
+        self.app_entry.set_width_chars(16)
+        self.app_entry.connect("activate", lambda _entry: self._add_app())
+        add_box.append(self.app_entry)
         add_box.append(
             w.button(
                 icon="list-add-symbolic",
                 css="flat",
-                tooltip="Add app rule",
+                tooltip="Add application ID",
                 on_click=lambda _button: self._add_app(),
             )
         )
@@ -324,7 +348,21 @@ class ProfileEditor(Adw.Dialog):
             title="Allowlist",
             description="Allowlisted targets are permitted even when another rule matches.",
         )
-        self.allow_app_row = Adw.EntryRow(title="Allow an application")
+        allow_choose = Adw.ActionRow(
+            title="Allow an application",
+            subtitle="Choose an installed app by name.",
+        )
+        allow_choose.add_suffix(
+            w.button(
+                "Choose app…",
+                css="flat",
+                tooltip="Choose an application to allow",
+                on_click=lambda _button: self._choose_allow_app(),
+            )
+        )
+        self.allow_group.add(allow_choose)
+
+        self.allow_app_row = Adw.EntryRow(title="Advanced: allow an application ID")
         self.allow_app_row.connect("activate", lambda _row: self._add_allow_app())
         self.allow_app_row.add_suffix(
             w.button(
@@ -501,7 +539,13 @@ class ProfileEditor(Adw.Dialog):
         self._app_rows = []
         for rule in self.spec.get("apps", []):
             key = rule.get("key", "?")
-            row = Adw.ActionRow(title=key, subtitle=rule_description(rule))
+            name = self._app_names.get(key, key)
+            description = rule_description(rule)
+            subtitle = description if name == key else f"{key} · {description}"
+            row = Adw.ActionRow()
+            row.set_use_markup(False)
+            row.set_title(name)
+            row.set_subtitle(subtitle)
             row.add_suffix(
                 w.button(
                     icon="user-trash-symbolic",
@@ -558,7 +602,12 @@ class ProfileEditor(Adw.Dialog):
         self._allow_app_rows = []
         self._allow_site_rows = []
         for app in self.spec.get("allow_apps", []):
-            row = Adw.ActionRow(title=app, subtitle="Allowed application")
+            name = self._app_names.get(app, app)
+            subtitle = "Allowed application" if name == app else f"Allowed application · {app}"
+            row = Adw.ActionRow()
+            row.set_use_markup(False)
+            row.set_title(name)
+            row.set_subtitle(subtitle)
             row.add_suffix(
                 w.button(
                     icon="user-trash-symbolic",
@@ -601,6 +650,26 @@ class ProfileEditor(Adw.Dialog):
         action = SITE_ACTIONS[self.site_action.get_selected()][0]
         self.site_minutes.set_visible(action == "daily_limit")
 
+    def _choose_app(self) -> None:
+        AppChooser(self._installed_apps, self._add_app_from_choice).present(self.window)
+
+    def _add_app_from_choice(self, app: DesktopApp) -> None:
+        action = APP_ACTIONS[self.app_action.get_selected()][0]
+        rule = {"key": app.key, "action": action}
+        if action != "block":
+            rule["minutes"] = int(self.app_minutes.get_value())
+        existing = next(
+            (item for item in self.spec["apps"] if item.get("key") == app.key),
+            None,
+        )
+        if existing is None:
+            self.spec["apps"].append(rule)
+        else:
+            existing.clear()
+            existing.update(rule)
+        self._app_names[app.key] = app.name
+        self._render_app_rules()
+
     def _add_app(self) -> None:
         key = self.app_entry.get_text().strip()
         if not key:
@@ -610,6 +679,7 @@ class ProfileEditor(Adw.Dialog):
         if action != "block":
             rule["minutes"] = int(self.app_minutes.get_value())
         self.spec["apps"].append(rule)
+        self._app_names.setdefault(key, key)
         self.app_entry.set_text("")
         self._render_app_rules()
 
@@ -634,12 +704,22 @@ class ProfileEditor(Adw.Dialog):
         self.keyword_row.set_text("")
         self._render_keyword_rules()
 
+    def _choose_allow_app(self) -> None:
+        AppChooser(self._installed_apps, self._add_allow_app_from_choice).present(self.window)
+
+    def _add_allow_app_from_choice(self, app: DesktopApp) -> None:
+        if app.key not in self.spec["allow_apps"]:
+            self.spec["allow_apps"].append(app.key)
+        self._app_names[app.key] = app.name
+        self._render_allow_rules()
+
     def _add_allow_app(self) -> None:
         value = self.allow_app_row.get_text().strip()
         if not value:
             return
         if value not in self.spec["allow_apps"]:
             self.spec["allow_apps"].append(value)
+        self._app_names.setdefault(value, value)
         self.allow_app_row.set_text("")
         self._render_allow_rules()
 

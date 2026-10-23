@@ -1,0 +1,7 @@
+{
+  "uuid": "stayproductive@hassanraza.ai",
+  "name": "StayProductive",
+  "description": "Applies StayProductive focus rules to native Wayland and XWayland windows.",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "version": 1
+}
