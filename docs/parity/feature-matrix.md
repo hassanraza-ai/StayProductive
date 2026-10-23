@@ -14,10 +14,12 @@ one required layer or automated acceptance evidence is still outstanding. See
 [`../spec/implementation-notes.md`](../spec/implementation-notes.md).
 
 The runnable build (October 2026) has the core engine, a local JSON state
-service, and a GTK 4 + libadwaita UI. It does **not** include a desktop
-enforcement adapter, so every row whose user-visible result depends on blocking
-a real app, window, or browser remains `wip` or `todo` even when its rules,
-state, and UI are present. The app reports enforcement as offline.
+service, and a GTK 4 + libadwaita UI. It includes an opt-in GNOME Shell
+extension that enforces application `block` rules and application quick blocks
+on real windows. It does **not** yet enforce websites, keywords, usage limits,
+or other compositors. Every row whose user-visible result depends on those
+missing layers remains `wip` or `todo`. The app reports enforcement as active
+only when the extension heartbeat is fresh and has loaded a valid policy.
 
 ## 1. Profiles and rules
 
@@ -116,7 +118,7 @@ state, and UI are present. The app reports enforcement as offline.
 | --- | --- | --- | --- | --- | --- | --- |
 | F-UX-01 | Onboarding: purpose, permissions, first profile | P0 | GTK wizard | ux §2 | A-UX-01 | todo |
 | F-UX-02 | Dashboard: status, profile, remaining time, quick actions | P0 | GTK | ux §3 | A-UX-02 | wip |
-| F-UX-03 | Block screen explains reason and end time | P0 | overlay | ux §5 | A-UX-03 | todo |
+| F-UX-03 | Block screen explains reason and end time | P0 | GNOME overlay | ux §5 | A-UX-03 | wip |
 | F-UX-04 | Break countdown screen | P1 | overlay | ux §5 | A-UX-04 | todo |
 | F-UX-05 | Profile editor with apps, sites, keywords, limits | P0 | GTK | ux §4 | A-UX-05 | wip |
 | F-UX-06 | Schedule editor per schedule type | P0 | GTK | ux §4 | A-UX-06 | wip |
@@ -135,12 +137,12 @@ state, and UI are present. The app reports enforcement as offline.
 | F-PLAT-02 | X11 foreground detection and enforcement | P0 | EWMH | arch §4 | A-PLAT-02 | todo |
 | F-PLAT-03 | sway/i3 adapter | P1 | IPC | arch §4 | A-PLAT-03 | todo |
 | F-PLAT-04 | Hyprland adapter | P1 | IPC | arch §4 | A-PLAT-04 | todo |
-| F-PLAT-05 | GNOME Shell adapter | P2 | extension + D-Bus | arch §4 | A-PLAT-05 | todo |
+| F-PLAT-05 | GNOME Shell adapter | P2 | extension + policy file | arch §4 | A-PLAT-05 | wip |
 | F-PLAT-06 | KDE/KWin adapter | P2 | script + D-Bus | arch §4 | A-PLAT-06 | todo |
 | F-PLAT-07 | System-wide DNS filtering (optional helper) | P1 | polkit + resolver | arch §7 | A-PLAT-07 | decision |
 | F-PLAT-08 | Browser extension (URL + DOM signals) | P1 | WebExtension | content §2 | A-PLAT-08 | todo |
 | F-PLAT-09 | Idle/lock/suspend awareness | P0 | logind | arch §4 | A-PLAT-09 | todo |
-| F-PLAT-10 | Multi-monitor lock overlay | P0 | compositor adapter | arch §6 | A-PLAT-10 | todo |
+| F-PLAT-10 | Multi-monitor lock overlay | P0 | compositor adapter | arch §6 | A-PLAT-10 | wip |
 | F-PLAT-11 | Notifications and low-time alerts | P1 | D-Bus | arch §5 | A-PLAT-11 | todo |
 
 ## 9. Data and lifecycle
@@ -158,13 +160,18 @@ state, and UI are present. The app reports enforcement as offline.
 | --- | --- |
 | `cargo fmt --check` | pass |
 | `cargo clippy --all-targets -- -D warnings` | pass |
-| `cargo test` | pass, including 32 acceptance tests and the daemon protocol test |
+| `cargo test` | pass, including 32 acceptance tests and the daemon protocol tests |
 | `cargo build --release -p stayproductive-daemon` | pass |
 | GTK app launch | pass on X11/XWayland with GTK 4 and libadwaita |
 | Dashboard, profiles, schedules, strict, activity, settings | rendered from live daemon state and manually inspected |
 | Profile editor round-trip | created and updated a scheduled profile with apps, site daily limit, keywords, allowlist, and multiple windows; persisted state re-read correctly |
 | Strict cool-down | core test rejects `finish_commitment_end` before the cool-down and accepts it afterwards; locked edits/pauses are rejected |
-| Desktop blocking | **not measured; not implemented** |
+| Enforcement policy | daemon protocol test checks active/inactive app entries, policy path, and `0600` mode |
+| Enforcement heartbeat | daemon protocol test checks active only with a fresh `active:true`/`policy_loaded:true` heartbeat and refuses stale, inactive, or policy-less files |
+| GNOME matching helpers | `gjs -m integrations/gnome/tests/matching.test.js` pass |
+| GNOME install flow | exercised with an isolated `XDG_DATA_HOME` and keyfile settings backend; copied the extension and enabled it without touching the host session |
+| GNOME extension load | pass in headless GNOME Shell 49: loads, reads policy, writes heartbeat, drops expired/removed policy |
+| GNOME overlay focus/visuals | **not measured** in headless Shell because it has no seat; requires a logged-in session |
 
 Manual UI inspection is not a substitute for the acceptance suite. Rows that
 depend on the UI remain `wip` until their `A-UX-*` scenarios are automated.

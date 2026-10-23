@@ -9,6 +9,13 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde_json::{Value, json};
 
+fn temp_state() -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("stayproductive-protocol-{}", ulid::Ulid::new()));
+    std::fs::create_dir_all(&dir).expect("temp state directory");
+    let state = dir.join("state.json");
+    (dir, state)
+}
+
 struct Service {
     child: Child,
     stdin: ChildStdin,
@@ -20,6 +27,10 @@ impl Service {
     fn start(state: &Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_stayproductive-daemon"))
             .env("STAYPRODUCTIVE_STATE", state)
+            .env(
+                "XDG_RUNTIME_DIR",
+                state.parent().unwrap_or_else(|| Path::new(".")),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -74,10 +85,7 @@ impl Service {
 
 #[test]
 fn strict_commitment_locks_rules_and_survives_restart() {
-    let path = std::env::temp_dir().join(format!(
-        "stayproductive-protocol-{}.json",
-        ulid::Ulid::new()
-    ));
+    let (dir, path) = temp_state();
     let _ = std::fs::remove_file(&path);
 
     let mut service = Service::start(&path);
@@ -162,5 +170,162 @@ fn strict_commitment_locks_rules_and_survives_restart() {
         json!(["block_edits", "block_pause"])
     );
     restarted.shutdown();
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn enforcement_snapshot_requires_fresh_extension_heartbeat() {
+    let (dir, path) = temp_state();
+    let mut service = Service::start(&path);
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let heartbeat = runtime.join("gnome-extension.json");
+
+    let snapshot = service.ok("snapshot", json!({}));
+    assert_eq!(snapshot["enforcement"]["state"], "unavailable");
+    assert_eq!(snapshot["enforcement"]["adapter"], "gnome-extension");
+    assert_eq!(
+        snapshot["enforcement"]["policy_path"],
+        dir.join("enforcement.json").display().to_string()
+    );
+
+    std::fs::write(
+        &heartbeat,
+        json!({
+            "active": true,
+            "policy_loaded": true,
+            "checked_at": chrono::Utc::now().to_rfc3339(),
+        })
+        .to_string(),
+    )
+    .expect("write heartbeat");
+    let snapshot = service.ok("snapshot", json!({}));
+    assert_eq!(snapshot["enforcement"]["state"], "active");
+
+    std::fs::write(
+        &heartbeat,
+        json!({
+            "active": true,
+            "policy_loaded": true,
+            "checked_at": (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339(),
+        })
+        .to_string(),
+    )
+    .expect("write stale heartbeat");
+    let snapshot = service.ok("snapshot", json!({}));
+    assert_eq!(snapshot["enforcement"]["state"], "unavailable");
+
+    std::fs::write(
+        &heartbeat,
+        json!({
+            "active": true,
+            "policy_loaded": false,
+            "checked_at": chrono::Utc::now().to_rfc3339(),
+        })
+        .to_string(),
+    )
+    .expect("write heartbeat without policy");
+    let snapshot = service.ok("snapshot", json!({}));
+    assert_eq!(snapshot["enforcement"]["state"], "unavailable");
+
+    std::fs::write(
+        &heartbeat,
+        json!({
+            "active": false,
+            "policy_loaded": true,
+            "checked_at": chrono::Utc::now().to_rfc3339(),
+        })
+        .to_string(),
+    )
+    .expect("write inactive heartbeat");
+    let snapshot = service.ok("snapshot", json!({}));
+    assert_eq!(snapshot["enforcement"]["state"], "unavailable");
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn enforcement_policy_tracks_active_app_rules() {
+    let (dir, path) = temp_state();
+    let policy_path = dir.join("enforcement.json");
+    let mut service = Service::start(&path);
+
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [
+                    {"key": "firefox", "action": "block"},
+                    {"key": "steam", "action": "daily_limit", "minutes": 30}
+                ]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+
+    let policy: Value = serde_json::from_slice(&std::fs::read(&policy_path).expect("policy file"))
+        .expect("policy json");
+    assert_eq!(policy["version"], 1);
+    assert_eq!(policy["apps"], json!([]), "inactive profile must not block");
+
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+    let snapshot = service.ok("snapshot", json!({}));
+    let policy: Value = serde_json::from_slice(&std::fs::read(&policy_path).expect("policy file"))
+        .expect("policy json");
+    assert_eq!(policy["apps"].as_array().expect("apps").len(), 1);
+    assert_eq!(policy["apps"][0]["app"], "firefox");
+    assert_eq!(policy["apps"][0]["reason"], "R-PROFILE");
+    assert_eq!(policy["apps"][0]["profile"], "Focus");
+    assert!(policy["valid_until"].as_str().is_some());
+    assert_eq!(snapshot["enforcement"]["adapter"], "gnome-extension");
+    assert_eq!(
+        snapshot["enforcement"]["policy_path"],
+        policy_path.display().to_string()
+    );
+
+    service.ok("deactivate_profile", json!({}));
+    let policy: Value = serde_json::from_slice(&std::fs::read(&policy_path).expect("policy file"))
+        .expect("policy json");
+    assert_eq!(policy["apps"], json!([]));
+
+    service.ok(
+        "quick_block",
+        json!({"kind": "app", "target": "steam", "minutes": 15}),
+    );
+    let policy: Value = serde_json::from_slice(&std::fs::read(&policy_path).expect("policy file"))
+        .expect("policy json");
+    assert_eq!(policy["apps"].as_array().expect("apps").len(), 1);
+    assert_eq!(policy["apps"][0]["app"], "steam");
+    assert_eq!(policy["apps"][0]["reason"], "R-QUICK");
+    assert!(policy["apps"][0]["until"].as_str().is_some());
+    assert!(policy["apps"][0]["profile"].is_null());
+
+    service.ok(
+        "clear_quick_block",
+        json!({"kind": "app", "target": "steam"}),
+    );
+    let policy: Value = serde_json::from_slice(&std::fs::read(&policy_path).expect("policy file"))
+        .expect("policy json");
+    assert_eq!(policy["apps"], json!([]));
+
+    service.shutdown();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&policy_path)
+            .expect("policy file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "policy file must be private");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -36,7 +36,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._error_shown = False
         self._build()
         self.refresh()
-        GLib.timeout_add_seconds(10, self._tick)
+        GLib.timeout_add_seconds(5, self._tick)
 
     def _build(self) -> None:
         self.set_default_size(1200, 800)
@@ -253,11 +253,15 @@ class MainWindow(Adw.ApplicationWindow):
             page.refresh(self.snapshot)
 
         enforcement = self.snapshot.get("enforcement", {})
-        if enforcement.get("state") == "unavailable":
-            self.enforcement_label.set_label("Enforcement offline")
-            self.service_label.set_label("State service running")
+        if enforcement.get("state") == "active":
+            self.enforcement_label.set_label("Enforcement active")
+            self.enforcement_dot.remove_css_class("status-dot-offline")
+            self.enforcement_dot.add_css_class("status-dot-online")
+            self.service_label.set_label("GNOME extension reporting")
         else:
-            self.enforcement_label.set_label("Enforcement connected")
+            self.enforcement_label.set_label("Enforcement offline")
+            self.enforcement_dot.remove_css_class("status-dot-online")
+            self.enforcement_dot.add_css_class("status-dot-offline")
             self.service_label.set_label("State service running")
 
     def _tick(self) -> bool:
