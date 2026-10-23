@@ -169,6 +169,7 @@ only when the extension heartbeat is fresh and has loaded a valid policy.
 | Enforcement policy | daemon protocol test checks active/inactive app entries, policy path, and `0600` mode |
 | Enforcement heartbeat | daemon protocol test checks active only with a fresh `active:true`/`policy_loaded:true` heartbeat and refuses stale, inactive, or policy-less files |
 | GNOME matching helpers | `gjs -m integrations/gnome/tests/matching.test.js` pass |
+| Installed-app chooser | `PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests` pass; GTK construction smoke-tested under Xvfb |
 | GNOME install flow | exercised with an isolated `XDG_DATA_HOME` and keyfile settings backend; copied the extension and enabled it without touching the host session |
 | GNOME extension load | pass in headless GNOME Shell 49: loads, reads policy, writes heartbeat, drops expired/removed policy |
 | GNOME overlay focus/visuals | **not measured** in headless Shell because it has no seat; requires a logged-in session |

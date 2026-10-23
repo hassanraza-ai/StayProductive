@@ -42,6 +42,10 @@ function testNormalisation() {
     assert(ids.has('blockmetest'), 'trailing component is an alias');
     assert(!ids.has(''), 'empty values are ignored');
     assert(ids.size === 4, `unexpected ids: ${[...ids]}`);
+
+    const snap = appIdsFromValues(['snap-store_snap-store']);
+    assert(snap.has('snap-store_snap-store'), 'snap id is kept');
+    assert(snap.has('snap-store'), 'snap application part is an alias');
 }
 
 function testWindowAccessors() {

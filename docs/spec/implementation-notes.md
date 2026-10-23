@@ -168,7 +168,9 @@ rendered from the returned snapshot. Pages:
   Deep work).
 - **Profile editor** — activation, enabled/strict flags, priority, six schedule
   kinds (daily, selected days, split windows, full day, hourly cycle, date
-  range), app/site rules with limits, keywords, allowlists, and pickup limits.
+  range), a searchable installed-app chooser that shows display names, app/site
+  rules with limits, keywords, allowlists, and pickup limits. Raw application
+  IDs remain available under “Advanced” for apps without a desktop entry.
 - **Schedules** — schedule summary and active/waiting/next-start state.
 - **Strict session** — start, visible commitment, request early exit, cool-down
   countdown, and end when the cool-down is ready.

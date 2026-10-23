@@ -42,9 +42,10 @@ pretending.
   `$XDG_DATA_HOME/stayproductive/state.json` (fallback
   `~/.local/share/stayproductive/state.json`), written atomically with mode
   `0600`, parent directory `0700`.
-- GTK 4 + libadwaita UI: dashboard, profile CRUD and editor (apps, sites,
-  keywords, allowlists, limits, pickup limits, six schedule kinds), schedules,
-  quick blocks, strict sessions with a real cool-down, activity, and settings.
+- GTK 4 + libadwaita UI: dashboard, profile CRUD and editor (installed-app
+  chooser by display name, sites, keywords, allowlists, limits, pickup limits,
+  six schedule kinds), schedules, quick blocks, strict sessions with a real
+  cool-down, activity, and settings.
 - Timezone defaults to the system zone through `iana-time-zone`; the start of day
   and timezone are editable.
 - Strict commitments block profile edits and pauses in both the UI and the
@@ -118,6 +119,7 @@ heartbeat gate. The GNOME matching helpers have a compositor-free test:
 
 ```sh
 gjs -m integrations/gnome/tests/matching.test.js
+PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests
 ```
 
 ## What "identical behaviour" means here

@@ -19,6 +19,11 @@ export function appIdsFromValues(values) {
         const tail = normalized.split('.').pop();
         if (tail && tail !== normalized)
             ids.add(tail);
+        // Snap desktop ids use a <snap>_<app> form, while the window's
+        // WM_CLASS often uses only the application part.
+        const snapTail = normalized.split('_').pop();
+        if (snapTail && snapTail !== normalized)
+            ids.add(snapTail);
     }
     return ids;
 }
