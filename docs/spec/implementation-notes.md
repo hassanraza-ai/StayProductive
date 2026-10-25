@@ -104,6 +104,41 @@ The service has no network listener, no root privileges, and no D-Bus name yet.
 Those belong to M1. Keeping the transport narrow makes the transition to D-Bus a
 replacement rather than a rewrite of the decision path.
 
+### Usage tracking
+
+The extension heartbeat is also the foreground observer. Besides the liveness
+fields it now carries `focus` (normalized app ids of the focused window, or
+`null`) and `focus_since` (when that window became foreground). On every
+command the daemon samples the heartbeat and feeds the core
+`UsageLedger`:
+
+- a fresh heartbeat with an attributable focus opens or continues a foreground
+  interval for the profile's own app key (both trailing-component alias
+  directions are matched, `org.mozilla.firefox` ↔ `firefox`);
+- a stale or missing heartbeat, a block overlay (`blocked: true`), or
+  `focus: null` closes the open interval: no usage accrues without an observer
+  or behind a block screen;
+- an interval never starts before the last observation, so time the daemon
+  already closed (a finished block, a lost observer) cannot be re-attributed
+  from an older `focus_since`. With no prior observation the observer's
+  `focus_since` is trusted;
+- only apps a profile rules over are tracked. Unconfigured apps produce no
+  intervals, which keeps the ledger bounded and the observation minimal.
+
+Sampling follows the UI's five-second poll, so usage is under-counted by at
+most one sampling interval and never over-counted; the engine additionally
+counts the open interval up to `now`, so a limit decision at the boundary does
+not lag. The ledger's in-memory event log is capped (`EVENT_LOG_CAP`) and not
+persisted; intervals, launches, pickups, blocks, and the last heartbeat are.
+
+Because the ledger feeds `decide`, daily and hourly application limits now
+produce real policy entries (`R-LIMIT-DAILY`/`R-LIMIT-HOURY`) once usage
+reaches the limit. Blocks that newly engage are recorded in the usage history
+with their reason and end time; the first policy after a daemon start only
+seeds the comparison so a restart does not duplicate records. The snapshot
+exposes `usage_today` (seconds per app for the current logical day), which the
+Activity page renders.
+
 After every successful command the service also publishes
 `enforcement.json` beside the state file. It contains only applications the
 engine would block at that instant: the app key, `R-*` reason, optional end
@@ -133,14 +168,17 @@ extension. It is a user-level extension, not a privileged component:
   stage, with the reason, blocked app title, end time, and local-only copy;
 - the overlay takes key focus and stops button/key events; switching to an
   allowed window hides it, and returning to the blocked window shows it again;
-- the heartbeat reports `policy_loaded`, `blocked`, and the Shell version. It
-  contains no window titles or per-app history.
+- the heartbeat reports `policy_loaded`, `blocked`, the Shell version, and the
+  focused app ids with `focus_since` for usage tracking. It contains no window
+  titles or per-app history.
 
-The extension only covers application windows. It cannot stop a process that
-runs in the background, cannot read browser tabs, and cannot enforce site,
-keyword, or usage-limit decisions. Those remain separate adapters. Because the
-policy is refreshed by the running app and expires after 30 seconds, closing
-StayProductive ends desktop enforcement; the daemon is not yet autonomous.
+The extension covers application windows and reports focus for application
+usage limits. It cannot stop a process that runs in the background, cannot
+read browser tabs, and cannot enforce site, keyword, site-limit, launch-limit,
+or pickup decisions. Those remain separate adapters. Because the policy is
+refreshed by the running app and expires after 30 seconds, closing
+StayProductive ends desktop enforcement and usage tracking; the daemon is not
+yet autonomous.
 
 Extension loading, policy parsing, heartbeat writes, and expiry were checked
 in a headless GNOME Shell 49 session. The headless compositor has no seat, so
@@ -222,11 +260,14 @@ persistence, and the private state-file mode.
 ### What is still inert
 
 The engine stores and explains site daily limits, but does not yet decrement
-them because there is no per-site interval tracker. Pickup limits likewise need
-the logind/tracker adapter. The UI labels both as configuration rather than
-claiming they are enforced. The GNOME adapter now enforces app windows, but the
-browser extension, other compositors, and the usage tracker remain the largest
-missing pieces.
+them because there is no per-site interval tracker (the browser extension must
+first report site visits). Launch limits are enforced by the engine once
+launches are counted, but the extension does not yet report background
+launches, only foreground entries; pickup limits likewise need the
+logind/tracker adapter. Application daily and hourly limits are now enforced
+end-to-end through the GNOME observer. The UI labels the rest as configuration
+rather than claiming they are enforced. The browser extension, other
+compositors, and the logind hookup remain the largest missing pieces.
 
 ## Not implemented yet
 

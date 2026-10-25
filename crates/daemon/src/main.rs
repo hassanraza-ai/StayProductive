@@ -23,8 +23,8 @@ use serde_json::{Value, json};
 use stayproductive_core::{
     Activation, AppKey, AppRule, ClockSettings, Commitment, CommitmentKind, CountLimit, DateRange,
     DayPattern, DeactivationMethod, Event, HostPattern, HourlyPattern, Keyword, LimitPeriod,
-    PauseReason, Profile, Restriction, RuleSet, Schedule, SiteAction, State, Target, Timestamp,
-    Window, decide,
+    PauseReason, Profile, ProfileId, ReasonCode, Restriction, RuleSet, Schedule, SiteAction, State,
+    Target, Timestamp, UsageLedger, Window, day_period, decide,
 };
 
 type DResult<T> = Result<T, String>;
@@ -41,6 +41,12 @@ struct Daemon {
     state: State,
     path: PathBuf,
     shutdown: bool,
+    /// Apps present in the last written policy, to record newly engaged
+    /// blocks in the usage history.
+    policy_apps: BTreeSet<AppKey>,
+    /// Whether the first policy of this run has been written. Blocks that are
+    /// already active at startup were recorded before and are not duplicated.
+    policy_seeded: bool,
 }
 
 fn require_rule_edits_allowed(state: &State, now: Timestamp) -> DResult<()> {
@@ -51,15 +57,42 @@ fn require_rule_edits_allowed(state: &State, now: Timestamp) -> DResult<()> {
     }
 }
 
+/// A cheap before/after comparison key for the usage ledger. Every structural
+/// change also moves the heartbeat, so this catches every persist-worthy edit.
+fn usage_fingerprint(
+    usage: &UsageLedger,
+) -> (
+    usize,
+    usize,
+    usize,
+    usize,
+    Option<Timestamp>,
+    Option<AppKey>,
+) {
+    (
+        usage.intervals().len(),
+        usage.launches().len(),
+        usage.pickups().len(),
+        usage.blocks().len(),
+        usage.last_heartbeat(),
+        usage.current_app().cloned(),
+    )
+}
+
 fn main() {
     let path = state_path();
-    let state = load_state(&path);
+    let mut state = load_state(&path);
+    // A crash can leave a foreground interval open; close it at the last
+    // heartbeat so restored usage is never over-counted.
+    state.recover();
     let mut daemon = Daemon {
         state,
         path,
         shutdown: false,
+        policy_apps: BTreeSet::new(),
+        policy_seeded: false,
     };
-    daemon.write_policy(Utc::now());
+    daemon.refresh_policy(Utc::now());
 
     println!(
         "{}",
@@ -167,34 +200,70 @@ fn runtime_dir() -> PathBuf {
         .unwrap_or_else(|_| env::temp_dir())
 }
 
-/// The extension writes this heartbeat while it is enabled. It is deliberately
+/// The heartbeat the extension writes while it is enabled. It is deliberately
 /// short-lived so a crashed or disabled extension cannot keep claiming
-/// enforcement.
-fn extension_heartbeat(now: Timestamp) -> bool {
-    let path = runtime_dir().join("stayproductive/gnome-extension.json");
-    let Ok(text) = fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return false;
-    };
-    if value.get("active").and_then(Value::as_bool) != Some(true)
-        || value.get("policy_loaded").and_then(Value::as_bool) != Some(true)
-    {
-        return false;
-    }
-    let Some(checked_at) = value
-        .get("checked_at")
-        .and_then(Value::as_str)
-        .and_then(|value| value.parse::<Timestamp>().ok())
-    else {
-        return false;
-    };
-    let age = now.signed_duration_since(checked_at);
-    age <= chrono::TimeDelta::seconds(5)
+/// enforcement or keep reporting focus.
+struct Heartbeat {
+    /// Enabled, policy loaded, and checked within the freshness window.
+    fresh: bool,
+    /// The block overlay is showing; no usage accrues behind it.
+    blocked: bool,
+    /// Normalized app ids of the focused window, empty when nothing is
+    /// attributable.
+    focus: Vec<AppKey>,
+    /// When the current focus window became foreground, if the observer knows.
+    focus_since: Option<Timestamp>,
 }
 
-fn enforcement_policy(state: &State, now: Timestamp) -> Value {
+fn read_heartbeat(now: Timestamp) -> Option<Heartbeat> {
+    let path = runtime_dir().join("stayproductive/gnome-extension.json");
+    let text = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let active = value.get("active").and_then(Value::as_bool) == Some(true);
+    let policy_loaded = value.get("policy_loaded").and_then(Value::as_bool) == Some(true);
+    let checked_at = value
+        .get("checked_at")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<Timestamp>().ok())?;
+    let fresh = active
+        && policy_loaded
+        && now.signed_duration_since(checked_at) <= chrono::TimeDelta::seconds(5);
+    let blocked = value
+        .get("blocked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let focus = value
+        .get("focus")
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .filter_map(|id| AppKey::new(id).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let focus_since = value
+        .get("focus_since")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<Timestamp>().ok());
+    Some(Heartbeat {
+        fresh,
+        blocked,
+        focus,
+        focus_since,
+    })
+}
+
+/// One app the engine would block right now.
+struct PolicyEntry {
+    app: AppKey,
+    reason: ReasonCode,
+    until: Option<Timestamp>,
+    profile: Option<ProfileId>,
+    profile_name: Option<String>,
+}
+
+fn policy_entries(state: &State, now: Timestamp) -> Vec<PolicyEntry> {
     let mut candidates: BTreeSet<AppKey> = BTreeSet::new();
     for profile in &state.profiles {
         for app in profile.rules.apps.keys() {
@@ -207,7 +276,7 @@ fn enforcement_policy(state: &State, now: Timestamp) -> Value {
         }
     }
 
-    let mut apps = Vec::new();
+    let mut entries = Vec::new();
     for app in candidates {
         let event = Event::ForegroundChanged {
             app: app.clone(),
@@ -221,20 +290,15 @@ fn enforcement_policy(state: &State, now: Timestamp) -> Value {
             .profile
             .and_then(|id| state.profile(id))
             .map(|profile| profile.name.clone());
-        apps.push(json!({
-            "app": app.as_str(),
-            "reason": decision.reason.as_str(),
-            "until": decision.until,
-            "profile": profile,
-        }));
+        entries.push(PolicyEntry {
+            app,
+            reason: decision.reason,
+            until: decision.until,
+            profile: decision.profile,
+            profile_name: profile,
+        });
     }
-
-    json!({
-        "version": 1,
-        "generated_at": now,
-        "valid_until": now + chrono::TimeDelta::seconds(30),
-        "apps": apps,
-    })
+    entries
 }
 
 fn fresh_state() -> State {
@@ -263,13 +327,11 @@ fn system_timezone() -> Tz {
 impl Daemon {
     fn handle(&mut self, command: &str, request: &Value) -> DResult<Value> {
         let now = Utc::now();
-        let mut dirty = true;
+        let tracked = self.track_usage(now);
+        let command_dirty = !matches!(command, "snapshot" | "shutdown");
         let result =
             match command {
-                "snapshot" => {
-                    dirty = false;
-                    Ok(self.snapshot())
-                }
+                "snapshot" => Ok(self.snapshot()),
                 "create_profile" => {
                     require_rule_edits_allowed(&self.state, now)?;
                     let spec: ProfileSpec = from_request(request, "profile")?;
@@ -448,20 +510,154 @@ impl Daemon {
                     Ok(self.snapshot())
                 }
                 "shutdown" => {
-                    dirty = false;
                     self.shutdown = true;
                     Ok(json!({"bye": true}))
                 }
                 other => return Err(format!("unknown command: {other}")),
             };
 
-        if dirty && result.is_ok() {
-            self.persist()?;
-        }
         if result.is_ok() {
-            self.write_policy(now);
+            let recorded = self.refresh_policy(now);
+            if command_dirty || tracked || recorded {
+                self.persist()?;
+            }
         }
         result
+    }
+
+    /// Feed the newest extension heartbeat into the usage ledger.
+    ///
+    /// Usage accrues only while a fresh observer reports an attributable,
+    /// unblocked focus window. Without an observer, or behind the block
+    /// overlay, the open interval is closed at `now`. Returns whether the
+    /// ledger changed, so the caller knows to persist.
+    fn track_usage(&mut self, now: Timestamp) -> bool {
+        let heartbeat = read_heartbeat(now);
+        let focus = match &heartbeat {
+            Some(hb) if hb.fresh && !hb.blocked && !hb.focus.is_empty() => {
+                // Attribution must use the profile's own app key, or the
+                // engine's usage queries would look at a different app.
+                self.resolve_focus(&hb.focus)
+                    .map(|app| (app, hb.focus_since))
+            }
+            _ => None,
+        };
+        let usage = &mut self.state.usage;
+        let before = usage_fingerprint(usage);
+        match focus {
+            Some((app, since)) => {
+                // An interval can only start at or after the last
+                // observation; an older `focus_since` (for example after a
+                // block ended) would re-attribute time we already closed.
+                // With no prior observation the observer's word is all we
+                // have, so its `focus_since` is trusted.
+                let mut at = since.unwrap_or(now);
+                if let Some(floor) = usage.last_heartbeat() {
+                    at = at.max(floor);
+                }
+                if at > now {
+                    at = now;
+                }
+                if usage.current_app() == Some(&app) {
+                    match usage.current_since() {
+                        Some(start) if at <= start => usage.heartbeat(now),
+                        // The focus left and returned within one sampling
+                        // gap; close and reopen at the reported instant.
+                        Some(_) => {
+                            usage.close_foreground(at);
+                            usage.foreground(app, at);
+                        }
+                        None => usage.foreground(app, at),
+                    }
+                } else {
+                    usage.foreground(app, at);
+                }
+            }
+            None => {
+                if usage.current_app().is_some() {
+                    usage.close_foreground(now);
+                }
+            }
+        }
+        let after = usage_fingerprint(&self.state.usage);
+        before != after
+    }
+
+    /// Map the ids a window reported to the app key a profile rules over.
+    ///
+    /// The extension already expands trailing-component aliases, but a
+    /// profile may use a desktop id while the window reports only the
+    /// WM_CLASS or the other way round, so both tails are matched. Apps no
+    /// profile rules over are not tracked.
+    fn resolve_focus(&self, ids: &[AppKey]) -> Option<AppKey> {
+        for id in ids {
+            let id_tail = id.as_str().rsplit('.').next().unwrap_or_default();
+            for profile in &self.state.profiles {
+                for key in profile.rules.apps.keys() {
+                    let key_tail = key.as_str().rsplit('.').next().unwrap_or_default();
+                    if key == id
+                        || (!key_tail.is_empty() && key_tail == id.as_str())
+                        || (!id_tail.is_empty() && id_tail == key.as_str())
+                    {
+                        return Some(key.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Write the enforcement policy and record newly engaged blocks.
+    ///
+    /// Returns whether any block record was added, so the caller knows to
+    /// persist. The first policy of a run only seeds the comparison set: a
+    /// block that is already active at startup was recorded by the run that
+    /// engaged it.
+    fn refresh_policy(&mut self, now: Timestamp) -> bool {
+        let entries = policy_entries(&self.state, now);
+        let mut recorded = false;
+        let mut current = BTreeSet::new();
+        for entry in &entries {
+            current.insert(entry.app.clone());
+            if self.policy_seeded && !self.policy_apps.contains(&entry.app) {
+                self.state.usage.blocked(
+                    Target::App(entry.app.clone()),
+                    entry.reason,
+                    now,
+                    entry.until,
+                    entry.profile,
+                );
+                recorded = true;
+            }
+        }
+        self.policy_apps = current;
+        self.policy_seeded = true;
+
+        let apps: Vec<Value> = entries
+            .iter()
+            .map(|entry| {
+                json!({
+                    "app": entry.app.as_str(),
+                    "reason": entry.reason.as_str(),
+                    "until": entry.until,
+                    "profile": entry.profile_name,
+                })
+            })
+            .collect();
+        let policy = json!({
+            "version": 1,
+            "generated_at": now,
+            "valid_until": now + chrono::TimeDelta::seconds(30),
+            "apps": apps,
+        });
+        let Ok(encoded) = serde_json::to_vec_pretty(&policy) else {
+            eprintln!("stayproductive: could not encode enforcement policy");
+            return recorded;
+        };
+        if let Err(error) = write_private(&self.policy_path(), &encoded) {
+            eprintln!("stayproductive: could not write enforcement policy: {error}");
+        }
+        recorded
     }
 
     fn persist(&self) -> DResult<()> {
@@ -480,20 +676,26 @@ impl Daemon {
             .join("enforcement.json")
     }
 
-    fn write_policy(&self, now: Timestamp) {
-        let policy = enforcement_policy(&self.state, now);
-        let Ok(encoded) = serde_json::to_vec_pretty(&policy) else {
-            eprintln!("stayproductive: could not encode enforcement policy");
-            return;
-        };
-        if let Err(error) = write_private(&self.policy_path(), &encoded) {
-            eprintln!("stayproductive: could not write enforcement policy: {error}");
-        }
+    fn usage_today(&self, now: Timestamp) -> Value {
+        let day = day_period(now, &self.state.settings);
+        let mut rows: Vec<(String, u64)> = self
+            .state
+            .usage
+            .usage_per_app(&day, now)
+            .into_iter()
+            .map(|(app, duration)| (app.as_str().to_owned(), duration.as_secs()))
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        Value::Array(
+            rows.into_iter()
+                .map(|(app, seconds)| json!({"app": app, "seconds": seconds}))
+                .collect(),
+        )
     }
 
     fn snapshot(&self) -> Value {
         let now = Utc::now();
-        let heartbeat = extension_heartbeat(now);
+        let heartbeat = read_heartbeat(now).is_some_and(|heartbeat| heartbeat.fresh);
         let enforcement = if heartbeat {
             json!({
                 "state": "active",
@@ -561,10 +763,11 @@ impl Daemon {
             "commitment": commitment,
             "quick_blocks": self.state.quick_blocks.iter().map(|block| json!({
                 "target": block.target.key(),
-                "kind": match block.target { Target::App(_) => "app", Target::Site(_) => "site" },
+                "kind": match &block.target { Target::App(_) => "app", Target::Site(_) => "site" },
                 "until": block.until,
             })).collect::<Vec<_>>(),
             "history": history,
+            "usage_today": self.usage_today(now),
             "enforcement": enforcement,
             "state_path": self.path.display().to_string(),
         })

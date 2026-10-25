@@ -15,11 +15,15 @@ one required layer or automated acceptance evidence is still outstanding. See
 
 The runnable build (October 2026) has the core engine, a local JSON state
 service, and a GTK 4 + libadwaita UI. It includes an opt-in GNOME Shell
-extension that enforces application `block` rules and application quick blocks
-on real windows. It does **not** yet enforce websites, keywords, usage limits,
-or other compositors. Every row whose user-visible result depends on those
-missing layers remains `wip` or `todo`. The app reports enforcement as active
-only when the extension heartbeat is fresh and has loaded a valid policy.
+extension that enforces application `block` rules, application quick blocks,
+and daily/hourly application usage limits on real windows: the extension
+reports the focused app, the daemon attributes foreground intervals to the
+engine's usage ledger, and a reached limit produces a policy entry like any
+other block. It does **not** yet enforce websites, keywords, site time limits,
+launch/pickup limits, or other compositors. Every row whose user-visible
+result depends on those missing layers remains `wip` or `todo`. The app
+reports enforcement as active only when the extension heartbeat is fresh and
+has loaded a valid policy.
 
 ## 1. Profiles and rules
 
@@ -103,7 +107,7 @@ only when the extension heartbeat is fresh and has loaded a valid policy.
 
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-STA-01 | Record foreground intervals per app/site | P0 | tracker + SQLite | block §7 | A-STA-01 | todo |
+| F-STA-01 | Record foreground intervals per app/site | P0 | tracker + SQLite | block §7 | A-STA-01 | wip |
 | F-STA-02 | Today / week / month totals | P1 | queries | ux §7 | A-STA-02 | todo |
 | F-STA-03 | Top distractions ranking | P1 | queries | ux §7 | A-STA-03 | todo |
 | F-STA-04 | Usage timeline | P2 | queries + chart | ux §7 | A-STA-04 | todo |
@@ -168,7 +172,8 @@ only when the extension heartbeat is fresh and has loaded a valid policy.
 | Strict cool-down | core test rejects `finish_commitment_end` before the cool-down and accepts it afterwards; locked edits/pauses are rejected |
 | Enforcement policy | daemon protocol test checks active/inactive app entries, policy path, and `0600` mode |
 | Enforcement heartbeat | daemon protocol test checks active only with a fresh `active:true`/`policy_loaded:true` heartbeat and refuses stale, inactive, or policy-less files |
-| GNOME matching helpers | `gjs -m integrations/gnome/tests/matching.test.js` pass |
+| Usage tracking → limits | daemon protocol test drives the real binary: reported focus over a daily limit blocks with `R-LIMIT-DAILY` and records history; the block overlay suspends accrual; counters survive restart (A-LIM-05 seed) |
+| GNOME matching helpers | `gjs -m integrations/gnome/tests/matching.test.js` pass, including the `FocusTracker` interval rules |
 | Installed-app chooser | `PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests` pass; GTK construction smoke-tested under Xvfb |
 | GNOME install flow | exercised with an isolated `XDG_DATA_HOME` and keyfile settings backend; copied the extension and enabled it without touching the host session |
 | GNOME extension load | pass in headless GNOME Shell 49: loads, reads policy, writes heartbeat, drops expired/removed policy |

@@ -102,6 +102,16 @@ def countdown(seconds: int) -> str:
     return f"{minutes}:{seconds:02d}"
 
 
+def duration_text(seconds: int) -> str:
+    minutes = max(0, int(seconds)) // 60
+    if minutes < 1:
+        return "less than a minute"
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} h {minutes:02d} min" if minutes else f"{hours} h"
+    return f"{minutes} min"
+
+
 def schedule_summary(schedule: dict | None) -> str:
     if not schedule:
         return "No schedule"

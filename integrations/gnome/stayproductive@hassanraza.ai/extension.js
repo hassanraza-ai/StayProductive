@@ -16,6 +16,7 @@ import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 import {
+    FocusTracker,
     appIdsForWindow,
     findBlockedApp,
     parseTimestamp,
@@ -34,6 +35,8 @@ export default class StayProductiveExtension extends Extension {
         this._ticks = 0;
         this._monitorsChangedId = 0;
         this._focusChangedId = 0;
+        this._focusTracker = new FocusTracker();
+        this._focus = {ids: null, since: null};
 
         this._policyPath = GLib.build_filenamev([
             GLib.get_user_data_dir(),
@@ -83,6 +86,8 @@ export default class StayProductiveExtension extends Extension {
         this._removeHeartbeat();
         this._destroyOverlay();
         this._policy = null;
+        this._focusTracker = null;
+        this._focus = {ids: null, since: null};
     }
 
     _buildOverlay() {
@@ -216,12 +221,15 @@ export default class StayProductiveExtension extends Extension {
     }
 
     _writeHeartbeat() {
+        const focusSince = this._focus?.since ?? null;
         const text = JSON.stringify({
             active: true,
             checked_at: new Date().toISOString(),
             shell_version: Config.PACKAGE_VERSION,
             policy_loaded: Boolean(this._policy),
             blocked: Boolean(this._overlay?.visible),
+            focus: this._focus?.ids ?? null,
+            focus_since: focusSince === null ? null : new Date(focusSince).toISOString(),
         });
         try {
             GLib.mkdir_with_parents(
@@ -259,39 +267,40 @@ export default class StayProductiveExtension extends Extension {
         if (!this._overlay)
             return;
 
-        if (Main.sessionMode.isLocked || Main.overview.visible) {
+        const suspended = Main.sessionMode.isLocked || Main.overview.visible;
+        this._trackFocus(suspended);
+
+        if (suspended || !this._policy || this._focus.ids === null) {
             this._hideOverlay();
             return;
         }
 
-        if (!this._policy) {
-            this._hideOverlay();
-            return;
-        }
-
-        const win = global.display.focus_window;
-        if (!win) {
-            this._hideOverlay();
-            return;
-        }
-
-        const ids = appIdsForWindow(win);
-        if (ids.size === 0) {
-            this._hideOverlay();
-            return;
-        }
-        if ([...ids].some(id => id.includes('stayproductive'))) {
-            this._hideOverlay();
-            return;
-        }
-
-        const entry = findBlockedApp(this._policy, ids);
+        const entry = findBlockedApp(this._policy, new Set(this._focus.ids));
         if (!entry) {
             this._hideOverlay();
             return;
         }
 
-        this._showOverlay(win, entry);
+        this._showOverlay(global.display.focus_window, entry);
+    }
+
+    /**
+     * Update the focus observation that the heartbeat reports for usage
+     * tracking. Nothing is attributable while the session is locked, the
+     * overview is up, or the focused window is StayProductive itself.
+     */
+    _trackFocus(suspended) {
+        let ids = null;
+        if (!suspended) {
+            const win = global.display.focus_window;
+            if (win) {
+                const candidates = appIdsForWindow(win);
+                if (candidates.size > 0 &&
+                    ![...candidates].some(id => id.includes('stayproductive')))
+                    ids = [...candidates];
+            }
+        }
+        this._focus = this._focusTracker.update(ids);
     }
 
     _showOverlay(win, entry) {

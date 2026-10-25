@@ -27,6 +27,7 @@ impl Service {
     fn start(state: &Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_stayproductive-daemon"))
             .env("STAYPRODUCTIVE_STATE", state)
+            .env("TZ", "UTC")
             .env(
                 "XDG_RUNTIME_DIR",
                 state.parent().unwrap_or_else(|| Path::new(".")),
@@ -168,6 +169,241 @@ fn strict_commitment_locks_rules_and_survives_restart() {
     assert_eq!(
         snapshot["commitment"]["restrictions"],
         json!(["block_edits", "block_pause"])
+    );
+    restarted.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn write_heartbeat(
+    heartbeat: &Path,
+    focus: Option<Vec<&str>>,
+    focus_since: Option<chrono::DateTime<chrono::Utc>>,
+    blocked: bool,
+) {
+    let now = chrono::Utc::now();
+    let body = json!({
+        "active": true,
+        "policy_loaded": true,
+        "blocked": blocked,
+        "focus": focus,
+        "focus_since": focus_since.map(|at| at.to_rfc3339()),
+        "checked_at": now.to_rfc3339(),
+    });
+    std::fs::write(heartbeat, body.to_string()).expect("write heartbeat");
+}
+
+fn policy_apps(policy_path: &Path) -> Vec<Value> {
+    let policy: Value = serde_json::from_slice(&std::fs::read(policy_path).expect("policy file"))
+        .expect("policy json");
+    policy["apps"].as_array().expect("apps array").clone()
+}
+
+fn usage_seconds(snapshot: &Value, app: &str) -> u64 {
+    snapshot["usage_today"]
+        .as_array()
+        .expect("usage_today array")
+        .iter()
+        .find(|entry| entry["app"] == app)
+        .map(|entry| entry["seconds"].as_u64().expect("seconds"))
+        .unwrap_or(0)
+}
+
+#[test]
+fn usage_tracking_enforces_daily_limit_and_records_history() {
+    let (dir, path) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let heartbeat = runtime.join("gnome-extension.json");
+    let policy_path = dir.join("enforcement.json");
+
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "daily_limit", "minutes": 1}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+    assert!(
+        policy_apps(&policy_path).is_empty(),
+        "under the limit the app is not blocked"
+    );
+
+    // 90 seconds of reported focus, over the 1-minute daily limit.
+    write_heartbeat(
+        &heartbeat,
+        Some(vec!["org.mozilla.firefox"]),
+        Some(chrono::Utc::now() - chrono::Duration::seconds(90)),
+        false,
+    );
+    let snapshot = service.ok("snapshot", json!({}));
+    let apps = policy_apps(&policy_path);
+    assert_eq!(apps.len(), 1, "the daily limit must now block: {apps:?}");
+    assert_eq!(apps[0]["app"], "firefox");
+    assert_eq!(apps[0]["reason"], "R-LIMIT-DAILY");
+    assert!(
+        apps[0]["until"].as_str().is_some(),
+        "limit blocks say when the day ends"
+    );
+    assert_eq!(apps[0]["profile"], "Focus");
+    assert!(
+        usage_seconds(&snapshot, "firefox") >= 90,
+        "focus time is attributed to the app: {}",
+        snapshot["usage_today"]
+    );
+    assert_eq!(
+        snapshot["usage_today"]
+            .as_array()
+            .expect("usage_today")
+            .len(),
+        1,
+        "no other app is attributed"
+    );
+    // The block is recorded when the policy is written, after the response
+    // above was rendered; the next poll sees it in history.
+    let snapshot = service.ok("snapshot", json!({}));
+    assert_eq!(
+        snapshot["history"][0]["target"], "firefox",
+        "the enforced block is recorded in history"
+    );
+    assert_eq!(snapshot["history"][0]["reason"], "R-LIMIT-DAILY");
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn blocked_overlay_suspends_usage_accrual() {
+    let (dir, path) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let heartbeat = runtime.join("gnome-extension.json");
+
+    let mut service = Service::start(&path);
+    service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "daily_limit", "minutes": 60}]
+            }
+        }),
+    );
+    let profile_id = service.ok("snapshot", json!({}))["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    let since = chrono::Utc::now() - chrono::Duration::seconds(90);
+    write_heartbeat(&heartbeat, Some(vec!["firefox"]), Some(since), false);
+    let before = usage_seconds(&service.ok("snapshot", json!({})), "firefox");
+    assert!(before >= 90, "usage is attributed while focused: {before}");
+
+    // The overlay is up; time behind the block screen must not count.
+    write_heartbeat(&heartbeat, Some(vec!["firefox"]), Some(since), true);
+    service.ok("snapshot", json!({}));
+
+    // Same focus window resumes after the overlay; the blocked gap must not
+    // be re-attributed even though focus_since still predates it.
+    write_heartbeat(&heartbeat, Some(vec!["firefox"]), Some(since), false);
+    let after = usage_seconds(&service.ok("snapshot", json!({})), "firefox");
+    assert!(
+        after - before < 30,
+        "blocked time must not accrue: before {before}, after {after}"
+    );
+
+    // A stale heartbeat means no observer: attribution stops again.
+    std::fs::write(
+        &heartbeat,
+        json!({
+            "active": true,
+            "policy_loaded": true,
+            "blocked": false,
+            "focus": ["firefox"],
+            "focus_since": since.to_rfc3339(),
+            "checked_at": (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339(),
+        })
+        .to_string(),
+    )
+    .expect("write stale heartbeat");
+    let stopped = usage_seconds(&service.ok("snapshot", json!({})), "firefox");
+    assert!(
+        stopped - after < 30,
+        "attribution must stop without a fresh observer: after {after}, stopped {stopped}"
+    );
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn usage_counters_survive_restart() {
+    let (dir, path) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let heartbeat = runtime.join("gnome-extension.json");
+    let policy_path = dir.join("enforcement.json");
+
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "steam", "action": "daily_limit", "minutes": 1}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    write_heartbeat(
+        &heartbeat,
+        Some(vec!["steam"]),
+        Some(chrono::Utc::now() - chrono::Duration::seconds(90)),
+        false,
+    );
+    let snapshot = service.ok("snapshot", json!({}));
+    assert!(
+        usage_seconds(&snapshot, "steam") >= 90,
+        "usage recorded before restart"
+    );
+    assert!(
+        policy_apps(&policy_path)
+            .iter()
+            .any(|app| app["app"] == "steam"),
+        "blocked before restart"
+    );
+    service.shutdown();
+
+    // Restart with no focus reported: the recorded intervals must keep the
+    // limit exhausted (A-LIM-05).
+    write_heartbeat(&heartbeat, None, None, false);
+    let mut restarted = Service::start(&path);
+    let snapshot = restarted.ok("snapshot", json!({}));
+    assert!(
+        usage_seconds(&snapshot, "steam") >= 90,
+        "usage survives the restart"
+    );
+    assert!(
+        policy_apps(&policy_path)
+            .iter()
+            .any(|app| app["app"] == "steam" && app["reason"] == "R-LIMIT-DAILY"),
+        "the exhausted limit still blocks after restart"
     );
     restarted.shutdown();
     let _ = std::fs::remove_dir_all(&dir);

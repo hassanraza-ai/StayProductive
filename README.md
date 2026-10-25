@@ -23,15 +23,17 @@ resources, or assets from the reference app are included or licensed.
 | Core engine | **implemented** — profiles, rules, limits, schedules, commitments, 32 acceptance scenarios |
 | Local state service | **implemented** — versioned atomic JSON, profiles, quick blocks, strict cool-down, settings |
 | Desktop UI | **implemented** — dashboard, profiles and editor, schedules, strict session, activity, settings |
-| Desktop enforcement | **implemented for GNOME app windows** — opt-in Shell extension; websites, limits, and other compositors remain |
+| Desktop enforcement | **implemented for GNOME app windows** — opt-in Shell extension covering app blocks, quick blocks, and daily/hourly app usage limits; sites, keywords, and other compositors remain |
 | Runtime parity verification | impossible against the reference without a device; parity is defined by the acceptance suite |
 
 The current build is useful as a real, persistent focus planner: profiles,
 schedules, limits, strict commitments, and state survive restarts. On GNOME it
-can also block application windows once the bundled Shell extension is installed
-and enabled. Website, keyword, usage-limit, and non-GNOME enforcement are still
-missing; the dashboard and Settings page report the adapter state rather than
-pretending.
+can also block application windows and enforce daily/hourly application usage
+limits once the bundled Shell extension is installed and enabled — the
+extension reports the focused app, the daemon accumulates foreground time in
+the engine's usage ledger, and a reached limit blocks like any other rule.
+Website, keyword, and non-GNOME enforcement are still missing; the dashboard
+and Settings page report the adapter state rather than pretending.
 
 ### Implemented today
 
@@ -50,6 +52,10 @@ pretending.
   and timezone are editable.
 - Strict commitments block profile edits and pauses in both the UI and the
   daemon, and survive restart.
+- Foreground usage tracking for apps with rules: the extension heartbeat names
+  the focused app, the daemon attributes intervals to the core usage ledger,
+  and daily/hourly app limits enforce for real. Usage survives restart, stops
+  behind the block overlay, and is shown per app on the Activity page.
 - GNOME Shell integration: a short-lived `enforcement.json` policy, an opt-in
   extension that overlays blocked application windows on Wayland and XWayland,
   a runtime heartbeat, and an install/status flow in Settings.
@@ -58,12 +64,12 @@ pretending.
 
 ### Not implemented yet
 
-Website and keyword enforcement, the browser extension, usage-limit tracking,
+Website and keyword enforcement, the browser extension, site time limits,
 launch/pickup limits, non-GNOME compositor adapters, tray integration, DNS
-helper, SQLite history/migrations, usage statistics, onboarding, low-time
-notifications, backup/restore, full translation catalogs, and a complete
-screen-reader audit. These remain tracked as `todo`/`wip`/`gap` in
-[`docs/parity/feature-matrix.md`](docs/parity/feature-matrix.md).
+helper, SQLite history/migrations, usage statistics beyond today's totals,
+onboarding, low-time notifications, backup/restore, full translation catalogs,
+and a complete screen-reader audit. These remain tracked as `todo`/`wip`/`gap`
+in [`docs/parity/feature-matrix.md`](docs/parity/feature-matrix.md).
 
 ## Run the desktop app
 
@@ -96,11 +102,14 @@ does not use `pip` for PyGObject.
    **Enforcement active**, and blocking an application in an active profile
    should cover its window.
 
-The extension is optional and local. It enforces application `block` rules and
-application quick blocks only; sites, keywords, and usage limits still need the
-browser extension and tracker. Closing StayProductive invalidates the policy
-within 30 seconds. See [`integrations/gnome/README.md`](integrations/gnome/README.md)
-for the policy format, emergency unblock, privacy notes, and uninstall steps.
+The extension is optional and local. It enforces application `block` rules,
+application quick blocks, and daily/hourly application usage limits (by
+reporting the focused app so the daemon can attribute foreground time); sites,
+keywords, launch and pickup limits still need the browser extension and a
+logind hookup. Closing StayProductive invalidates the policy within 30 seconds.
+See [`integrations/gnome/README.md`](integrations/gnome/README.md)
+for the policy format, usage tracking, emergency unblock, privacy notes, and
+uninstall steps.
 
 ### Verify the engine
 

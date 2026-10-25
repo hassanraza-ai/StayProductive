@@ -2,6 +2,7 @@
 // Run with: gjs -m integrations/gnome/tests/matching.test.js
 
 import {
+    FocusTracker,
     appIdsForWindow,
     appIdsFromValues,
     findBlockedApp,
@@ -102,9 +103,35 @@ function testReasonText() {
     assert(reasonText('R-UNKNOWN').includes('StayProductive'), 'fallback reason');
 }
 
+function testFocusTracker() {
+    const tracker = new FocusTracker();
+
+    let state = tracker.update(null, 1_000);
+    assert(state.ids === null, 'no focus reports null ids');
+    assert(state.since === null, 'no focus reports null since');
+
+    state = tracker.update(['firefox', 'org.mozilla.firefox'], 2_000);
+    assert(Array.isArray(state.ids) && state.ids.length === 2, 'ids are reported');
+    assert(state.since === 2_000, 'a new focus records its start');
+
+    state = tracker.update(['org.mozilla.firefox', 'firefox'], 3_000);
+    assert(state.since === 2_000, 'the same focus window keeps its start');
+    assert(
+        state.ids.join(',') === 'firefox,org.mozilla.firefox',
+        'ids are sorted so accessor order does not matter'
+    );
+
+    state = tracker.update(null, 3_500);
+    assert(state.ids === null && state.since === null, 'leaving focus clears both');
+
+    state = tracker.update(['firefox', 'org.mozilla.firefox'], 4_000);
+    assert(state.since === 4_000, 'returning to an app is a new interval');
+}
+
 testNormalisation();
 testWindowAccessors();
 testMatching();
 testPolicyFreshness();
 testReasonText();
+testFocusTracker();
 print('matching.test.js: ok');

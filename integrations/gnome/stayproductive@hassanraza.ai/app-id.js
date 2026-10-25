@@ -57,6 +57,34 @@ export function findBlockedApp(policy, ids) {
     );
 }
 
+export class FocusTracker {
+    constructor() {
+        this._key = null;
+        this._ids = null;
+        this._sinceMs = null;
+    }
+
+    /**
+     * Record the newest focus observation and return {ids, since}.
+     *
+     * `ids` is null when nothing is attributable (locked session, overview,
+     * no window, or the StayProductive window itself). The ids are sorted so
+     * the accessor order a window reports does not restart the interval, and
+     * `since` is the instant this focus window was first seen, in epoch
+     * milliseconds. Re-focusing the same app after leaving it is a new
+     * interval and gets a new `since`.
+     */
+    update(ids, nowMs = Date.now()) {
+        const key = ids === null ? null : [...ids].sort().join('\n');
+        if (key !== this._key) {
+            this._key = key;
+            this._ids = ids === null ? null : [...ids].sort();
+            this._sinceMs = ids === null ? null : nowMs;
+        }
+        return {ids: this._ids, since: this._sinceMs};
+    }
+}
+
 export function parseTimestamp(value) {
     if (typeof value !== 'string' || value.length === 0)
         return null;

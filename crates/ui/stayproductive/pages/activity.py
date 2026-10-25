@@ -5,7 +5,7 @@ from __future__ import annotations
 from gi.repository import Gtk
 
 from .. import widgets as w
-from ..formatting import error_text, local_time, relative, remaining_seconds
+from ..formatting import duration_text, error_text, local_time, relative, remaining_seconds
 
 
 class ActivityPage:
@@ -31,6 +31,20 @@ class ActivityPage:
         )
         self.root.append(copy)
 
+        today = w.Card(spacing=12)
+        today.append(w.label("Today", "card-title"))
+        today.append(
+            w.label(
+                "Foreground time per app with rules, recorded while the desktop "
+                "adapter reports focus. Nothing leaves this machine.",
+                "muted",
+            )
+        )
+        self.today_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.today_list.set_margin_top(2)
+        today.append(self.today_list)
+        self.root.append(today)
+
         quick = w.Card(spacing=12)
         quick.append(w.label("Active quick blocks", "card-title"))
         self.quick_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -54,6 +68,20 @@ class ActivityPage:
     def refresh(self, snapshot: dict) -> None:
         now = snapshot.get("now")
         tz = snapshot.get("settings", {}).get("timezone", "UTC")
+        w.clear(self.today_list)
+        usage = snapshot.get("usage_today") or []
+        if not usage:
+            self.today_list.append(
+                w.label("No tracked usage yet today.", "muted small")
+            )
+        for entry in usage:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            title = w.label(entry.get("app", "?"), "row-title")
+            title.set_hexpand(True)
+            row.append(title)
+            row.append(w.label(duration_text(entry.get("seconds", 0)), "muted small"))
+            self.today_list.append(row)
+
         w.clear(self.quick_list)
         blocks = [
             block
