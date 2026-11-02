@@ -2,56 +2,15 @@
 
 from __future__ import annotations
 
-import os
-import shutil
 from pathlib import Path
 
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+from gi.repository import Adw, Gdk, Gio, Gtk
 
+from .. import desktop
 from .. import widgets as w
 from ..formatting import error_text
 
-GNOME_EXTENSION_UUID = "stayproductive@hassanraza.ai"
-GNOME_SHELL_SCHEMA = "org.gnome.shell"
-
-
-def _extension_source() -> Path | None:
-    candidates = [
-        parent
-        / "integrations"
-        / "gnome"
-        / GNOME_EXTENSION_UUID
-        for parent in Path(__file__).resolve().parents
-    ]
-    candidates.extend(
-        [
-            Path(GLib.get_user_data_dir())
-            / "stayproductive"
-            / "extension-source"
-            / GNOME_EXTENSION_UUID,
-            Path("/usr/share/stayproductive/gnome-extension"),
-        ]
-    )
-    return next(
-        (path for path in candidates if (path / "metadata.json").is_file()), None
-    )
-
-
-def _extension_target() -> Path:
-    return (
-        Path(GLib.get_user_data_dir())
-        / "gnome-shell"
-        / "extensions"
-        / GNOME_EXTENSION_UUID
-    )
-
-
-def _is_gnome() -> bool:
-    desktops = " ".join(
-        os.environ.get(name, "")
-        for name in ("XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP")
-    ).lower()
-    return "gnome" in desktops or "GNOME_DESKTOP_SESSION_ID" in os.environ
+GNOME_EXTENSION_UUID = desktop.GNOME_EXTENSION_UUID
 
 
 class SettingsPage:
@@ -172,6 +131,37 @@ class SettingsPage:
         integration.add(self.extension_note)
         self.page.add(integration)
 
+        help_group = Adw.PreferencesGroup(
+            title="Help",
+            description="Revisit the setup steps at any time. Nothing is reset.",
+        )
+        onboarding_row = Adw.ActionRow(
+            title="Run onboarding again",
+            subtitle=(
+                "Review the purpose, choose another goal, and create a starter "
+                "profile. Existing profiles and commitments are left alone."
+            ),
+        )
+        onboarding_row.add_suffix(
+            w.button(
+                "Start",
+                css="flat",
+                tooltip="Open the first-run wizard again",
+                on_click=lambda _button: self.window.show_onboarding(first_run=False),
+            )
+        )
+        help_group.add(onboarding_row)
+        help_group.add(
+            Adw.ActionRow(
+                title="Not a parental-control tool",
+                subtitle=(
+                    "You decide every rule. There is no account, purchase, "
+                    "telemetry, or hidden exit."
+                ),
+            )
+        )
+        self.page.add(help_group)
+
         about = Adw.PreferencesGroup(title="About")
         version = Adw.ActionRow(
             title="StayProductive",
@@ -223,10 +213,10 @@ class SettingsPage:
         self._refresh_extension(active)
 
     def _refresh_extension(self, enforcement_active: bool) -> None:
-        installed = (_extension_target() / "metadata.json").is_file()
-        enabled = self._extension_enabled() if installed else False
+        installed = desktop.extension_installed()
+        enabled = desktop.extension_enabled() if installed else False
 
-        if not _is_gnome():
+        if not desktop.is_gnome():
             self.extension_row.set_subtitle(
                 "This session is not GNOME. The extension is not used here, and "
                 "no other desktop adapter is installed in this build."
@@ -260,15 +250,7 @@ class SettingsPage:
             self.extension_button.set_label("Reinstall")
 
     def _extension_enabled(self) -> bool:
-        if not _is_gnome():
-            return False
-        try:
-            shell = Gio.Settings.new(GNOME_SHELL_SCHEMA)
-            if shell.get_boolean("disable-user-extensions"):
-                return False
-            return GNOME_EXTENSION_UUID in shell.get_strv("enabled-extensions")
-        except Exception:  # noqa: BLE001 - schema or dconf can be unavailable
-            return False
+        return desktop.extension_enabled()
 
     def _set_pill(self, pill: Gtk.Label, text: str, kind: str) -> None:
         for value in ("active", "warning", "neutral", "accent", "idle"):
@@ -277,36 +259,21 @@ class SettingsPage:
         pill.set_label(text.upper())
 
     def _install_or_enable_extension(self) -> None:
-        source = _extension_source()
-        if source is None:
-            self.window.show_error(
-                "Extension files are missing",
-                "This build does not contain the GNOME integration files. "
-                "Reinstall StayProductive or point the package at "
-                "integrations/gnome/stayproductive@hassanraza.ai.",
-            )
-            return
-
-        target = _extension_target()
-        installed = (target / "metadata.json").is_file()
-        enabled = self._extension_enabled() if installed else False
         try:
-            target.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(source, target, dirs_exist_ok=True)
-        except OSError as error:
-            self.window.show_error("Could not install the extension", error)
+            desktop.copy_extension()
+        except desktop.DesktopError as error:
+            heading = (
+                "Extension files are missing"
+                if desktop.extension_source() is None
+                else "Could not install the extension"
+            )
+            self.window.show_error(heading, str(error))
             return
 
-        if not enabled:
+        if not desktop.extension_enabled():
             try:
-                shell = Gio.Settings.new(GNOME_SHELL_SCHEMA)
-                if shell.get_boolean("disable-user-extensions"):
-                    raise RuntimeError("user extensions are disabled by policy")
-                enabled_extensions = shell.get_strv("enabled-extensions")
-                if GNOME_EXTENSION_UUID not in enabled_extensions:
-                    enabled_extensions.append(GNOME_EXTENSION_UUID)
-                    shell.set_strv("enabled-extensions", enabled_extensions)
-            except Exception as error:  # noqa: BLE001
+                desktop.enable_extension()
+            except desktop.DesktopError as error:
                 self.window.show_error(
                     "Extension installed; enable it manually",
                     "Open Extensions or run: gnome-extensions enable "

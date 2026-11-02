@@ -29,6 +29,8 @@ Rules:
 
 - Skipping optional capabilities is allowed; the dashboard shows a persistent
   but dismissible banner for missing enforcement.
+- A capability the build cannot provide is named as unavailable, with the reason,
+  instead of offering a control that appears to enable it.
 - The onboarding never asks for an email, purchase, or analytics consent.
 - Re-running onboarding is available from Settings → Help.
 

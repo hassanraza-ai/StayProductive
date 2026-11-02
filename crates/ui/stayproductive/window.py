@@ -8,6 +8,7 @@ from . import widgets as w
 from .editor import ProfileEditor
 from .engine import Engine, EngineError
 from .formatting import error_text
+from .onboarding import Onboarding, should_show_onboarding
 from .pages.activity import ActivityPage
 from .pages.dashboard import DashboardPage
 from .pages.focus import FocusPage
@@ -33,6 +34,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.engine = engine
         self.snapshot: dict = {}
         self.editor: ProfileEditor | None = None
+        self.onboarding: Onboarding | None = None
+        self._onboarding_auto_shown = False
         self._error_shown = False
         self._build()
         self.refresh()
@@ -139,9 +142,18 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_content(self.toast_overlay)
 
         GLib.idle_add(self._select_initial)
+        GLib.idle_add(self._maybe_onboard)
 
     def _select_initial(self) -> bool:
         self.nav.select_row(self.nav.get_row_at_index(0))
+        return False
+
+    def _maybe_onboard(self) -> bool:
+        if self._onboarding_auto_shown:
+            return False
+        self._onboarding_auto_shown = True
+        if should_show_onboarding(self.snapshot):
+            self.show_onboarding(first_run=True)
         return False
 
     def _global_menu(self) -> Gtk.MenuButton:
@@ -216,6 +228,15 @@ class MainWindow(Adw.ApplicationWindow):
                 return
 
     # -------------------------------------------------------------- operations
+    def show_onboarding(self, *, first_run: bool = False) -> None:
+        if not first_run and self._edits_blocked():
+            return
+        if self.onboarding is not None:
+            self.onboarding.present(self)
+            return
+        self.onboarding = Onboarding(self, first_run=first_run)
+        self.onboarding.present(self)
+
     def create_profile(self) -> None:
         if self._edits_blocked():
             return

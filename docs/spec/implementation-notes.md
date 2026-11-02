@@ -25,7 +25,9 @@ These notes record decisions the existing specs left implicit. Anything marked
 
 Unit tests additionally cover DST day lengths, the local-date period
 calculator, schedule gap/merge behaviour, keyword folding, and ledger
-attribution. The suite currently has 32 acceptance tests.
+attribution. The suite currently has 32 acceptance tests. The UI test suite
+(`crates/ui/tests`) adds 21 display-free tests for application discovery and
+onboarding (`A-UX-01`).
 
 ## Decisions made in code
 
@@ -176,13 +178,41 @@ rendered from the returned snapshot. Pages:
   countdown, and end when the cool-down is ready.
 - **Activity** — active quick blocks and recorded block decisions.
 - **Settings** — start of day, IANA timezone, desktop integration install and
-  status, policy path, capability status, data path, copy path, open folder, and
-  About dialog.
+  status, policy path, capability status, data path, copy path, open folder, a
+  Help group that re-runs onboarding, and About dialog.
 
 The front end refreshes from the service every five seconds and after each
 mutation. It shows “Enforcement active” only when the extension heartbeat is
 fresh and reports a loaded policy; otherwise it shows “Enforcement offline” and
 explains how to install or load the adapter.
+
+### First-run onboarding
+
+`crates/ui/stayproductive/onboarding.py` implements `F-UX-01` as an
+`Adw.Dialog` with five steps: welcome and purpose, goal, capabilities, review,
+and done. Goal logic is pure: `Goal` definitions, alias-based app matching,
+`apps_for_goal`, and `starter_profile` are testable without a display.
+
+- Goals preselect at most `MAX_STARTER_APPS` (6) installed applications in hint
+  order. The selection is editable in step 4; applications are shown by display
+  name and raw IDs stay out of the main flow.
+- Step 3 lists foreground app visibility (with the real adapter state) and names
+  autostart, notifications, and the DNS helper as unavailable. There is no code
+  path that enables them, so clicking through the wizard cannot silently turn on
+  an optional capability.
+- `StarterProfileCreator` creates at most one profile per wizard run and writes
+  `onboarding.json` next to `state.json` only after the daemon accepts the
+  profile. A rejected create leaves the guard open so the user can fix the name
+  and retry.
+- The wizard auto-opens only when there is no commitment, no profile, and no
+  marker. Settings → Help re-runs it without resetting anything.
+- The dashboard's missing-enforcement banner has a session-scoped dismiss
+  button, as `ux-flows.md` §2 requires; the banner returns next launch.
+
+Known limits: the capability step cannot grant autostart or notifications
+because those integrations do not exist yet, so `F-UX-01` stays `wip`. The
+wizard's GTK flow is smoke-tested under Xvfb (construction, step navigation, app
+add/remove, profile creation), but not automated in CI as a UI test.
 
 ### Strict commitments and cool-down
 
@@ -249,9 +279,12 @@ missing pieces.
   adapter and its scope.
 - **D-Bus, systemd user unit, tray, CLI** — the current boundary is stdio JSON
   and the UI launches the service itself.
-- **Usage statistics, notifications, onboarding, export/delete, backup/restore,
+- **Usage statistics, notifications, export/delete, backup/restore,
   localisation catalogs, full accessibility audit**.
 - **Low-time alerts** (`A-LIM-07` / `A-PLAT-11`).
+- **Optional onboarding capabilities** — autostart, notifications, and the DNS
+  helper are explained in the wizard but not implemented; the step is honest
+  about that instead of offering a switch that does nothing.
 
 ## Test commands
 
@@ -260,12 +293,14 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 gjs -m integrations/gnome/tests/matching.test.js
+PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests
 gnome-extensions pack integrations/gnome/stayproductive@hassanraza.ai --out-dir /tmp
 cargo build --release -p stayproductive-daemon
 ./stayproductive
 ```
 
-The Python frontend has no separate test runner yet; UI verification currently
-uses a harness that starts the real app, exercises the state service through the
-same calls the buttons use, and inspects persisted state. Turning those checks
-into an automated UI suite is tracked in the parity matrix.
+The Python suite (`crates/ui/tests`) covers installed-app discovery and the
+onboarding goal, alias matching, starter-profile construction, marker handling,
+and the one-profile-per-run guard. It needs no display. The GTK wizard is
+additionally construction-smoke-tested under Xvfb; that check is manual, not
+part of the suite.

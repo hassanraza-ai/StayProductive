@@ -55,14 +55,23 @@ pretending.
   a runtime heartbeat, and an install/status flow in Settings.
 - The dashboard only says enforcement is active when the extension heartbeat is
   fresh and reports a loaded policy; otherwise it explains what is missing.
+- A five-step first-run wizard: purpose, a goal (Social, Work, Study, Sleep,
+  Custom), an honest capability list, one editable starter profile, and a done
+  screen. It appears only on a clean state, creates exactly one profile, and can
+  be re-run from Settings → Help.
+- Blocking warnings are dismissible per session so a known gap does not shout on
+  every refresh — the underlying state is unchanged and reappears after a
+  restart or once enforcement recovers and drops again.
 
 ### Not implemented yet
 
 Website and keyword enforcement, the browser extension, usage-limit tracking,
 launch/pickup limits, non-GNOME compositor adapters, tray integration, DNS
-helper, SQLite history/migrations, usage statistics, onboarding, low-time
-notifications, backup/restore, full translation catalogs, and a complete
-screen-reader audit. These remain tracked as `todo`/`wip`/`gap` in
+helper, SQLite history/migrations, usage statistics, low-time notifications,
+backup/restore, full translation catalogs, and a complete screen-reader audit.
+Optional onboarding capabilities (autostart, notifications, DNS helper) are
+listed but deliberately unavailable, so nothing is enabled by clicking through
+the wizard. These remain tracked as `todo`/`wip`/`gap` in
 [`docs/parity/feature-matrix.md`](docs/parity/feature-matrix.md).
 
 ## Run the desktop app
@@ -82,6 +91,11 @@ STAYPRODUCTIVE_STATE=/tmp/stayproductive-test.json ./stayproductive
 
 The state service is a child of the UI. Closing the window shuts it down; the
 state is already persisted. There is no account, network call, or telemetry.
+
+On a clean state the first-run wizard opens automatically and offers a goal-based
+starter profile. Completing it writes `onboarding.json` next to `state.json`; to
+see the wizard again, either run it from **Settings → Help** or delete that
+marker. Re-running never resets profiles or commitments.
 
 On distributions where the Python GTK bindings are packaged separately, install
 `python3-gi`, `gir1.2-gtk-4.0`, and `gir1.2-adw-1` first. The app deliberately
@@ -121,6 +135,11 @@ heartbeat gate. The GNOME matching helpers have a compositor-free test:
 gjs -m integrations/gnome/tests/matching.test.js
 PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests
 ```
+
+The Python suite covers desktop-entry discovery and the onboarding goal/starter
+profile logic, including the “exactly one profile per wizard run” rule. The GTK
+wizard itself is construction-smoke-tested under Xvfb; visual inspection is not
+an acceptance test.
 
 ## What "identical behaviour" means here
 
