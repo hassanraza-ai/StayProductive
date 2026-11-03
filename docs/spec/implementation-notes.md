@@ -307,8 +307,12 @@ Limitations: Xvfb has no window manager, so the measured run exercised the
 compositor's focus rules. Overlay pixels and multi-monitor placement have not
 been inspected in a logged-in X11 session. Dynamic workspaces, screen
 lock/suspend, and compositors that refuse override-redirect focus remain open
-(`A-PLAT-09`, `A-PLAT-10`). The adapter covers application windows only; sites,
-keywords, and usage limits still need trackers and the browser extension.
+(`A-PLAT-09`, `A-PLAT-10`). Autostart at login relies on the graphical session
+exporting `DISPLAY`/`XAUTHORITY` into the systemd user manager; importing them
+when autostart is enabled covers the current manager, but a session that never
+exports them will start the daemon without an adapter and report `unavailable`.
+The adapter covers application windows only; sites, keywords, and usage limits
+still need trackers and the browser extension.
 
 ### GTK frontend
 

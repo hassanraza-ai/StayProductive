@@ -168,7 +168,10 @@ cat "${XDG_RUNTIME_DIR:-/tmp}/stayproductive/x11-adapter.log"
 The adapter covers application windows only. A compositor without EWMH support,
 screen lock/suspend, and dynamic workspace changes are not handled yet. Xvfb test
 runs use a direct unmap because there is no window manager; a real X11 login is
-still needed to judge iconification and overlay visuals. See
+still needed to judge iconification and overlay visuals. Start at login also
+depends on the session exporting `DISPLAY`/`XAUTHORITY` to the systemd user
+manager; enabling autostart from Settings imports them for the current manager,
+and the unit passes them through with `PassEnvironment`. See
 [`docs/spec/implementation-notes.md`](docs/spec/implementation-notes.md).
 
 ### Verify the engine
