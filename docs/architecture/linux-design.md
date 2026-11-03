@@ -68,14 +68,17 @@ without moving decisions out of `core`:
 
 | Target | Current build | Why |
 | --- | --- | --- |
-| D-Bus + Unix socket | newline-delimited JSON on stdio | fastest safe UI boundary; one request/response line, started by the UI |
+| D-Bus + Unix socket | newline-delimited JSON on a same-user Unix socket; stdio kept for tests | small safe UI boundary now; one request/response line, daemon independent of the window |
+| systemd user unit | `stayproductive.service` written by the UI; `Restart=always`; autostart opt-in | daemon survives the window; systemd restarts a killed daemon |
 | SQLite | versioned atomic JSON | no queryable history is needed until trackers exist |
 | gtk-rs | PyGObject | GTK 4 development headers were unavailable in the build environment; the widget layer is still GTK 4 + libadwaita |
 | D-Bus-driven GNOME extension | short-lived policy file + runtime heartbeat | no daemon D-Bus name yet; the file is same-user, atomic, and expires in 30 seconds |
 
-The daemon is still the only writer. The UI still has no decision logic. Both
-are expected to be replaced at M1; the matrix and implementation notes record
-the limitation rather than presenting it as the final architecture.
+The daemon is still the only writer. The UI still has no decision logic. The
+socket and unit are expected to be fronted by D-Bus at M1; the matrix and
+implementation notes record the limitation rather than presenting it as the
+final architecture. In socket mode the daemon republishes the policy every five
+seconds, so schedule changes and blocks continue without a client.
 
 ## 3. D-Bus surface (session bus)
 
@@ -203,8 +206,10 @@ reference does (it sends the user home). Hiding an app is the faithful mapping.
   with a clear error and the UI offers to update.
 - The GNOME extension currently reads a short-lived unsigned policy snapshot
   written by the daemon and writes a runtime heartbeat. It is same-user only and
-  expires after 30 seconds. Signed snapshots and blocking across daemon restarts
-  remain target behaviour, not current behaviour.
+  expires after 30 seconds. The daemon in socket mode refreshes it every five
+  seconds and systemd restarts the daemon, so a window close no longer lapses
+  enforcement. Signed snapshots, a D-Bus name, and a verified restart before
+  adapters load remain target behaviour, not current behaviour.
 
 ## 9. Performance budgets
 

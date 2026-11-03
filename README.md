@@ -36,8 +36,14 @@ pretending.
 ### Implemented today
 
 - Rust core with a pure `(state, event, now)` decision function.
-- Local state service over newline-delimited JSON on stdio; the UI never writes
-  the state file directly.
+- Local state service over newline-delimited JSON on a same-user Unix socket at
+  `$XDG_RUNTIME_DIR/stayproductive/daemon.sock` (stdio stays for tests); the UI
+  never writes the state file directly.
+- The daemon is independent of the window: closing the UI keeps schedules,
+  enforcement policy refresh, and blocks running. A systemd user unit
+  (`stayproductive.service`, `Restart=always`) restarts a killed daemon, and
+  Settings offers opt-in autostart. The unit is written per user; nothing is
+  enabled without an explicit action.
 - Versioned state at
   `$XDG_DATA_HOME/stayproductive/state.json` (fallback
   `~/.local/share/stayproductive/state.json`), written atomically with mode
@@ -69,10 +75,11 @@ Website and keyword enforcement, the browser extension, usage-limit tracking,
 launch/pickup limits, non-GNOME compositor adapters, tray integration, DNS
 helper, SQLite history/migrations, usage statistics, low-time notifications,
 backup/restore, full translation catalogs, and a complete screen-reader audit.
-Optional onboarding capabilities (autostart, notifications, DNS helper) are
-listed but deliberately unavailable, so nothing is enabled by clicking through
-the wizard. These remain tracked as `todo`/`wip`/`gap` in
-[`docs/parity/feature-matrix.md`](docs/parity/feature-matrix.md).
+Notifications and the DNS helper are listed in onboarding but deliberately
+unavailable, so nothing is enabled by clicking through the wizard. Autostart is
+implemented through the systemd user unit, but only for the default data file
+with a running systemd user manager. These remain tracked as `todo`/`wip`/`gap`
+in [`docs/parity/feature-matrix.md`](docs/parity/feature-matrix.md).
 
 ## Run the desktop app
 
@@ -82,15 +89,33 @@ Prerequisites: Rust stable, Python 3.10+, PyGObject, GTK 4, and libadwaita 1.
 ./stayproductive
 ```
 
-The launcher builds the release state service if needed and starts the GTK
-window. To use a different state file (for testing or a portable profile):
+The launcher builds the release state service if needed, starts or connects to
+the background daemon, then opens the GTK window. To use a different state file
+(for testing or a portable profile):
 
 ```sh
 STAYPRODUCTIVE_STATE=/tmp/stayproductive-test.json ./stayproductive
 ```
 
-The state service is a child of the UI. Closing the window shuts it down; the
-state is already persisted. There is no account, network call, or telemetry.
+Closing the window no longer stops blocking: the daemon stays connected to the
+same socket below `$XDG_RUNTIME_DIR/stayproductive/`. Relaunching reuses it. To
+stop it explicitly, use **Settings → Background service** or:
+
+```sh
+systemctl --user stop stayproductive.service
+```
+
+If you started it without systemd, send `shutdown` over the socket or kill the
+`stayproductive-daemon --socket` process; it removes its socket on exit. The
+state is persisted either way. There is no account, network call, or telemetry.
+
+Custom state files get a hashed socket name so a test instance never talks to the
+login daemon. `STAYPRODUCTIVE_SOCKET` overrides the socket path entirely.
+
+Autostart is opt-in: turn on **Settings → Background service → Start at login**,
+or choose **Set up** in the onboarding capability step. It requires a running
+systemd user manager and the default data file, and reports why it is
+unavailable otherwise.
 
 On a clean state the first-run wizard opens automatically and offers a goal-based
 starter profile. Completing it writes `onboarding.json` next to `state.json`; to
@@ -112,8 +137,9 @@ does not use `pip` for PyGObject.
 
 The extension is optional and local. It enforces application `block` rules and
 application quick blocks only; sites, keywords, and usage limits still need the
-browser extension and tracker. Closing StayProductive invalidates the policy
-within 30 seconds. See [`integrations/gnome/README.md`](integrations/gnome/README.md)
+browser extension and tracker. The daemon keeps refreshing the policy while it
+runs, including when the window is closed, so enforcement continues until the
+daemon is stopped. See [`integrations/gnome/README.md`](integrations/gnome/README.md)
 for the policy format, emergency unblock, privacy notes, and uninstall steps.
 
 ### Verify the engine
@@ -127,19 +153,20 @@ cargo test
 The acceptance suite is `crates/core/tests/acceptance.rs`; every test names the
 `A-*` identifier from `docs/acceptance/parity-tests.md`. The end-to-end service
 test is `crates/daemon/tests/protocol.rs`; it drives the real daemon binary over
-stdio and checks strict locks, the cool-down refusal, restart persistence,
-state-file permissions, the generated enforcement policy, and the extension
-heartbeat gate. The GNOME matching helpers have a compositor-free test:
+stdio and over the Unix socket, and checks strict locks, the cool-down refusal,
+restart persistence, state-file permissions, socket privacy and single-instance
+behaviour, the generated enforcement policy, and the extension heartbeat gate.
+The GNOME matching helpers have a compositor-free test:
 
 ```sh
 gjs -m integrations/gnome/tests/matching.test.js
 PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests
 ```
 
-The Python suite covers desktop-entry discovery and the onboarding goal/starter
-profile logic, including the “exactly one profile per wizard run” rule. The GTK
-wizard itself is construction-smoke-tested under Xvfb; visual inspection is not
-an acceptance test.
+The Python suite covers desktop-entry discovery, the onboarding goal/starter
+profile logic, the socket client (detach, reconnect, state mismatch), and the
+systemd unit text and service-state logic. The GTK wizard itself is
+construction-smoke-tested under Xvfb; visual inspection is not an acceptance test.
 
 ## What "identical behaviour" means here
 
@@ -196,8 +223,9 @@ equivalent exists, the spec says so instead of pretending. See
 
 - **Core**: Rust, no runtime, no desktop dependency.
 - **Local state service**: Rust binary that owns `State` and persists versioned
-  JSON atomically. The current boundary is newline-delimited JSON over stdio;
-  the D-Bus surface in the architecture document replaces it without moving
+  JSON atomically. The desktop transport is newline-delimited JSON over a
+  same-user Unix socket, owned by a systemd user unit; stdio remains for tests.
+  The D-Bus surface in the architecture document replaces it without moving
   decision logic out of `core`.
 - **Desktop UI**: GTK 4 + libadwaita through PyGObject. The Python layer only
   renders state and sends commands; it contains no blocking decisions.
@@ -205,8 +233,8 @@ equivalent exists, the spec says so instead of pretending. See
   windows, driven by a short-lived policy file and a runtime heartbeat. Further
   adapters (X11 EWMH, sway/i3 IPC, Hyprland IPC, KWin script), the browser
   extension (Manifest V3), and the optional privileged DNS helper are planned.
-- **Planned packaging**: Flatpak (user mode, no system-wide blocking), `.deb`,
-  `.rpm`, Arch package, and a systemd user unit.
+- **Packaging**: the systemd user unit is written by the app today; Flatpak (user
+  mode, no system-wide blocking), `.deb`, `.rpm`, and Arch packages are planned.
 
 The architecture document still specifies SQLite, D-Bus, and gtk-rs as the
 target M1 stack. The runnable build uses JSON and PyGObject as a deliberate,

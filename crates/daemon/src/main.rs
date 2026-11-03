@@ -1,19 +1,30 @@
 //! The StayProductive local state service.
 //!
-//! For the first runnable UI this binary owns the core `State` and persists it
-//! atomically as JSON under `$XDG_DATA_HOME/stayproductive/state.json`. It
-//! speaks newline-delimited JSON on stdin/stdout; one request per line and one
-//! response per line. The GTK frontend starts it and sends requests.
+//! The daemon owns the core `State` and persists it atomically as JSON under
+//! `$XDG_DATA_HOME/stayproductive/state.json`. It speaks newline-delimited JSON:
+//! one request per line and one response per line.
 //!
-//! This is deliberately a narrow boundary: replacing stdio with D-Bus later
-//! does not move decision logic out of `stayproductive-core`.
+//! Two transports are supported:
+//!
+//! - `--socket [PATH]` — the normal desktop transport. The daemon binds a
+//!   same-user Unix socket in `$XDG_RUNTIME_DIR/stayproductive/`, refreshes the
+//!   enforcement policy on its own, and keeps running after the GTK window
+//!   closes. systemd starts it at login and restarts it if it is killed.
+//! - stdio (default) — kept for the protocol tests and one-shot tooling. The
+//!   process exits with its parent.
+//!
+//! This is deliberately a narrow boundary: replacing it with D-Bus later does
+//! not move decision logic out of `stayproductive-core`.
 
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use chrono::{NaiveDate, NaiveTime, Utc};
@@ -52,19 +63,92 @@ fn require_rule_edits_allowed(state: &State, now: Timestamp) -> DResult<()> {
 }
 
 fn main() {
-    let path = state_path();
-    let state = load_state(&path);
-    let mut daemon = Daemon {
-        state,
-        path,
-        shutdown: false,
+    let mode = match parse_args(env::args().skip(1).collect()) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("stayproductive-daemon: {error}");
+            eprintln!("usage: stayproductive-daemon [--stdio | --socket [PATH]]");
+            std::process::exit(2);
+        }
     };
+    match mode {
+        Mode::Stdio => run_stdio(),
+        Mode::Socket(path) => run_socket(path),
+    }
+}
+
+enum Mode {
+    Stdio,
+    Socket(PathBuf),
+}
+
+fn parse_args(args: Vec<String>) -> Result<Mode, String> {
+    let mut mode = Mode::Stdio;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        match argument {
+            "--stdio" => {
+                mode = Mode::Stdio;
+                index += 1;
+            }
+            "--socket" => match args.get(index + 1).filter(|value| !value.starts_with('-')) {
+                Some(path) => {
+                    mode = Mode::Socket(PathBuf::from(path));
+                    index += 2;
+                }
+                None => {
+                    mode = Mode::Socket(default_socket_path());
+                    index += 1;
+                }
+            },
+            "--help" | "-h" => {
+                println!("usage: stayproductive-daemon [--stdio | --socket [PATH]]");
+                std::process::exit(0);
+            }
+            other if other.starts_with("--socket=") => {
+                mode = Mode::Socket(PathBuf::from(&other["--socket=".len()..]));
+                index += 1;
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(mode)
+}
+
+/// Same-user control socket. A custom state file gets its own socket so a test
+/// or portable instance never talks to the login service's daemon.
+fn default_socket_path() -> PathBuf {
+    if let Ok(path) = env::var("STAYPRODUCTIVE_SOCKET") {
+        return PathBuf::from(path);
+    }
+    let mut name = String::from("daemon");
+    if let Ok(state) = env::var("STAYPRODUCTIVE_STATE") {
+        if !state.is_empty() {
+            name.push('-');
+            name.push_str(&fnv1a_hex(state.as_bytes()));
+        }
+    }
+    runtime_dir()
+        .join("stayproductive")
+        .join(format!("{name}.sock"))
+}
+
+/// Stable 64-bit FNV-1a, mirrored by `engine.py` for the same socket name.
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn run_stdio() {
+    let mut daemon = Daemon::new(state_path());
     daemon.write_policy(Utc::now());
 
-    println!(
-        "{}",
-        json!({"event": "ready", "state_path": daemon.path.display().to_string()})
-    );
+    println!("{}", daemon.greeting());
     io::stdout().flush().ok();
 
     let stdin = io::stdin();
@@ -73,31 +157,145 @@ fn main() {
         if line.trim().is_empty() {
             continue;
         }
-        let request: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(error) => {
-                println!(
-                    "{}",
-                    json!({"id": 0, "ok": false, "error": format!("invalid JSON: {error}")})
-                );
-                continue;
-            }
-        };
-        let id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
-        let command = request
-            .get("cmd")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-
-        let response = match daemon.handle(&command, &request) {
-            Ok(data) => json!({"id": id, "ok": true, "data": data}),
-            Err(error) => json!({"id": id, "ok": false, "error": error}),
-        };
+        let response = daemon.respond(&line);
         println!("{response}");
         io::stdout().flush().ok();
         if daemon.shutdown {
             break;
+        }
+    }
+}
+
+/// Background transport. One daemon per state file; the socket is mode `0600`
+/// inside a `0700` directory, so only the same user can talk to it.
+fn run_socket(socket_path: PathBuf) {
+    if let Some(parent) = socket_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let existed = parent.exists();
+        if let Err(error) = fs::create_dir_all(parent) {
+            eprintln!(
+                "stayproductive-daemon: could not create {}: {error}",
+                parent.display()
+            );
+            std::process::exit(1);
+        }
+        #[cfg(unix)]
+        if !existed {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    if UnixStream::connect(&socket_path).is_ok() {
+        eprintln!(
+            "stayproductive-daemon: already running at {}",
+            socket_path.display()
+        );
+        return;
+    }
+    let _ = fs::remove_file(&socket_path);
+
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+            eprintln!(
+                "stayproductive-daemon: already running at {}",
+                socket_path.display()
+            );
+            return;
+        }
+        Err(error) => {
+            eprintln!(
+                "stayproductive-daemon: could not bind {}: {error}",
+                socket_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600));
+    }
+
+    let daemon = Arc::new(Mutex::new(Daemon::new(state_path())));
+    if let Ok(daemon) = daemon.lock() {
+        daemon.write_policy(Utc::now());
+    }
+    eprintln!(
+        "stayproductive-daemon: listening on {}",
+        socket_path.display()
+    );
+
+    // The window may be closed for hours. Refreshing the policy from the daemon
+    // itself is what lets enforcement (and schedule starts) continue without a
+    // client; the policy is deliberately short-lived.
+    {
+        let shared = Arc::clone(&daemon);
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(5));
+                let Ok(daemon) = shared.lock() else {
+                    return;
+                };
+                daemon.write_policy(Utc::now());
+            }
+        });
+    }
+
+    for connection in listener.incoming() {
+        match connection {
+            Ok(stream) => {
+                let shared = Arc::clone(&daemon);
+                let path = socket_path.clone();
+                thread::spawn(move || serve_client(stream, shared, path));
+            }
+            Err(error) => eprintln!("stayproductive-daemon: accept failed: {error}"),
+        }
+    }
+}
+
+fn serve_client(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, socket_path: PathBuf) {
+    let Ok(reader_stream) = stream.try_clone() else {
+        return;
+    };
+    let mut writer = stream;
+    {
+        let Ok(daemon) = daemon.lock() else {
+            return;
+        };
+        if writeln!(writer, "{}", daemon.greeting()).is_err() {
+            return;
+        }
+        if writer.flush().is_err() {
+            return;
+        }
+    }
+
+    let reader = BufReader::new(reader_stream);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (response, shutdown) = {
+            let Ok(mut daemon) = daemon.lock() else {
+                return;
+            };
+            let response = daemon.respond(&line);
+            (response, daemon.shutdown)
+        };
+        if writeln!(writer, "{response}")
+            .and_then(|_| writer.flush())
+            .is_err()
+        {
+            return;
+        }
+        if shutdown {
+            let _ = fs::remove_file(&socket_path);
+            std::process::exit(0);
         }
     }
 }
@@ -261,6 +459,50 @@ fn system_timezone() -> Tz {
 }
 
 impl Daemon {
+    fn new(path: PathBuf) -> Self {
+        let state = load_state(&path);
+        Self {
+            state,
+            path,
+            shutdown: false,
+        }
+    }
+
+    fn greeting(&self) -> String {
+        json!({
+            "event": "ready",
+            "state_path": self.path.display().to_string(),
+        })
+        .to_string()
+    }
+
+    /// One newline-delimited request in, one out. Invalid JSON never kills the
+    /// service; it returns an error envelope with a zero id.
+    fn respond(&mut self, line: &str) -> String {
+        let request: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(error) => {
+                return json!({
+                    "id": 0,
+                    "ok": false,
+                    "error": format!("invalid JSON: {error}"),
+                })
+                .to_string();
+            }
+        };
+        let id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
+        let command = request
+            .get("cmd")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        match self.handle(&command, &request) {
+            Ok(data) => json!({"id": id, "ok": true, "data": data}),
+            Err(error) => json!({"id": id, "ok": false, "error": error}),
+        }
+        .to_string()
+    }
+
     fn handle(&mut self, command: &str, request: &Value) -> DResult<Value> {
         let now = Utc::now();
         let mut dirty = true;
@@ -1076,4 +1318,42 @@ fn commitment_view(commitment: &Commitment) -> Value {
             Restriction::BlockPause => "block_pause",
         }).collect::<Vec<_>>(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fnv_matches_the_python_client() {
+        // `engine.py` derives the same socket suffix for a custom state file.
+        assert_eq!(fnv1a_hex(b""), "cbf29ce484222325");
+        assert_eq!(fnv1a_hex(b"abc"), "e71fa2190541574b");
+    }
+
+    #[test]
+    fn socket_argument_takes_an_optional_explicit_path() {
+        match parse_args(vec!["--socket".into(), "/tmp/chosen.sock".into()]).unwrap() {
+            Mode::Socket(path) => assert_eq!(path, PathBuf::from("/tmp/chosen.sock")),
+            Mode::Stdio => panic!("expected socket mode"),
+        }
+        match parse_args(vec!["--socket=/tmp/inline.sock".into()]).unwrap() {
+            Mode::Socket(path) => assert_eq!(path, PathBuf::from("/tmp/inline.sock")),
+            Mode::Stdio => panic!("expected socket mode"),
+        }
+        assert!(matches!(
+            parse_args(vec!["--stdio".into()]).unwrap(),
+            Mode::Stdio
+        ));
+        assert!(parse_args(vec!["--wat".into()]).is_err());
+    }
+
+    #[test]
+    fn invalid_json_returns_an_error_envelope() {
+        let path = env::temp_dir().join(format!("stayproductive-unit-{}.json", ulid::Ulid::new()));
+        let mut daemon = Daemon::new(path);
+        let response: Value = serde_json::from_str(&daemon.respond("{not json")).unwrap();
+        assert_eq!(response["id"], 0);
+        assert_eq!(response["ok"], false);
+    }
 }

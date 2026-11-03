@@ -1,10 +1,12 @@
 # Core engine implementation notes
 
-Status: **M0 core implemented; runnable local UI and state service.** The pure
-engine, scheduler, period calculator, usage ledger, and domain model live in
-`crates/core`. `crates/daemon` owns state and persists it atomically as JSON.
-`crates/ui` is a GTK 4 + libadwaita front end. Desktop adapters, SQLite, and
-D-Bus are not implemented yet; those are tracked in the parity matrix.
+Status: **M0 core implemented; runnable local UI and autonomous state service.**
+The pure engine, scheduler, period calculator, usage ledger, and domain model
+live in `crates/core`. `crates/daemon` owns state, persists it atomically as
+JSON, and runs behind a same-user Unix socket under a systemd user unit.
+`crates/ui` is a GTK 4 + libadwaita front end. Desktop adapters beyond GNOME,
+SQLite, and D-Bus are not implemented yet; those are tracked in the parity
+matrix.
 
 These notes record decisions the existing specs left implicit. Anything marked
 **TODO(spec)** is deliberately unfinished and must not be read as implemented.
@@ -26,8 +28,8 @@ These notes record decisions the existing specs left implicit. Anything marked
 Unit tests additionally cover DST day lengths, the local-date period
 calculator, schedule gap/merge behaviour, keyword folding, and ledger
 attribution. The suite currently has 32 acceptance tests. The UI test suite
-(`crates/ui/tests`) adds 21 display-free tests for application discovery and
-onboarding (`A-UX-01`).
+(`crates/ui/tests`) adds display-free tests for application discovery, onboarding
+(`A-UX-01`), the socket client, and the systemd unit (`F-PLAT-01`).
 
 ## Decisions made in code
 
@@ -84,11 +86,29 @@ profile's targets. The next decision after the limit is reached reports
 ### Local state service
 
 `crates/daemon` is the first implementation of the daemon boundary. It owns the
-only mutable `State`, exposes one command per line of JSON on stdin, and writes
-one response per line on stdout. The greeting is
-`{"event":"ready","state_path":...}`; every request carries an `id`, so a caller
-can match replies. The UI starts the process, waits for the greeting, and sends
-`shutdown` on exit.
+only mutable `State` and speaks one JSON request/response per line. The greeting
+is `{"event":"ready","state_path":...}`; every request carries an `id`, so a
+caller can match replies.
+
+Two transports share that protocol:
+
+- `--socket [PATH]` is the desktop transport. The daemon binds a same-user Unix
+  socket (mode `0600`, parent directory `0700`) at
+  `$XDG_RUNTIME_DIR/stayproductive/daemon.sock`, or at the path from
+  `--socket`/`$STAYPRODUCTIVE_SOCKET`. A non-default `$STAYPRODUCTIVE_STATE`
+  hashes to a distinct `daemon-<fnv1a64>.sock` so test and portable instances
+  never share the login daemon. A second instance detects the live socket and
+  exits successfully instead of taking over; a stale socket file is removed.
+- stdio (the default) remains for the protocol tests and one-shot tooling. Each
+  process exits with its input.
+
+The UI connects to the socket and never owns the daemon's lifetime: closing or
+killing the window leaves enforcement running, and relaunching reconnects to the
+same process. If no daemon is reachable, the UI starts `stayproductive.service`
+through systemd when that is manageable, otherwise it spawns a detached session
+(`start_new_session=True`) and logs to `<state dir>/daemon.log`. Explicit stop is
+`systemctl --user stop stayproductive.service` or a `shutdown` request; the
+daemon removes its socket on exit.
 
 Persistence is deliberately simpler than the target SQLite store:
 
@@ -110,8 +130,12 @@ After every successful command the service also publishes
 `enforcement.json` beside the state file. It contains only applications the
 engine would block at that instant: the app key, `R-*` reason, optional end
 time, profile name, and a `valid_until` 30 seconds in the future. The file is
-atomic and mode `0600`. Expiry is intentional: if the app stops refreshing the
-policy, a consumer must stop enforcing rather than preserve a stale block.
+atomic and mode `0600`. Expiry is intentional: if the daemon stops refreshing
+the policy, a consumer must stop enforcing rather than preserve a stale block.
+
+In socket mode the daemon refreshes that policy itself every five seconds, not
+only after a client command. Schedule starts, ends, and committed blocks
+therefore keep working with no window open.
 
 The service reports enforcement as `active` only while
 `$XDG_RUNTIME_DIR/stayproductive/gnome-extension.json` says `active:true` and
@@ -119,6 +143,52 @@ The service reports enforcement as `active` only while
 extension writes that heartbeat every two seconds. Without a fresh heartbeat the snapshot says
 `unavailable` and names the missing adapter. This keeps “active” an observation,
 not a configuration claim.
+
+### Daemon autonomy and autostart (`F-PLAT-01`)
+
+`crates/ui/stayproductive/service.py` owns the systemd user unit
+`stayproductive.service`:
+
+- `ExecStart="<daemon>" --socket`, `Restart=always`, `RestartSec=2`,
+  `NoNewPrivileges=yes`, `WantedBy=default.target`, and an explicit
+  `Documentation=` line;
+- `start()` writes the unit, reloads systemd, and starts it for this session;
+- `enable()` is the autostart grant: it stops a directly spawned daemon first so
+  the unit wins the single-instance socket check, then `enable`s and `start`s;
+- `disable()` runs `systemctl --user disable` and leaves this session's daemon
+  running; blocking continues until logout or an explicit stop.
+
+Autostart is offered only when a systemd user manager answers and the session
+uses the default data file. `service_state()` reports `unavailable`,
+`custom-state`, `enabled`, `installed`, or `off`, and both Settings and the
+onboarding capability step render that state rather than assuming success.
+Nothing is enabled silently: the switch and the “Set up” button are explicit
+user actions.
+
+Settings → Background service also states that the daemon is independent of the
+window and names the stop command. `Engine.close()` only detaches;
+`Engine.shutdown_service()` is reserved for the systemd handover. Engine writes
+are not retried automatically, but `snapshot()` retries once after a connection
+failure so a daemon restart does not force the user to reopen the window.
+
+Evidence:
+
+- `crates/daemon/tests/protocol.rs` — socket privacy and mode, single instance,
+  stale-socket takeover avoidance, and a policy refreshed with no client.
+- `crates/ui/tests/test_engine.py` — round trip, disconnect on close, reconnect
+  after restart, mismatched state-file refusal.
+- `crates/ui/tests/test_service.py` — unit text, quoting, socket naming, service
+  states, and the systemd handover order.
+- Manual end-to-end under Xvfb: UI spawned a detached daemon; `SIGKILL`ing the
+  UI left it alive and the policy timestamp advanced; relaunching reused the same
+  daemon PID; an explicit shutdown removed process and socket.
+- Manual restart on a transient systemd unit: `kill -9` of `MainPID` produced a
+  new PID and the unit stayed active.
+
+Remaining limitation: the Settings toggle has not been exercised with a real
+`systemctl --user enable` against an installed unit; that needs a real login
+session. There is no D-Bus name yet, and the unit is not installed by any
+package manager.
 
 ### GNOME enforcement adapter
 
@@ -140,9 +210,10 @@ extension. It is a user-level extension, not a privileged component:
 
 The extension only covers application windows. It cannot stop a process that
 runs in the background, cannot read browser tabs, and cannot enforce site,
-keyword, or usage-limit decisions. Those remain separate adapters. Because the
-policy is refreshed by the running app and expires after 30 seconds, closing
-StayProductive ends desktop enforcement; the daemon is not yet autonomous.
+keyword, or usage-limit decisions. Those remain separate adapters. The socket
+daemon refreshes the policy independently, so closing the window no longer ends
+gentle enforcement; killing the daemon still stops it, and autostart/restart is
+the systemd unit described below.
 
 Extension loading, policy parsing, heartbeat writes, and expiry were checked
 in a headless GNOME Shell 49 session. The headless compositor has no seat, so
@@ -196,10 +267,10 @@ and done. Goal logic is pure: `Goal` definitions, alias-based app matching,
 - Goals preselect at most `MAX_STARTER_APPS` (6) installed applications in hint
   order. The selection is editable in step 4; applications are shown by display
   name and raw IDs stay out of the main flow.
-- Step 3 lists foreground app visibility (with the real adapter state) and names
-  autostart, notifications, and the DNS helper as unavailable. There is no code
-  path that enables them, so clicking through the wizard cannot silently turn on
-  an optional capability.
+- Step 3 lists foreground app visibility (with the real adapter state), offers
+  “Set up” for autostart when systemd can manage it, and continues to name
+  notifications and the DNS helper as unavailable. Autostart is only enabled by
+  that explicit button; nothing is granted by clicking through the wizard.
 - `StarterProfileCreator` creates at most one profile per wizard run and writes
   `onboarding.json` next to `state.json` only after the daemon accepts the
   profile. A rejected create leaves the guard open so the user can fix the name
@@ -209,10 +280,12 @@ and done. Goal logic is pure: `Goal` definitions, alias-based app matching,
 - The dashboard's missing-enforcement banner has a session-scoped dismiss
   button, as `ux-flows.md` §2 requires; the banner returns next launch.
 
-Known limits: the capability step cannot grant autostart or notifications
-because those integrations do not exist yet, so `F-UX-01` stays `wip`. The
-wizard's GTK flow is smoke-tested under Xvfb (construction, step navigation, app
-add/remove, profile creation), but not automated in CI as a UI test.
+Known limits: notifications and the DNS helper cannot be granted from the
+capability step because those integrations do not exist yet, so `F-UX-01` stays
+`wip`. Autostart is real, but it is offered only for the default data file and a
+running systemd user manager. The wizard's GTK flow is smoke-tested under Xvfb
+(construction, step navigation, app add/remove, profile creation), but not
+automated in CI as a UI test.
 
 ### Strict commitments and cool-down
 
@@ -245,9 +318,10 @@ Known gaps in this first strict implementation:
   editable by the same local user; permissions keep out other accounts, not the
   owner. Package removal or root access ends every commitment.
 
-`crates/daemon/tests/protocol.rs` drives the real service binary over stdio. It
-covers locked profile mutations, rejected pause, refused early finish, restart
-persistence, and the private state-file mode.
+`crates/daemon/tests/protocol.rs` drives the real service binary over stdio and
+over the Unix socket. It covers locked profile mutations, rejected pause, refused
+early finish, restart persistence, the private state-file mode, socket privacy
+and single-instance behaviour, and a policy refreshed with no client.
 
 ### What is still inert
 
@@ -277,14 +351,15 @@ missing pieces.
   application windows only; X11 standalone (EWMH), sway/i3, Hyprland, KWin,
   website, keyword, and limit enforcement still need adapters. The UI labels the
   adapter and its scope.
-- **D-Bus, systemd user unit, tray, CLI** — the current boundary is stdio JSON
-  and the UI launches the service itself.
+- **D-Bus name and tray/CLI** — the boundary is newline JSON over a Unix socket;
+  systemd can own the daemon, but there is no `org.stayproductive.Daemon1` name,
+  tray, or CLI yet.
 - **Usage statistics, notifications, export/delete, backup/restore,
   localisation catalogs, full accessibility audit**.
 - **Low-time alerts** (`A-LIM-07` / `A-PLAT-11`).
-- **Optional onboarding capabilities** — autostart, notifications, and the DNS
-  helper are explained in the wizard but not implemented; the step is honest
-  about that instead of offering a switch that does nothing.
+- **Optional onboarding capabilities** — notifications and the DNS helper are
+  explained in the wizard but not implemented. Autostart is implemented as the
+  systemd user unit above.
 
 ## Test commands
 

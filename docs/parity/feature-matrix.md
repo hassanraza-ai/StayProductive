@@ -13,8 +13,9 @@ implemented), `decision` (blocked on a product/architecture decision).
 one required layer or automated acceptance evidence is still outstanding. See
 [`../spec/implementation-notes.md`](../spec/implementation-notes.md).
 
-The runnable build (November 2026) has the core engine, a local JSON state
-service, a GTK 4 + libadwaita UI, and a five-step first-run onboarding wizard.
+The runnable build (November 2026) has the core engine, an autonomous local JSON
+state service behind a same-user Unix socket and an opt-in systemd user unit, a
+GTK 4 + libadwaita UI, and a five-step first-run onboarding wizard.
 It includes an opt-in GNOME Shell extension that enforces application `block`
 rules and application quick blocks on real windows. It does **not** yet enforce
 websites, keywords, usage limits, or other compositors. Every row whose
@@ -134,7 +135,7 @@ has loaded a valid policy.
 
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-PLAT-01 | Daemon autostart and restart | P0 | systemd user unit | arch §5 | A-PLAT-01 | todo |
+| F-PLAT-01 | Daemon autostart and restart | P0 | systemd user unit | arch §5 | A-PLAT-01 | wip |
 | F-PLAT-02 | X11 foreground detection and enforcement | P0 | EWMH | arch §4 | A-PLAT-02 | todo |
 | F-PLAT-03 | sway/i3 adapter | P1 | IPC | arch §4 | A-PLAT-03 | todo |
 | F-PLAT-04 | Hyprland adapter | P1 | IPC | arch §4 | A-PLAT-04 | todo |
@@ -169,6 +170,10 @@ has loaded a valid policy.
 | Strict cool-down | core test rejects `finish_commitment_end` before the cool-down and accepts it afterwards; locked edits/pauses are rejected |
 | Enforcement policy | daemon protocol test checks active/inactive app entries, policy path, and `0600` mode |
 | Enforcement heartbeat | daemon protocol test checks active only with a fresh `active:true`/`policy_loaded:true` heartbeat and refuses stale, inactive, or policy-less files |
+| Socket transport (`F-PLAT-01`) | daemon protocol tests check `0600` socket / `0700` dir, single instance, clean socket removal, and a policy refreshed with no client |
+| Daemon autonomy (`F-PLAT-01`) | Xvfb end-to-end: `SIGKILL`ed the UI, daemon stayed alive and advanced the policy timestamp; relaunch reused the same daemon PID; explicit shutdown removed process and socket |
+| systemd unit and restart (`F-PLAT-01`) | `crates/ui/tests/test_service.py` covers unit text, quoting, socket naming, service states, and handover order; manual transient unit restarted a `kill -9`ed daemon with a new PID and stayed active |
+| Autostart toggle | **not measured** with a real `systemctl --user enable` + logout/login; requires a human session |
 | GNOME matching helpers | `gjs -m integrations/gnome/tests/matching.test.js` pass |
 | Installed-app chooser | `PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests` pass; GTK construction smoke-tested under Xvfb |
 | First-run onboarding | five steps implemented; goal/app selection, starter profile, marker, and the “exactly one profile” guard covered by `crates/ui/tests/test_onboarding.py`; GTK flow construction-smoke-tested under Xvfb. Autostart, notifications, and the DNS helper are listed as unavailable and cannot be enabled from the wizard. |

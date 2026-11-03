@@ -22,7 +22,8 @@ tracker. The UI says so instead of pretending.
 ## Requirements
 
 - GNOME Shell 45–49 on Wayland or X11.
-- StayProductive is running so it can refresh the policy and state service.
+- The StayProductive daemon is running (normally started at login by the user
+  unit), so it can refresh the policy and state service. The window may be closed.
 - One log out / log in after the first installation. GNOME Shell does not load a
   newly copied extension until the Shell restarts.
 
@@ -50,12 +51,13 @@ gnome-extensions info stayproductive@hassanraza.ai
 
 ## How it works
 
-1. The daemon writes `enforcement.json` beside `state.json` after every command.
-   The file contains only applications that the engine would block right now,
-   the reason code, the optional end time, and a `valid_until` timestamp
-   (30 seconds after generation).
+1. The daemon writes `enforcement.json` beside `state.json` after every command
+   and every five seconds on its own. The file contains only applications that
+   the engine would block right now, the reason code, the optional end time, and
+   a `valid_until` timestamp (30 seconds after generation).
 2. The extension reads the policy every second. An expired policy is ignored,
-   so closing StayProductive stops enforcement instead of leaving stale blocks.
+   so a stopped or crashed daemon stops enforcement instead of leaving stale
+   blocks; closing only the window does not, because the daemon keeps running.
 3. For each focused window it collects the Wayland/XWayland app id,
    `WM_CLASS`, and GApplication id, normalizes them, and looks for a policy entry.
 4. On a match it shows an overlay on every monitor with the reason and end time,

@@ -18,7 +18,7 @@ gi.require_version("Adw", "1")
 
 from gi.repository import Adw, Gtk
 
-from . import desktop
+from . import desktop, service
 from . import widgets as w
 from .app_picker import AppChooser
 from .apps import DesktopApp, installed_apps
@@ -537,19 +537,22 @@ class Onboarding(Adw.Dialog):
         optional = Adw.PreferencesGroup(
             title="Optional capabilities",
             description=(
-                "None of these are enabled in this build. Skipping them keeps "
-                "the app local and leaves the dashboard warning visible."
+                "Autostart can be granted here. Notifications and the DNS helper "
+                "are not available in this build; skipping them keeps the app "
+                "local."
             ),
         )
-        autostart = Adw.ActionRow(
-            title="Start at login",
-            subtitle=(
-                "Not available yet. This build does not install a systemd or "
-                "autostart entry."
-            ),
+        self.autostart_row = Adw.ActionRow(title="Start at login")
+        self.autostart_pill = w.status_pill("Checking", "neutral")
+        self.autostart_row.add_suffix(self.autostart_pill)
+        self.autostart_button = w.button(
+            "Set up",
+            css="flat",
+            tooltip="Enable the systemd user service at login",
+            on_click=lambda _button: self._set_up_autostart(),
         )
-        autostart.add_suffix(w.status_pill("Not available", "neutral"))
-        optional.add(autostart)
+        self.autostart_row.add_suffix(self.autostart_button)
+        optional.add(self.autostart_row)
         notifications = Adw.ActionRow(
             title="Notifications",
             subtitle=(
@@ -902,6 +905,52 @@ class Onboarding(Adw.Dialog):
                 "installation."
             )
             self.enforcement_button.set_label("Reinstall")
+        self._refresh_autostart()
+
+    def _refresh_autostart(self) -> None:
+        state = service.service_state(self.window.snapshot.get("state_path"))
+        if state == "unavailable":
+            self._set_pill(self.autostart_pill, "Unavailable", "neutral")
+            self.autostart_row.set_subtitle(
+                "No systemd user manager in this session. Blocking still "
+                "continues while the background service runs."
+            )
+            self.autostart_button.set_visible(False)
+        elif state == "custom-state":
+            self._set_pill(self.autostart_pill, "Unavailable", "neutral")
+            self.autostart_row.set_subtitle(
+                "Only offered for the default data file. This session uses a "
+                "custom one."
+            )
+            self.autostart_button.set_visible(False)
+        elif state == "enabled":
+            self._set_pill(self.autostart_pill, "On", "active")
+            self.autostart_row.set_subtitle(
+                "Enabled. systemd starts the daemon at login and restarts it if "
+                "it is killed."
+            )
+            self.autostart_button.set_visible(False)
+        else:
+            self._set_pill(self.autostart_pill, "Off", "neutral")
+            self.autostart_row.set_subtitle(
+                "Optional. Enabling it keeps the background service running "
+                "after logout; nothing is enabled until you choose Set up."
+            )
+            self.autostart_button.set_visible(True)
+            self.autostart_button.set_sensitive(True)
+
+    def _set_up_autostart(self) -> None:
+        try:
+            service.enable(
+                self.window.engine, self.window.snapshot.get("state_path")
+            )
+        except service.ServiceError as error:
+            self.window.show_error("Could not enable autostart", str(error))
+            self._refresh_autostart()
+            return
+        self.window.toast("Autostart enabled · the daemon starts at login")
+        self.window.refresh()
+        self._refresh_autostart()
 
     def _set_up_enforcement(self) -> None:
         try:

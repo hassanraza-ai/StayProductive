@@ -7,6 +7,7 @@ from pathlib import Path
 from gi.repository import Adw, Gdk, Gio, Gtk
 
 from .. import desktop
+from .. import service
 from .. import widgets as w
 from ..formatting import error_text
 
@@ -18,6 +19,9 @@ class SettingsPage:
         self.window = window
         self.page = Adw.PreferencesPage()
         self.page.set_vexpand(True)
+        self._updating_autostart = False
+        self._service_refreshed = False
+        self._service_state_path: str | None = None
         self._build()
         self.widget = self.page
 
@@ -51,12 +55,15 @@ class SettingsPage:
         self.enforcement_row.add_suffix(self.enforcement_pill)
         capabilities.add(self.enforcement_row)
 
-        service = Adw.ActionRow(
+        service_row = Adw.ActionRow(
             title="Local state service",
-            subtitle="Connected · decisions and persistence are live",
+            subtitle=(
+                "Connected · runs independently and keeps enforcing after this "
+                "window closes"
+            ),
         )
-        service.add_suffix(w.status_pill("Running", "active"))
-        capabilities.add(service)
+        service_row.add_suffix(w.status_pill("Running", "active"))
+        capabilities.add(service_row)
 
         self.data_row = Adw.ActionRow(title="Data file", subtitle="—")
         copy = w.button(
@@ -77,6 +84,34 @@ class SettingsPage:
         open_folder.connect("activated", lambda _row: self._open_folder())
         capabilities.add(open_folder)
         self.page.add(capabilities)
+
+        background = Adw.PreferencesGroup(
+            title="Background service",
+            description=(
+                "Blocking is enforced by a local daemon, not by this window. "
+                "Closing StayProductive keeps it running; autostart restores it "
+                "after you log in."
+            ),
+        )
+        self.autostart_row = Adw.SwitchRow(
+            title="Start at login",
+            subtitle="Checking the systemd user service…",
+        )
+        self.autostart_row.connect("notify::active", self._on_autostart_changed)
+        background.add(self.autostart_row)
+
+        self.service_status_row = Adw.ActionRow(
+            title="Daemon independence",
+            subtitle=(
+                "The daemon keeps schedules and blocks running with no window "
+                "open. Stop it with: systemctl --user stop stayproductive.service"
+            ),
+        )
+        self.service_status_row.set_use_markup(False)
+        self.service_status_pill = w.status_pill("Independent", "active")
+        self.service_status_row.add_suffix(self.service_status_pill)
+        background.add(self.service_status_row)
+        self.page.add(background)
 
         integration = Adw.PreferencesGroup(
             title="Desktop integration",
@@ -211,6 +246,63 @@ class SettingsPage:
         )
         self.policy_row.set_subtitle(enforcement.get("policy_path", "—"))
         self._refresh_extension(active)
+        self._maybe_refresh_service(snapshot.get("state_path", ""))
+
+    def _maybe_refresh_service(self, state_path: str) -> None:
+        if self._service_refreshed and self._service_state_path == state_path:
+            return
+        self._service_state_path = state_path
+        self._service_refreshed = True
+        self._refresh_service(state_path)
+
+    def _refresh_service(self, state_path: str) -> None:
+        state = service.service_state(state_path or None)
+        self._updating_autostart = True
+        self.autostart_row.set_active(state == "enabled")
+        self._updating_autostart = False
+        if state == "unavailable":
+            self.autostart_row.set_sensitive(False)
+            self.autostart_row.set_subtitle(
+                "systemd user services are not available in this session. The "
+                "daemon still runs independently of this window."
+            )
+        elif state == "custom-state":
+            self.autostart_row.set_sensitive(False)
+            self.autostart_row.set_subtitle(
+                "Autostart is only offered for the default data file. This "
+                "session uses a custom one."
+            )
+        elif state == "enabled":
+            self.autostart_row.set_sensitive(True)
+            self.autostart_row.set_subtitle(
+                "On · systemd starts the daemon at login and restarts it if it "
+                "is killed."
+            )
+        else:
+            self.autostart_row.set_sensitive(True)
+            self.autostart_row.set_subtitle(
+                "Off · the daemon runs for this session; enabling this keeps it "
+                "after you log out."
+            )
+
+    def _on_autostart_changed(self, row: Adw.SwitchRow, _pspec) -> None:
+        if self._updating_autostart:
+            return
+        state_path = self.window.snapshot.get("state_path", "")
+        try:
+            if row.get_active():
+                service.enable(self.window.engine, state_path or None)
+                self.window.toast("Autostart enabled · the daemon starts at login")
+            else:
+                service.disable()
+                self.window.toast(
+                    "Autostart disabled · blocking continues until you log out"
+                )
+        except service.ServiceError as error:
+            self.window.show_error("Could not change autostart", str(error))
+        self._service_refreshed = False
+        self._refresh_service(state_path)
+        self.window.refresh()
 
     def _refresh_extension(self, enforcement_active: bool) -> None:
         installed = desktop.extension_installed()
