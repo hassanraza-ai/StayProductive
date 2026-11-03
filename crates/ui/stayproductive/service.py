@@ -99,6 +99,7 @@ def unit_text(binary: str, data_home: str | None = None) -> str:
         "Type=simple\n"
         f"ExecStart={quote_exec(binary)} --socket\n"
         f"{environment}"
+        "PassEnvironment=DISPLAY XAUTHORITY WAYLAND_DISPLAY XDG_SESSION_TYPE\n"
         "Restart=always\n"
         "RestartSec=2\n"
         "NoNewPrivileges=yes\n"
@@ -178,11 +179,34 @@ def service_state(state_path: str | None = None) -> str:
     return "off"
 
 
+def _import_environment() -> None:
+    """Copy the graphical-session variables into the systemd user manager.
+
+    A user unit started before the desktop session may otherwise have no
+    ``DISPLAY``, so the daemon would not know it can supervise the X11 adapter.
+    Best effort: older systemd versions or a manager without those variables
+    simply keep the variables the manager already has.
+    """
+
+    names = [
+        name
+        for name in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE")
+        if os.environ.get(name)
+    ]
+    if not names:
+        return
+    try:
+        _systemctl("import-environment", *names)
+    except ServiceError:
+        pass
+
+
 def start() -> None:
     """Start the daemon for this session through systemd (not autostart)."""
 
     if not systemctl_available() or not user_manager_running():
         raise ServiceError("systemd user services are not available in this session.")
+    _import_environment()
     write_unit()
     if is_active():
         return
@@ -218,6 +242,7 @@ def enable(engine=None, state_path: str | None = None) -> None:
         )
     if not is_active() and engine is not None:
         engine.shutdown_service()
+    _import_environment()
     write_unit()
     result = _systemctl("enable", UNIT_NAME)
     if result.returncode != 0:

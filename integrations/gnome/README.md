@@ -65,8 +65,9 @@ gnome-extensions info stayproductive@hassanraza.ai
 5. Every two seconds it writes
    `$XDG_RUNTIME_DIR/stayproductive/gnome-extension.json`. The daemon treats that
    heartbeat as fresh for five seconds, and the heartbeat must say it loaded a
-   valid policy, before the daemon reports enforcement as active. A disabled,
-   crashed, or policy-less extension cannot keep claiming enforcement.
+   valid policy and identify itself as `gnome-extension`, before the daemon
+   reports enforcement as active. A disabled, crashed, or policy-less extension
+   cannot keep claiming enforcement.
 
 The overlay can be left with `Super`/window switching, but the blocked window is
 covered again when it regains focus.

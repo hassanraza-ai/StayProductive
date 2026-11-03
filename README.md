@@ -142,6 +142,35 @@ runs, including when the window is closed, so enforcement continues until the
 daemon is stopped. See [`integrations/gnome/README.md`](integrations/gnome/README.md)
 for the policy format, emergency unblock, privacy notes, and uninstall steps.
 
+### Enable desktop blocking on X11
+
+On a plain X11 session there is nothing to install. When the environment has
+`DISPLAY`, no `WAYLAND_DISPLAY`, and `XDG_SESSION_TYPE` is not `wayland`, the
+daemon starts `stayproductive-x11` itself and restarts it if it exits. The
+adapter watches EWMH focus, hides a blocked window, and covers every monitor
+with the block explanation. It is a separate process so closing the
+StayProductive window does not stop enforcement.
+
+If the daemon cannot find the launcher, point it at the checkout script
+explicitly (useful for a portable install or development build):
+
+```sh
+STAYPRODUCTIVE_X11_ADAPTER="$PWD/stayproductive-x11" ./stayproductive
+```
+
+`STAYPRODUCTIVE_X11_ADAPTER=0` disables the adapter. Diagnostics:
+
+```sh
+cat "${XDG_RUNTIME_DIR:-/tmp}/stayproductive/x11-adapter.json"
+cat "${XDG_RUNTIME_DIR:-/tmp}/stayproductive/x11-adapter.log"
+```
+
+The adapter covers application windows only. A compositor without EWMH support,
+screen lock/suspend, and dynamic workspace changes are not handled yet. Xvfb test
+runs use a direct unmap because there is no window manager; a real X11 login is
+still needed to judge iconification and overlay visuals. See
+[`docs/spec/implementation-notes.md`](docs/spec/implementation-notes.md).
+
 ### Verify the engine
 
 ```sh
@@ -163,10 +192,19 @@ gjs -m integrations/gnome/tests/matching.test.js
 PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests
 ```
 
+The X11 adapter has a live check against a throwaway Xvfb display; it is opt-in
+because it starts an X server and a second GTK process:
+
+```sh
+STAYPRODUCTIVE_X11_LIVE=1 PYTHONPATH=crates/ui \
+  python3 -m unittest crates.ui.tests.test_x11_live
+```
+
 The Python suite covers desktop-entry discovery, the onboarding goal/starter
-profile logic, the socket client (detach, reconnect, state mismatch), and the
-systemd unit text and service-state logic. The GTK wizard itself is
-construction-smoke-tested under Xvfb; visual inspection is not an acceptance test.
+profile logic, the socket client (detach, reconnect, state mismatch), the
+systemd unit text and service-state logic, and the display-free X11 matching and
+planner rules. The GTK wizard itself is construction-smoke-tested under Xvfb;
+visual inspection is not an acceptance test.
 
 ## What "identical behaviour" means here
 
@@ -229,10 +267,12 @@ equivalent exists, the spec says so instead of pretending. See
   decision logic out of `core`.
 - **Desktop UI**: GTK 4 + libadwaita through PyGObject. The Python layer only
   renders state and sends commands; it contains no blocking decisions.
-- **Desktop integration**: an opt-in GNOME Shell extension for application
-  windows, driven by a short-lived policy file and a runtime heartbeat. Further
-  adapters (X11 EWMH, sway/i3 IPC, Hyprland IPC, KWin script), the browser
-  extension (Manifest V3), and the optional privileged DNS helper are planned.
+- **Desktop integration**: an X11 EWMH adapter (a supervised standalone process
+  that hides blocked windows and draws a per-monitor overlay) and an opt-in
+  GNOME Shell extension for application windows, both driven by a short-lived
+  policy file and a runtime heartbeat. Further adapters (sway/i3 IPC, Hyprland
+  IPC, KWin script), the browser extension (Manifest V3), and the optional
+  privileged DNS helper are planned.
 - **Packaging**: the systemd user unit is written by the app today; Flatpak (user
   mode, no system-wide blocking), `.deb`, `.rpm`, and Arch packages are planned.
 

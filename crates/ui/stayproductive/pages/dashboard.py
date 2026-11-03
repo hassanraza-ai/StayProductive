@@ -261,7 +261,7 @@ class DashboardPage:
             self.enforcement_detail.set_label(
                 enforcement.get(
                     "message",
-                    "The GNOME Shell extension is applying app blocks now.",
+                    "A desktop enforcement adapter is applying app blocks now.",
                 )
             )
 
@@ -333,8 +333,8 @@ class DashboardPage:
         history = snapshot.get("history", [])
         if not history:
             empty = w.label(
-                "No blocks recorded yet. Desktop blocks appear here once the "
-                "GNOME extension is active.",
+                "No blocks recorded yet. Desktop blocks appear here once a "
+                "desktop enforcement adapter is active.",
                 "muted",
             )
             empty.add_css_class("small")

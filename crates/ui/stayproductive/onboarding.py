@@ -866,14 +866,22 @@ class Onboarding(Adw.Dialog):
         gnome = desktop.is_gnome()
         installed = desktop.extension_installed()
         enabled = desktop.extension_enabled()
-        active = self.window.snapshot.get("enforcement", {}).get("state") == "active"
+        enforcement = self.window.snapshot.get("enforcement", {})
+        active = enforcement.get("state") == "active"
+        adapter = enforcement.get("adapter")
 
         self.enforcement_button.set_visible(True)
-        if not gnome:
+        if active and adapter == "x11":
+            self._set_pill(self.enforcement_pill, "Active", "active")
+            self.enforcement_row.set_subtitle(
+                "The daemon's X11 adapter is enforcing app blocks in this session."
+            )
+            self.enforcement_button.set_visible(False)
+        elif not gnome:
             self._set_pill(self.enforcement_pill, "Unavailable", "warning")
             self.enforcement_row.set_subtitle(
-                f"No desktop adapter is installed for {desktop.session_desktop_name()} "
-                "in this build. Rules still run and are recorded; windows cannot "
+                f"No desktop adapter is reporting for {desktop.session_desktop_name()} "
+                "in this session. Rules still run and are recorded; windows cannot "
                 "be blocked here yet."
             )
             self.enforcement_button.set_visible(False)

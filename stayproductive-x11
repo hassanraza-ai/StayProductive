@@ -1,0 +1,12 @@
+#!/bin/sh
+# Launch the standalone X11 enforcement adapter.
+#
+# The daemon normally starts and supervises this process itself. Running it by
+# hand is useful for development and for a session where the daemon was started
+# without the X11 environment.
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PYTHONPATH="$ROOT/crates/ui${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+exec python3 -m stayproductive.x11_adapter "$@"

@@ -278,7 +278,12 @@ class MainWindow(Adw.ApplicationWindow):
             self.enforcement_label.set_label("Enforcement active")
             self.enforcement_dot.remove_css_class("status-dot-offline")
             self.enforcement_dot.add_css_class("status-dot-online")
-            self.service_label.set_label("GNOME extension reporting")
+            adapter = enforcement.get("adapter")
+            self.service_label.set_label(
+                "X11 adapter reporting"
+                if adapter == "x11"
+                else "GNOME extension reporting"
+            )
         else:
             self.enforcement_label.set_label("Enforcement offline")
             self.enforcement_dot.remove_css_class("status-dot-online")

@@ -245,7 +245,7 @@ class SettingsPage:
             "active" if active else "warning",
         )
         self.policy_row.set_subtitle(enforcement.get("policy_path", "—"))
-        self._refresh_extension(active)
+        self._refresh_extension(active, enforcement.get("adapter"))
         self._maybe_refresh_service(snapshot.get("state_path", ""))
 
     def _maybe_refresh_service(self, state_path: str) -> None:
@@ -304,16 +304,25 @@ class SettingsPage:
         self._refresh_service(state_path)
         self.window.refresh()
 
-    def _refresh_extension(self, enforcement_active: bool) -> None:
+    def _refresh_extension(
+        self, enforcement_active: bool, adapter: str | None = None
+    ) -> None:
         installed = desktop.extension_installed()
         enabled = desktop.extension_enabled() if installed else False
 
         if not desktop.is_gnome():
-            self.extension_row.set_subtitle(
-                "This session is not GNOME. The extension is not used here, and "
-                "no other desktop adapter is installed in this build."
-            )
-            self.extension_button.set_label("Unavailable")
+            if enforcement_active and adapter == "x11":
+                self.extension_row.set_subtitle(
+                    "Not used in this session. The daemon's X11 adapter is "
+                    "enforcing app blocks now."
+                )
+                self.extension_button.set_label("Not needed")
+            else:
+                self.extension_row.set_subtitle(
+                    "This session is not GNOME. The extension is not used here; "
+                    "the daemon uses the X11 adapter when a display is available."
+                )
+                self.extension_button.set_label("Unavailable")
             self.extension_button.set_sensitive(False)
             return
 

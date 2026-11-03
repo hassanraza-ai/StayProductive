@@ -62,7 +62,11 @@ class UnitFileTest(unittest.TestCase):
         self.assertIn("Restart=always", text)
         self.assertIn("NoNewPrivileges=yes", text)
         self.assertIn("WantedBy=default.target", text)
-        self.assertNotIn("Environment=", text)
+        self.assertIn(
+            "PassEnvironment=DISPLAY XAUTHORITY WAYLAND_DISPLAY XDG_SESSION_TYPE",
+            text,
+        )
+        self.assertNotIn("\nEnvironment=", text)
 
     def test_unit_carries_the_ui_data_home(self) -> None:
         text = service.unit_text(
@@ -148,10 +152,44 @@ class ServiceStateTest(unittest.TestCase):
             mock.patch.object(service, "is_active", return_value=False),
             mock.patch.object(service, "write_unit", return_value=True),
             mock.patch.object(service, "_systemctl", side_effect=systemctl),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "DISPLAY": "",
+                    "XAUTHORITY": "",
+                    "WAYLAND_DISPLAY": "",
+                    "XDG_SESSION_TYPE": "",
+                },
+                clear=False,
+            ),
         ):
             service.enable(engine, "/tmp/state.json")
         self.assertEqual(engine.shutdown_service.call_count, 1)
         self.assertEqual(calls, ["enable", "start"])
+
+    def test_enable_copies_the_display_into_the_user_manager(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def systemctl(*args: str, timeout: float = 10.0):
+            calls.append(args)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(service, "service_state", return_value="off"),
+            mock.patch.object(service, "is_active", return_value=False),
+            mock.patch.object(service, "write_unit", return_value=True),
+            mock.patch.object(service, "_systemctl", side_effect=systemctl),
+            mock.patch.dict(
+                os.environ,
+                {"DISPLAY": ":42", "XAUTHORITY": "/tmp/xauthority"},
+                clear=False,
+            ),
+        ):
+            service.enable(None, "/tmp/state.json")
+        imported = [args for args in calls if args and args[0] == "import-environment"]
+        self.assertEqual(len(imported), 1)
+        self.assertIn("DISPLAY", imported[0])
+        self.assertIn("XAUTHORITY", imported[0])
 
     def test_disable_keeps_the_current_session_running(self) -> None:
         calls: list[tuple[str, ...]] = []

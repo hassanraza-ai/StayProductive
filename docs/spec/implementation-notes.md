@@ -137,12 +137,14 @@ In socket mode the daemon refreshes that policy itself every five seconds, not
 only after a client command. Schedule starts, ends, and committed blocks
 therefore keep working with no window open.
 
-The service reports enforcement as `active` only while
-`$XDG_RUNTIME_DIR/stayproductive/gnome-extension.json` says `active:true` and
-`policy_loaded:true`, and has a `checked_at` no more than five seconds old. The
-extension writes that heartbeat every two seconds. Without a fresh heartbeat the snapshot says
-`unavailable` and names the missing adapter. This keeps “active” an observation,
-not a configuration claim.
+The service reports enforcement as `active` only from a fresh adapter
+heartbeat under `$XDG_RUNTIME_DIR/stayproductive/`. It reads
+`x11-adapter.json` first and then `gnome-extension.json`; the file must declare
+the expected `adapter`, say `active:true` and `policy_loaded:true`, and have a
+`checked_at` no more than five seconds old. The X11 entry wins so an X11 session
+reports the adapter that is actually operating. Without a fresh heartbeat the
+snapshot says `unavailable` and names the adapter expected for the session. This
+keeps “active” an observation, not a configuration claim.
 
 ### Daemon autonomy and autostart (`F-PLAT-01`)
 
@@ -150,9 +152,11 @@ not a configuration claim.
 `stayproductive.service`:
 
 - `ExecStart="<daemon>" --socket`, `Restart=always`, `RestartSec=2`,
-  `NoNewPrivileges=yes`, `WantedBy=default.target`, and an explicit
+  `NoNewPrivileges=yes`, `PassEnvironment=DISPLAY XAUTHORITY WAYLAND_DISPLAY
+  XDG_SESSION_TYPE`, `WantedBy=default.target`, and an explicit
   `Documentation=` line;
-- `start()` writes the unit, reloads systemd, and starts it for this session;
+- `start()` writes the unit, reloads systemd, imports the graphical-session
+  variables into the user manager, and starts it for this session;
 - `enable()` is the autostart grant: it stops a directly spawned daemon first so
   the unit wins the single-instance socket check, then `enable`s and `start`s;
 - `disable()` runs `systemctl --user disable` and leaves this session's daemon
@@ -228,6 +232,84 @@ The Settings page copies the extension into
 `org.gnome.shell enabled-extensions`, and explains that a first-time install
 needs one log out / log in. It does not silently restart the Shell.
 
+### X11 enforcement adapter (`F-PLAT-02`)
+
+`crates/ui/stayproductive/x11_adapter.py` is a standalone process started and
+supervised by the daemon in an X11 session (`DISPLAY` set, no
+`WAYLAND_DISPLAY`, `XDG_SESSION_TYPE` not `wayland`). The
+`STAYPRODUCTIVE_X11_ADAPTER` environment variable is both an override and an
+adapter path; `0`/`off` disables the adapter. GTK 4 draws the overlay and a
+small `ctypes` libX11 binding (`x11.py`) performs window operations. There is no
+Python Xlib or libwnck dependency, so the adapter shares GTK 4 with the front
+end.
+
+- **Focus** — `_NET_ACTIVE_WINDOW`, falling back to `XGetInputFocus` plus a
+  `XQueryTree` walk to the toplevel when no EWMH window manager is present.
+- **Identity** — `WM_CLASS` name and class, `_GTK_APPLICATION_ID`,
+  `_GTK_APP_ID`, `_BAMF_DESKTOP_FILE_HINT`, `_NET_WM_DESKTOP_FILE`, and the
+  PID's `comm`, executable basename, and first `cmdline` basename. A rule key
+  is normalized (lower-case, `.desktop` removed) and the last dotted and
+  underscored component are added as aliases, matching the GNOME helper.
+- **Decision order** — `x11_policy.py` is display-free. `Planner` emits
+  `hide_window` then `show_overlay`; repeated focus is a no-op; switching to an
+  allowed window hides the overlay; Back focuses the previous allowed window
+  and then hides; a policy refresh updates the copy without re-hiding. When the
+  policy expires or disappears, `clear()` hides the overlay and maps/focuses
+  the blocked window so enforcement cannot leave a window unreachable. Dock,
+  panel, menu, notification, and other non-application window types are
+  ignored, and the last known block is kept while they have focus.
+- **Overlay** — one override-redirect GTK window per `Gdk.Monitor`, positioned
+  and raised through Xlib and given keyboard focus. The card names the app, the
+  reason from the `R-*` code, the end time, a Back action, and local-only copy.
+  The overlay is created before it is mapped so the window manager does not
+  decorate or reposition it.
+- **Hide** — ICCCM `WM_CHANGE_STATE` `IconicState` when
+  `_NET_SUPPORTING_WM_CHECK` exists; a direct `XUnmapWindow` when there is no
+  window manager (headless/Xvfb).
+- **Heartbeat** — `$XDG_RUNTIME_DIR/stayproductive/x11-adapter.json` is written
+  after every action and at least once a second. It contains `adapter:"x11"`,
+  `active`, `policy_loaded`, `blocked`, `overlay_visible`, `blocks`, `display`,
+  and `checked_at`; no window titles or per-app history are recorded.
+- **Supervision** — the daemon finds the launcher from an explicit
+  `STAYPRODUCTIVE_X11_ADAPTER`, `stayproductive-x11` on `PATH`, or the checkout
+  next to the binary, then starts it with `--state`, `--heartbeat`, and
+  `--parent-pid`. Output goes to
+  `$XDG_RUNTIME_DIR/stayproductive/x11-adapter.log`. Every second the daemon
+  polls the child, removes a dead adapter's heartbeat immediately so the
+  snapshot stops claiming enforcement, and restarts it after a two-second
+  backoff. The adapter also exits when its parent PID disappears. A fresh GNOME
+  extension heartbeat takes precedence and stops the X11 adapter; if the
+  extension goes stale the daemon starts the X11 adapter again.
+- **systemd** — the user unit passes `DISPLAY`, `XAUTHORITY`, `WAYLAND_DISPLAY`,
+  and `XDG_SESSION_TYPE` through `PassEnvironment`; `start()` and `enable()`
+  import the same variables into the systemd user manager first, so a unit
+  started before the desktop session still knows it can run the adapter.
+
+Evidence:
+
+- `crates/ui/tests/test_x11_policy.py` — aliases, policy expiry, hide/overlay
+  ordering, dedupe, re-block, allowed-window hide, and Back with and without a
+  previous window.
+- `crates/daemon/tests/protocol.rs::socket_service_supervises_the_x11_adapter`
+  — a fake adapter writes a heartbeat, is `SIGKILL`ed, and is restarted; the
+  snapshot reports `active`/`x11`, and shutdown leaves no orphan.
+- `crates/ui/tests/test_x11_live.py` (opt in with
+  `STAYPRODUCTIVE_X11_LIVE=1`) — Xvfb end-to-end: a focused blocked window is
+  unmapped, switching to an allowed window lowers the block, refocusing
+  re-blocks and increments `blocks`, and an expiring policy maps the window
+  again.
+- Manual Xvfb end-to-end with the real daemon and real adapter: an active
+  profile produced the policy, the adapter blocked the focused window, and the
+  snapshot reported `active`/`x11`.
+
+Limitations: Xvfb has no window manager, so the measured run exercised the
+`XUnmapWindow` fallback rather than WM iconification, real decorations, or a
+compositor's focus rules. Overlay pixels and multi-monitor placement have not
+been inspected in a logged-in X11 session. Dynamic workspaces, screen
+lock/suspend, and compositors that refuse override-redirect focus remain open
+(`A-PLAT-09`, `A-PLAT-10`). The adapter covers application windows only; sites,
+keywords, and usage limits still need trackers and the browser extension.
+
 ### GTK frontend
 
 `crates/ui` is GTK 4 + libadwaita through PyGObject. It contains no blocking
@@ -253,9 +335,10 @@ rendered from the returned snapshot. Pages:
   Help group that re-runs onboarding, and About dialog.
 
 The front end refreshes from the service every five seconds and after each
-mutation. It shows “Enforcement active” only when the extension heartbeat is
-fresh and reports a loaded policy; otherwise it shows “Enforcement offline” and
-explains how to install or load the adapter.
+mutation. It shows “Enforcement active” only when an adapter heartbeat is fresh
+and reports a loaded policy; otherwise it shows “Enforcement offline” and
+explains which adapter is missing. The sidebar and enforcement card name the
+reporting adapter (X11 or GNOME).
 
 ### First-run onboarding
 

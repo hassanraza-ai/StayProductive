@@ -136,7 +136,7 @@ has loaded a valid policy.
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | F-PLAT-01 | Daemon autostart and restart | P0 | systemd user unit | arch §5 | A-PLAT-01 | wip |
-| F-PLAT-02 | X11 foreground detection and enforcement | P0 | EWMH | arch §4 | A-PLAT-02 | todo |
+| F-PLAT-02 | X11 foreground detection and enforcement | P0 | EWMH | arch §4 | A-PLAT-02 | wip |
 | F-PLAT-03 | sway/i3 adapter | P1 | IPC | arch §4 | A-PLAT-03 | todo |
 | F-PLAT-04 | Hyprland adapter | P1 | IPC | arch §4 | A-PLAT-04 | todo |
 | F-PLAT-05 | GNOME Shell adapter | P2 | extension + policy file | arch §4 | A-PLAT-05 | wip |
@@ -169,7 +169,12 @@ has loaded a valid policy.
 | Profile editor round-trip | created and updated a scheduled profile with apps, site daily limit, keywords, allowlist, and multiple windows; persisted state re-read correctly |
 | Strict cool-down | core test rejects `finish_commitment_end` before the cool-down and accepts it afterwards; locked edits/pauses are rejected |
 | Enforcement policy | daemon protocol test checks active/inactive app entries, policy path, and `0600` mode |
-| Enforcement heartbeat | daemon protocol test checks active only with a fresh `active:true`/`policy_loaded:true` heartbeat and refuses stale, inactive, or policy-less files |
+| Enforcement heartbeat | daemon protocol test checks active only with a fresh `active:true`/`policy_loaded:true` heartbeat with the expected `adapter`, and refuses stale, inactive, policy-less, or foreign files |
+| X11 adapter matching (`F-PLAT-02`) | `crates/ui/tests/test_x11_policy.py` covers aliases, expiry, hide-then-overlay ordering, dedupe, re-block, allowed-window hide, and Back |
+| X11 adapter supervision (`F-PLAT-02`) | `crates/daemon/tests/protocol.rs` kills a fake adapter and checks that the daemon removes its stale heartbeat, restarts it, and reports `active`/`x11`; shutdown leaves no orphan |
+| X11 adapter live (`F-PLAT-02`) | opt-in `crates/ui/tests/test_x11_live.py` under Xvfb: blocked window unmapped, allowed window lowers the block, refocusing re-blocks, expiring policy restores the window |
+| X11 adapter end-to-end (`F-PLAT-02`) | real daemon + real adapter under Xvfb: active profile produced the policy, the focused window was blocked, snapshot reported `active`/`x11` |
+| X11 WM iconification and overlay visuals | **not measured**: Xvfb has no window manager and no logged-in X11 session was available |
 | Socket transport (`F-PLAT-01`) | daemon protocol tests check `0600` socket / `0700` dir, single instance, clean socket removal, and a policy refreshed with no client |
 | Daemon autonomy (`F-PLAT-01`) | Xvfb end-to-end: `SIGKILL`ed the UI, daemon stayed alive and advanced the policy timestamp; relaunch reused the same daemon PID; explicit shutdown removed process and socket |
 | systemd unit and restart (`F-PLAT-01`) | `crates/ui/tests/test_service.py` covers unit text, quoting, socket naming, service states, and handover order; manual transient unit restarted a `kill -9`ed daemon with a new PID and stayed active |

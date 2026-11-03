@@ -27,6 +27,7 @@ impl Service {
     fn start(state: &Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_stayproductive-daemon"))
             .env("STAYPRODUCTIVE_STATE", state)
+            .env("STAYPRODUCTIVE_X11_ADAPTER", "0")
             .env(
                 "XDG_RUNTIME_DIR",
                 state.parent().unwrap_or_else(|| Path::new(".")),
@@ -174,7 +175,7 @@ fn strict_commitment_locks_rules_and_survives_restart() {
 }
 
 #[test]
-fn enforcement_snapshot_requires_fresh_extension_heartbeat() {
+fn enforcement_snapshot_requires_a_fresh_adapter_heartbeat() {
     let (dir, path) = temp_state();
     let mut service = Service::start(&path);
     let runtime = dir.join("stayproductive");
@@ -192,6 +193,7 @@ fn enforcement_snapshot_requires_fresh_extension_heartbeat() {
     std::fs::write(
         &heartbeat,
         json!({
+            "adapter": "gnome-extension",
             "active": true,
             "policy_loaded": true,
             "checked_at": chrono::Utc::now().to_rfc3339(),
@@ -205,6 +207,7 @@ fn enforcement_snapshot_requires_fresh_extension_heartbeat() {
     std::fs::write(
         &heartbeat,
         json!({
+            "adapter": "gnome-extension",
             "active": true,
             "policy_loaded": true,
             "checked_at": (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339(),
@@ -218,6 +221,7 @@ fn enforcement_snapshot_requires_fresh_extension_heartbeat() {
     std::fs::write(
         &heartbeat,
         json!({
+            "adapter": "gnome-extension",
             "active": true,
             "policy_loaded": false,
             "checked_at": chrono::Utc::now().to_rfc3339(),
@@ -231,6 +235,7 @@ fn enforcement_snapshot_requires_fresh_extension_heartbeat() {
     std::fs::write(
         &heartbeat,
         json!({
+            "adapter": "gnome-extension",
             "active": false,
             "policy_loaded": true,
             "checked_at": chrono::Utc::now().to_rfc3339(),
@@ -240,6 +245,38 @@ fn enforcement_snapshot_requires_fresh_extension_heartbeat() {
     .expect("write inactive heartbeat");
     let snapshot = service.ok("snapshot", json!({}));
     assert_eq!(snapshot["enforcement"]["state"], "unavailable");
+
+    // An X11 heartbeat with the expected adapter id wins over GNOME, and a
+    // file that declares a different adapter is ignored.
+    std::fs::write(
+        runtime.join("x11-adapter.json"),
+        json!({
+            "adapter": "not-x11",
+            "active": true,
+            "policy_loaded": true,
+            "checked_at": chrono::Utc::now().to_rfc3339(),
+        })
+        .to_string(),
+    )
+    .expect("write foreign x11 heartbeat");
+    let snapshot = service.ok("snapshot", json!({}));
+    assert_eq!(snapshot["enforcement"]["state"], "unavailable");
+
+    std::fs::write(
+        runtime.join("x11-adapter.json"),
+        json!({
+            "adapter": "x11",
+            "active": true,
+            "policy_loaded": true,
+            "checked_at": chrono::Utc::now().to_rfc3339(),
+        })
+        .to_string(),
+    )
+    .expect("write x11 heartbeat");
+    let snapshot = service.ok("snapshot", json!({}));
+    assert_eq!(snapshot["enforcement"]["state"], "active");
+    assert_eq!(snapshot["enforcement"]["adapter"], "x11");
+    let _ = std::fs::remove_file(runtime.join("x11-adapter.json"));
 
     service.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
@@ -389,19 +426,29 @@ struct SocketDaemon {
 
 impl SocketDaemon {
     fn start(state: &Path, socket: &Path) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_stayproductive-daemon"))
+        Self::start_with_adapter(state, socket, None)
+    }
+
+    fn start_with_adapter(state: &Path, socket: &Path, adapter: Option<&Path>) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_stayproductive-daemon"));
+        command
             .arg("--socket")
             .arg(socket)
             .env("STAYPRODUCTIVE_STATE", state)
+            .env(
+                "STAYPRODUCTIVE_X11_ADAPTER",
+                adapter
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "0".to_string()),
+            )
             .env(
                 "XDG_RUNTIME_DIR",
                 state.parent().unwrap_or_else(|| Path::new(".")),
             )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start socket service");
+            .stderr(Stdio::null());
+        let child = command.spawn().expect("start socket service");
         // Own the child immediately so a failed readiness check or a panic
         // cannot leave a zombie behind.
         let service = Self {
@@ -467,6 +514,11 @@ fn socket_service_is_single_instance_and_private() {
         .arg("--socket")
         .arg(&socket)
         .env("STAYPRODUCTIVE_STATE", &state)
+        .env("STAYPRODUCTIVE_X11_ADAPTER", "0")
+        .env(
+            "XDG_RUNTIME_DIR",
+            state.parent().unwrap_or_else(|| Path::new(".")),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -548,4 +600,93 @@ fn socket_service_refreshes_the_policy_without_a_client() {
 
 fn read_policy(path: &Path) -> Value {
     serde_json::from_slice(&std::fs::read(path).expect("policy file")).expect("policy json")
+}
+
+#[test]
+fn socket_service_supervises_the_x11_adapter() {
+    let (dir, state) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let socket = runtime.join("daemon.sock");
+    let heartbeat = runtime.join("x11-adapter.json");
+    let pid_file = dir.join("adapter.pid");
+    let adapter = dir.join("fake-adapter.sh");
+    let script = format!(
+        "#!/bin/sh\n\
+         heartbeat=\"\"\n\
+         while [ $# -gt 0 ]; do\n\
+         \x20 case \"$1\" in\n\
+         \x20   --heartbeat) heartbeat=\"$2\"; shift 2 ;;\n\
+         \x20   *) shift ;;\n\
+         \x20 esac\n\
+         done\n\
+         echo $$ > \"{}\"\n\
+         while :; do\n\
+         \x20 mkdir -p \"$(dirname \"$heartbeat\")\"\n\
+         \x20 printf '{{\"adapter\":\"x11\",\"active\":true,\"policy_loaded\":true,\"checked_at\":\"%s\"}}\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$heartbeat\"\n\
+         \x20 sleep 0.2\n\
+         done\n",
+        pid_file.display()
+    );
+    std::fs::write(&adapter, script).expect("write fake adapter");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700))
+            .expect("make adapter executable");
+    }
+
+    let daemon = SocketDaemon::start_with_adapter(&state, &socket, Some(&adapter));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let first_pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file)
+            && let Ok(pid) = text.trim().parse::<u32>()
+            && heartbeat.exists()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "adapter did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let mut client = SocketClient::connect(&socket);
+    let snapshot = client.ok("snapshot", json!({}));
+    assert_eq!(snapshot["enforcement"]["state"], "active");
+    assert_eq!(snapshot["enforcement"]["adapter"], "x11");
+
+    // Kill the adapter: the daemon must notice, drop the stale heartbeat, and
+    // start a replacement without any UI or client involvement.
+    let status = Command::new("kill")
+        .args(["-9", &first_pid.to_string()])
+        .status()
+        .expect("kill adapter");
+    assert!(status.success(), "kill failed");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let second_pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file)
+            && let Ok(pid) = text.trim().parse::<u32>()
+            && pid != first_pid
+            && heartbeat.exists()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "adapter was not restarted");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let snapshot = client.ok("snapshot", json!({}));
+    assert_eq!(snapshot["enforcement"]["state"], "active");
+    assert_eq!(snapshot["enforcement"]["adapter"], "x11");
+    drop(client);
+    daemon.shutdown();
+
+    // Shutdown stops the adapter; no orphan keeps enforcing.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Path::new(&format!("/proc/{second_pid}")).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "adapter {second_pid} survived shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

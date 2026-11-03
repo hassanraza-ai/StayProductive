@@ -139,6 +139,13 @@ Adapter detection is automatic (`XDG_CURRENT_DESKTOP`, `WAYLAND_DISPLAY`,
 `SWAYSOCK`, `HYPRLAND_INSTANCE_SIGNATURE`), with a manual override in settings.
 Capabilities are reported, not assumed: the UI shows exactly what is enforced.
 
+Current build: the X11 row is implemented as a standalone Python process
+(`crates/ui/stayproductive/x11_adapter.py`) started and restarted by the daemon
+when the session is X11. It uses EWMH for focus, ICCCM `WM_CHANGE_STATE` or a
+direct unmap for hiding, and one override-redirect GTK window per monitor for
+the overlay. The GNOME extension covers the Wayland row. The other rows are
+still planned and are reported as unavailable rather than silently skipped.
+
 ## 5. Enforcement strategy
 
 ### App blocking
@@ -176,7 +183,10 @@ reference does (it sends the user home). Hiding an app is the faithful mapping.
 - One overlay process (part of the UI crate) with a fullscreen, always-on-top,
   keyboard-grabbing window per monitor.
 - X11: override-redirect window + `_NET_WM_STATE_ABOVE`, `_NET_WM_STATE_FULLSCREEN`,
-  input focus; re-assert above state on focus changes.
+  input focus; re-assert above state on focus changes. The current adapter
+  creates one GTK window per monitor and sets override-redirect before mapping;
+  `_NET_WM_STATE_*` hints and focus re-assertion on workspace changes are still
+  open.
 - wlroots: `wlr-layer-shell` on the overlay layer with exclusive keyboard
   interactivity.
 - GNOME/KDE: extension/script creates the actor/window; the daemon drives it.
