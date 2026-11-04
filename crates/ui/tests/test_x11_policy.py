@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from stayproductive.x11_policy import (
     Action,
     FocusEvent,
+    FocusReporter,
     Planner,
     Rect,
     app_aliases,
@@ -297,6 +298,63 @@ class PlannerPauseTest(unittest.TestCase):
             [action.kind for action in self.planner.update(self.event(11, "firefox"), None)],
             ["restore_window"],
         )
+
+
+class FocusReporterTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.now = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+        self.reporter = FocusReporter()
+
+    def event(self, *identifiers: str, normal: bool = True) -> FocusEvent:
+        return FocusEvent(
+            window=10,
+            identifiers=frozenset(identifiers),
+            label="Test",
+            normal=normal,
+        )
+
+    def test_no_focus_reports_nothing(self) -> None:
+        self.reporter.observe(None, self.now)
+        self.assertEqual(self.reporter.aliases, ())
+        self.assertIsNone(self.reporter.since)
+
+    def test_focus_reports_sorted_aliases_and_start(self) -> None:
+        self.reporter.observe(
+            self.event("Navigator", "org.mozilla.firefox"), self.now
+        )
+        self.assertEqual(
+            self.reporter.aliases, ("firefox", "navigator", "org.mozilla.firefox")
+        )
+        self.assertEqual(self.reporter.since, self.now)
+
+    def test_same_focus_keeps_the_original_start(self) -> None:
+        self.reporter.observe(self.event("firefox"), self.now)
+        later = self.now + timedelta(minutes=5)
+        self.reporter.observe(self.event("firefox"), later)
+        self.assertEqual(self.reporter.since, self.now)
+
+    def test_focus_change_restarts_the_interval(self) -> None:
+        self.reporter.observe(self.event("firefox"), self.now)
+        later = self.now + timedelta(minutes=5)
+        self.reporter.observe(self.event("code"), later)
+        self.assertEqual(self.reporter.aliases, ("code",))
+        self.assertEqual(self.reporter.since, later)
+
+    def test_blocked_or_non_application_focus_is_ignored(self) -> None:
+        self.reporter.observe(self.event("firefox"), self.now)
+        self.reporter.observe(self.event("firefox"), self.now, blocked=True)
+        self.assertEqual(self.reporter.aliases, ())
+        self.assertIsNone(self.reporter.since)
+
+        self.reporter.observe(self.event("firefox"), self.now)
+        self.reporter.observe(self.event("gnome-shell", normal=False), self.now)
+        self.assertEqual(self.reporter.aliases, ())
+
+    def test_empty_identifiers_reset_the_interval(self) -> None:
+        self.reporter.observe(self.event("firefox"), self.now)
+        self.reporter.observe(self.event(), self.now)
+        self.assertEqual(self.reporter.aliases, ())
+        self.assertIsNone(self.reporter.since)
 
 
 if __name__ == "__main__":

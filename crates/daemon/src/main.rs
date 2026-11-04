@@ -280,7 +280,9 @@ fn run_socket(socket_path: PathBuf) {
                 let Ok(mut daemon) = shared.lock() else {
                     return;
                 };
-                daemon.refresh_policy(Utc::now());
+                if let Err(error) = daemon.pulse(Utc::now()) {
+                    eprintln!("stayproductive-daemon: could not persist periodic state: {error}");
+                }
             }
         });
     }
@@ -1064,7 +1066,19 @@ impl Daemon {
         result
     }
 
-    /// Feed the newest extension heartbeat into the usage ledger.
+    /// Periodic work with no client attached: attribute usage, refresh the
+    /// policy, and persist when either changed. This is what keeps tracking and
+    /// schedule starts working while the GTK window is closed.
+    fn pulse(&mut self, now: Timestamp) -> DResult<()> {
+        let tracked = self.track_usage(now);
+        let recorded = self.refresh_policy(now);
+        if tracked || recorded {
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    /// Feed the newest observer heartbeat into the usage ledger.
     ///
     /// Usage accrues only while a fresh observer reports an attributable,
     /// unblocked focus window. Without an observer, or behind the block

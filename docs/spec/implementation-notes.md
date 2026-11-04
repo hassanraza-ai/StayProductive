@@ -128,10 +128,12 @@ replacement rather than a rewrite of the decision path.
 
 ### Usage tracking
 
-The extension heartbeat is also the foreground observer. Besides the liveness
-fields it now carries `focus` (normalized app ids of the focused window, or
-`null`) and `focus_since` (when that window became foreground). On every
-command the daemon samples the heartbeat and feeds the core
+Each adapter heartbeat is also a foreground observer. Besides the liveness
+fields it carries `focus` (normalized app ids of the focused window, or `null`)
+and `focus_since` (when that window became foreground). The GNOME extension and
+the X11 adapter report the same shape; when both are fresh the extension wins
+because an X11 GNOME session hands enforcement to it. On every command, and on
+the daemon's own five-second pulse, the newest observer feeds the core
 `UsageLedger`:
 
 - a fresh heartbeat with an attributable focus opens or continues a foreground
@@ -147,11 +149,13 @@ command the daemon samples the heartbeat and feeds the core
 - only apps a profile rules over are tracked. Unconfigured apps produce no
   intervals, which keeps the ledger bounded and the observation minimal.
 
-Sampling follows the UI's five-second poll, so usage is under-counted by at
-most one sampling interval and never over-counted; the engine additionally
-counts the open interval up to `now`, so a limit decision at the boundary does
-not lag. The ledger's in-memory event log is capped (`EVENT_LOG_CAP`) and not
-persisted; intervals, launches, pickups, blocks, and the last heartbeat are.
+Sampling follows the UI's five-second poll and the daemon's own five-second
+pulse when no client is attached, so usage keeps accruing while the GTK window
+is closed. It is under-counted by at most one sampling interval and never
+over-counted; the engine additionally counts the open interval up to `now`, so
+a limit decision at the boundary does not lag. The ledger's in-memory event log
+is capped (`EVENT_LOG_CAP`) and not persisted; intervals, launches, pickups,
+blocks, and the last heartbeat are.
 
 Because the ledger feeds `decide`, daily and hourly application limits now
 produce real policy entries (`R-LIMIT-DAILY`/`R-LIMIT-HOURY`) once usage
@@ -314,17 +318,19 @@ end.
   application, and the blocked window stays hidden. Unlocking resumes the
   planner, and the next focus event re-blocks the still-hidden window; a
   policy that expired during the pause is cleared on resume, which restores
-  the window. When logind is unreachable the adapter reports
+  the window. Focus reporting is cleared too, so a locked or suspended session
+  never accrues app usage. When logind is unreachable the adapter reports
   `session_aware:false` and keeps enforcing without pausing.
 - **Hide** — ICCCM `WM_CHANGE_STATE` `IconicState` when
   `_NET_SUPPORTING_WM_CHECK` exists; a direct `XUnmapWindow` when there is no
   window manager (headless/Xvfb).
 - **Heartbeat** — `$XDG_RUNTIME_DIR/stayproductive/x11-adapter.json` is written
   after every action and at least once a second. It contains `adapter:"x11"`,
-  `active`, `policy_loaded`, `blocked`, `overlay_visible`, `blocks`,
-  `monitors`, `card_monitor`, `locked`, `suspended`, `session_aware`,
-  `display`, and `checked_at`; no window titles or per-app history are
-  recorded.
+  `active`, `policy_loaded`, `blocked`, `overlay_visible`, `blocks`, `focus`
+  (normalized aliases of the focused application window, empty behind the
+  overlay or while paused), `focus_since`, `monitors`, `card_monitor`,
+  `locked`, `suspended`, `session_aware`, `display`, and `checked_at`; no
+  window titles or per-app history are recorded.
 - **Supervision** — the daemon finds the launcher from an explicit
   `STAYPRODUCTIVE_X11_ADAPTER`, `stayproductive-x11` on `PATH`, or the checkout
   next to the binary, then starts it with `--state`, `--heartbeat`, and
@@ -348,7 +354,15 @@ Evidence:
   monitor, spanning-window majority, off-screen and missing geometry, and no
   monitors; `PlannerPauseTest` covers pause hiding the overlay, updates and
   Back being ignored while paused, resume re-blocking the still-hidden window,
-  and a policy that expires during the pause being restored on resume.
+  and a policy that expires during the pause being restored on resume;
+  `FocusReporterTest` covers the reported aliases, a stable `focus_since` for
+  an unchanged window, a restart on focus change, and no focus while blocked or
+  paused.
+- `crates/daemon/tests/protocol.rs::x11_focus_reports_feed_usage_limits` — an
+  X11 heartbeat is the only observer: reported focus crosses a daily limit,
+  produces `R-LIMIT-DAILY`, and stops accruing while the overlay is up.
+  `socket_service_tracks_usage_without_a_client` checks the same attribution
+  through the daemon's own five-second pulse.
 - `crates/daemon/tests/protocol.rs::socket_service_supervises_the_x11_adapter`
   — a fake adapter writes a heartbeat, is `SIGKILL`ed, and is restarted; the
   snapshot reports `active`/`x11`, and shutdown leaves no orphan.
@@ -357,7 +371,8 @@ Evidence:
   unmapped, switching to an allowed window lowers the block, refocusing
   re-blocks and increments `blocks`, an expiring policy maps the window again,
   and the heartbeat reports `monitors`, `card_monitor`, `locked`,
-  `suspended`, and `session_aware`.
+  `suspended`, `session_aware`, `focus`, and `focus_since` (empty behind the
+  overlay, the allowed window otherwise).
 - Manual Xvfb end-to-end with the real daemon and real adapter: an active
   profile produced the policy, the adapter blocked the focused window, and the
   snapshot reported `active`/`x11`.
@@ -378,8 +393,8 @@ Autostart at login relies on the graphical session
 exporting `DISPLAY`/`XAUTHORITY` into the systemd user manager; importing them
 when autostart is enabled covers the current manager, but a session that never
 exports them will start the daemon without an adapter and report `unavailable`.
-The adapter covers application windows only; sites, keywords, and usage limits
-still need trackers and the browser extension.
+The adapter covers application windows only; sites and keywords still need the
+browser extension, and launch/pickup limits are not tracked.
 
 ### GTK frontend
 
@@ -485,9 +500,10 @@ first report site visits). Launch limits are enforced by the engine once
 launches are counted, but the extension does not yet report background
 launches, only foreground entries; pickup limits likewise need the
 logind/tracker adapter. Application daily and hourly limits are now enforced
-end-to-end through the GNOME observer. The UI labels the rest as configuration
-rather than claiming they are enforced. The browser extension, other
-compositors, and the logind hookup remain the largest missing pieces.
+end-to-end through the GNOME extension or the X11 adapter observer. The UI
+labels the rest as configuration rather than claiming they are enforced. The
+browser extension, other compositors, and launch/pickup tracking remain the
+largest missing pieces.
 
 ## Not implemented yet
 
@@ -504,10 +520,10 @@ compositors, and the logind hookup remain the largest missing pieces.
   set or surface matching yet.
 - **SQLite persistence, migrations, and history** (`F-DATA-01`) — the current
   store is versioned JSON with atomic replace; it has no queryable ledger yet.
-- **Desktop enforcement beyond GNOME app windows** — the GNOME extension covers
-  application windows only; X11 standalone (EWMH), sway/i3, Hyprland, KWin,
-  website, keyword, and limit enforcement still need adapters. The UI labels the
-  adapter and its scope.
+- **Desktop enforcement beyond X11 and GNOME** — the supervised X11 adapter and
+  the GNOME extension cover application windows only; sway/i3, Hyprland, KWin,
+  website, keyword, and site-limit enforcement still need adapters. The UI
+  labels the adapter and its scope.
 - **D-Bus name and tray/CLI** — the boundary is newline JSON over a Unix socket;
   systemd can own the daemon, but there is no `org.stayproductive.Daemon1` name,
   tray, or CLI yet.

@@ -181,9 +181,19 @@ fn write_heartbeat(
     focus_since: Option<chrono::DateTime<chrono::Utc>>,
     blocked: bool,
 ) {
+    write_adapter_heartbeat(heartbeat, "gnome-extension", focus, focus_since, blocked);
+}
+
+fn write_adapter_heartbeat(
+    heartbeat: &Path,
+    adapter: &str,
+    focus: Option<Vec<&str>>,
+    focus_since: Option<chrono::DateTime<chrono::Utc>>,
+    blocked: bool,
+) {
     let now = chrono::Utc::now();
     let body = json!({
-        "adapter": "gnome-extension",
+        "adapter": adapter,
         "active": true,
         "policy_loaded": true,
         "blocked": blocked,
@@ -408,6 +418,64 @@ fn usage_counters_survive_restart() {
         "the exhausted limit still blocks after restart"
     );
     restarted.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn x11_focus_reports_feed_usage_limits() {
+    let (dir, path) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    // No GNOME extension here: the X11 adapter is the only observer.
+    let heartbeat = runtime.join("x11-adapter.json");
+    let policy_path = dir.join("enforcement.json");
+
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "daily_limit", "minutes": 1}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    // The adapter reports WM_CLASS and desktop-id aliases; the daemon maps
+    // them to the profile's own key.
+    write_adapter_heartbeat(
+        &heartbeat,
+        "x11",
+        Some(vec!["navigator", "firefox", "org.mozilla.firefox"]),
+        Some(chrono::Utc::now() - chrono::Duration::seconds(90)),
+        false,
+    );
+    let snapshot = service.ok("snapshot", json!({}));
+    assert!(
+        usage_seconds(&snapshot, "firefox") >= 90,
+        "X11 focus time is attributed: {}",
+        usage_seconds(&snapshot, "firefox")
+    );
+    let apps = policy_apps(&policy_path);
+    assert_eq!(apps.len(), 1, "the daily limit blocks on X11 too: {apps:?}");
+    assert_eq!(apps[0]["app"], "firefox");
+    assert_eq!(apps[0]["reason"], "R-LIMIT-DAILY");
+
+    // Behind the X11 overlay the adapter reports no focus, so the interval
+    // closes instead of accruing behind the explanation.
+    write_adapter_heartbeat(&heartbeat, "x11", None, None, true);
+    let before = usage_seconds(&service.ok("snapshot", json!({})), "firefox");
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let after = usage_seconds(&service.ok("snapshot", json!({})), "firefox");
+    assert_eq!(after, before, "no usage accrues behind the block overlay");
+
+    service.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -837,6 +905,58 @@ fn socket_service_refreshes_the_policy_without_a_client() {
 
 fn read_policy(path: &Path) -> Value {
     serde_json::from_slice(&std::fs::read(path).expect("policy file")).expect("policy json")
+}
+
+#[test]
+fn socket_service_tracks_usage_without_a_client() {
+    let (dir, state) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let socket = runtime.join("daemon.sock");
+    let heartbeat = runtime.join("x11-adapter.json");
+    let daemon = SocketDaemon::start(&state, &socket);
+
+    let mut client = SocketClient::connect(&socket);
+    let created = client.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "daily_limit", "minutes": 60}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    client.ok("activate_profile", json!({"profile_id": profile_id}));
+    drop(client);
+
+    write_adapter_heartbeat(
+        &heartbeat,
+        "x11",
+        Some(vec!["firefox"]),
+        Some(chrono::Utc::now() - chrono::Duration::seconds(90)),
+        false,
+    );
+
+    // No client for six seconds: the daemon itself must attribute the reported
+    // focus, not only refresh the policy, so limits keep working when the GTK
+    // window is closed.
+    std::thread::sleep(Duration::from_secs(6));
+
+    let mut client = SocketClient::connect(&socket);
+    let snapshot = client.ok("snapshot", json!({}));
+    assert!(
+        usage_seconds(&snapshot, "firefox") >= 90,
+        "usage is attributed without a client: {}",
+        usage_seconds(&snapshot, "firefox")
+    );
+    drop(client);
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

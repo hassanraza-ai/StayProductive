@@ -58,10 +58,12 @@ and Settings page report the adapter state rather than pretending.
   and timezone are editable.
 - Strict commitments block profile edits and pauses in both the UI and the
   daemon, and survive restart.
-- Foreground usage tracking for apps with rules: the extension heartbeat names
-  the focused app, the daemon attributes intervals to the core usage ledger,
-  and daily/hourly app limits enforce for real. Usage survives restart, stops
-  behind the block overlay, and is shown per app on the Activity page.
+- Foreground usage tracking for apps with rules: either adapter heartbeat (the
+  GNOME extension or the X11 adapter) names the focused app, the daemon
+  attributes intervals to the core usage ledger, and daily/hourly app limits
+  enforce for real, even with the GTK window closed. Usage survives restart,
+  stops behind the block overlay or a locked session, and is shown per app on
+  the Activity page.
 - GNOME Shell integration: a short-lived `enforcement.json` policy, an opt-in
   extension that overlays blocked application windows on Wayland and XWayland,
   a runtime heartbeat, and an install/status flow in Settings.
@@ -179,11 +181,13 @@ cat "${XDG_RUNTIME_DIR:-/tmp}/stayproductive/x11-adapter.json"
 cat "${XDG_RUNTIME_DIR:-/tmp}/stayproductive/x11-adapter.log"
 ```
 
-The adapter covers application windows only. A compositor without EWMH support
-and dynamic workspace changes are not handled yet. Card placement across
-monitors and the lock/suspend handshake are implemented, but Xvfb cannot present
-two monitors to GDK or lock a real session, so those visuals still need a
-logged-in X11 desktop; the live test asserts the single-monitor heartbeat fields.
+The adapter covers application windows only. It also reports the focused app so
+daily and hourly application usage limits work on X11, including while the GTK
+window is closed. A compositor without EWMH support and dynamic workspace
+changes are not handled yet. Card placement across monitors and the lock/suspend
+handshake are implemented, but Xvfb cannot present two monitors to GDK or lock a
+real session, so those visuals still need a logged-in X11 desktop; the live test
+asserts the single-monitor heartbeat fields.
 Xvfb test runs use a direct unmap because there is no window manager; a real X11
 login is still needed to judge iconification and overlay visuals. Start at login
 also depends on the session exporting `DISPLAY`/`XAUTHORITY` to the systemd user

@@ -175,22 +175,31 @@ class LiveAdapterTest(unittest.TestCase):
             backend.focus(blocked)
             backend.sync()
             heartbeat = self.wait_for_heartbeat(
-                lambda value: value.get("blocked") == 1
+                lambda value: value.get("blocked") is True
             )
             self.assertFalse(
                 backend.is_viewable(blocked), "the blocked window must be unmapped"
             )
+            # No usage accrues behind the block overlay.
+            self.assertEqual(heartbeat.get("focus"), [])
+            self.assertIsNone(heartbeat.get("focus_since"))
 
             backend.focus(allowed)
             backend.sync()
-            self.wait_for_heartbeat(lambda value: value.get("blocked") == 0)
+            heartbeat = self.wait_for_heartbeat(
+                lambda value: value.get("blocked") is False
+            )
+            # The focused allowed app is reported for usage limits.
+            self.assertIn("allowedtest", heartbeat.get("focus", []))
+            self.assertIsNotNone(heartbeat.get("focus_since"))
 
             backend.map_window(blocked)
             backend.focus(blocked)
             backend.sync()
             heartbeat = self.wait_for_heartbeat(
-                lambda value: value.get("blocked") == 1
+                lambda value: value.get("blocked") is True
             )
+            self.assertEqual(heartbeat.get("focus"), [])
             self.assertGreaterEqual(heartbeat.get("blocks", 0), 2)
             self.assertEqual(heartbeat.get("adapter"), "x11")
             self.assertEqual(heartbeat.get("display"), self.display)

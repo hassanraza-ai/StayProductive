@@ -42,6 +42,7 @@ from .x11 import X11, WindowGeometry  # noqa: E402
 from .x11_policy import (  # noqa: E402
     Action,
     FocusEvent,
+    FocusReporter,
     Planner,
     Policy,
     PolicyEntry,
@@ -405,6 +406,7 @@ class X11Adapter:
         self.parent_pid = parent_pid
         self.poll_ms = poll_ms
         self.planner = Planner()
+        self.focus = FocusReporter()
         self.overlay = Overlay(application, backend, self.go_back)
         self.session = SessionMonitor(self._on_session_change)
         self._last_heartbeat = 0.0
@@ -428,6 +430,8 @@ class X11Adapter:
         self._apply_session_state()
         policy = self.policy_cache.load(now)
         if self._paused:
+            # A locked or suspended session must not accrue app usage.
+            self.focus.reset()
             if time.monotonic() - self._last_heartbeat >= HEARTBEAT_SECONDS:
                 self.write_heartbeat(policy_loaded=policy is not None)
             return True
@@ -444,6 +448,9 @@ class X11Adapter:
             event = self._event(focus)
         actions = self.planner.update(event, policy)
         self._execute(actions)
+        # Report the focused app for usage limits. Behind the overlay no usage
+        # accrues, so the interval is dropped and a new one starts later.
+        self.focus.observe(event, now, blocked=self.planner.overlay_visible)
         if actions or time.monotonic() - self._last_heartbeat >= HEARTBEAT_SECONDS:
             self.write_heartbeat(policy_loaded=policy is not None)
         return True
@@ -534,9 +541,13 @@ class X11Adapter:
             "adapter": "x11",
             "active": active,
             "policy_loaded": policy_loaded,
-            "blocked": 1 if self.planner.overlay_visible else 0,
+            "blocked": self.planner.overlay_visible,
             "overlay_visible": self.planner.overlay_visible,
             "blocks": self.planner.blocks,
+            "focus": list(self.focus.aliases),
+            "focus_since": (
+                iso_timestamp(self.focus.since) if self.focus.since else None
+            ),
             "monitors": self.overlay.monitor_count,
             "card_monitor": self.overlay.card_monitor,
             "locked": self.session.locked,

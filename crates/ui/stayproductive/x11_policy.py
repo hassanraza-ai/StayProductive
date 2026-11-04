@@ -190,6 +190,42 @@ class FocusEvent:
     normal: bool = True
 
 
+class FocusReporter:
+    """Tracks the focused app and when it became foreground.
+
+    Usage limits accrue only while an application window is focused and no
+    block overlay is up. The interval stays stable while the same app keeps
+    focus; the reporter forgets it while the overlay is visible or the session
+    is paused, so time behind a block can never be re-attributed afterwards.
+    """
+
+    def __init__(self) -> None:
+        self.aliases: tuple[str, ...] = ()
+        self.since: datetime | None = None
+
+    def observe(
+        self,
+        event: FocusEvent | None,
+        now: datetime,
+        *,
+        blocked: bool = False,
+    ) -> None:
+        if blocked or event is None or not event.normal:
+            self.reset()
+            return
+        aliases = tuple(sorted(app_aliases(event.identifiers)))
+        if not aliases:
+            self.reset()
+            return
+        if aliases != self.aliases:
+            self.aliases = aliases
+            self.since = now
+
+    def reset(self) -> None:
+        self.aliases = ()
+        self.since = None
+
+
 @dataclass(frozen=True)
 class Action:
     kind: str
