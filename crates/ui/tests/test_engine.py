@@ -19,6 +19,7 @@ class FakeDaemon:
         self.path = Path(path)
         self.state_path = Path(state_path)
         self.commands: list[str] = []
+        self.requests: list[dict] = []
         self._closing = False
         self._connections: list[socket.socket] = []
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -57,6 +58,7 @@ class FakeDaemon:
                     continue
                 request = json.loads(line)
                 self.commands.append(request["cmd"])
+                self.requests.append(request)
                 if request["cmd"] == "shutdown":
                     stream.write(
                         json.dumps(
@@ -165,6 +167,24 @@ class EngineSocketTest(unittest.TestCase):
         with self.assertRaises(EngineError) as caught:
             self.engine(state=other)
         self.assertIn("already running", str(caught.exception))
+
+    def test_export_and_delete_send_explicit_intent(self) -> None:
+        engine = self.engine()
+        engine.snapshot()
+        engine.export_data()
+        engine.export_data("/tmp/elsewhere.zip", include_usage=False)
+        engine.delete_history()
+
+        commands = [request["cmd"] for request in self.daemon.requests]
+        self.assertEqual(
+            commands,
+            ["snapshot", "export_data", "export_data", "delete_history"],
+        )
+        self.assertEqual(self.daemon.requests[1]["include_usage"], True)
+        self.assertNotIn("path", self.daemon.requests[1])
+        self.assertEqual(self.daemon.requests[2]["path"], "/tmp/elsewhere.zip")
+        self.assertEqual(self.daemon.requests[2]["include_usage"], False)
+        self.assertIs(self.daemon.requests[3]["confirm"], True)
 
 
 if __name__ == "__main__":

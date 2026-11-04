@@ -289,6 +289,22 @@ class Engine:
             "set_settings", start_of_day=start_of_day, timezone=timezone
         )
 
+    # ------------------------------------------------------------------ data
+    def export_data(
+        self, path: str | None = None, *, include_usage: bool = True
+    ) -> dict[str, Any]:
+        """Write a versioned archive of profiles, settings, and (optionally) usage."""
+
+        payload: dict[str, Any] = {"include_usage": include_usage}
+        if path:
+            payload["path"] = path
+        return self.request("export_data", **payload)
+
+    def delete_history(self) -> dict[str, Any]:
+        """Forget raw and aggregate usage. Profiles and commitments are kept."""
+
+        return self.request("delete_history", confirm=True)
+
     # --------------------------------------------------------------- lifecycle
     def shutdown_service(self) -> None:
         """Ask the daemon to stop. Only used for explicit service handover."""

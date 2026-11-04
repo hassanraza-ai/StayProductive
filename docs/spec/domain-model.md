@@ -258,7 +258,7 @@ SQLite (WAL) with tables: `profiles`, `rules`, `schedules`, `commitments`,
 A versioned archive (`.stayproductive.zip`):
 
 ```
-manifest.json        {version, exported_at, app_version}
+manifest.json        {version, exported_at, app_version, format, usage_included}
 profiles.json        profiles + rules + schedules (no history)
 settings.json
 usage/YYYY-MM.json   aggregates and block reasons (opt-in)
@@ -267,3 +267,14 @@ commitments.json     current state + history
 
 Import validates `version`, never overwrites an active commitment with a weaker
 one, and refuses to import a commitment whose password hash it cannot verify.
+
+Implementation notes (`F-STA-08`, see `implementation-notes.md`):
+
+- the archive is a stored zip (no compression) with `manifest.json` naming
+  `format: "stayproductive.export"` and `version: 1`;
+- only months that contain records get a `usage/YYYY-MM.json` file, and the open
+  foreground interval is written with `end = now`;
+- "delete history" resets the usage ledger (intervals, launches, pickups,
+  blocks, last heartbeat) but keeps profiles, schedules, quick blocks, settings,
+  and commitments, so blocking never weakens;
+- import is still `todo` (`F-UX-12`).

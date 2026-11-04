@@ -64,6 +64,10 @@ and Settings page report the adapter state rather than pretending.
   enforce for real, even with the GTK window closed. Usage survives restart,
   stops behind the block overlay or a locked session, and is shown per app on
   the Activity page.
+- Export and delete usage data from the Activity page. An export is a versioned
+  zip of profiles, settings, commitments, and monthly usage, written with mode
+  `0600`; deleting history asks first, removes intervals, launches, pickups, and
+  block decisions, and keeps profiles plus any active strict session.
 - GNOME Shell integration: a short-lived `enforcement.json` policy, an opt-in
   extension that overlays blocked application windows on Wayland and XWayland,
   a runtime heartbeat, and an install/status flow in Settings.

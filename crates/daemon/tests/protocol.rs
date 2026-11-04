@@ -3,6 +3,7 @@
 //! These drive the real binary over stdio, with a temporary state file. They do
 //! not need a desktop or a display, so they run in CI alongside the core suite.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -218,6 +219,171 @@ fn usage_seconds(snapshot: &Value, app: &str) -> u64 {
         .find(|entry| entry["app"] == app)
         .map(|entry| entry["seconds"].as_u64().expect("seconds"))
         .unwrap_or(0)
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Read a stored zip written by the export command. This deliberately parses
+/// the central directory instead of trusting the writer, so a wrong offset or
+/// checksum fails the test.
+fn unzip(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
+    let eocd = (0..bytes.len() - 4)
+        .rev()
+        .find(|&at| &bytes[at..at + 4] == b"PK\x05\x06")
+        .expect("end of central directory");
+    let count = u16::from_le_bytes(bytes[eocd + 10..eocd + 12].try_into().expect("count")) as usize;
+    let mut at =
+        u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().expect("offset")) as usize;
+    let mut files = BTreeMap::new();
+    for _ in 0..count {
+        assert_eq!(
+            &bytes[at..at + 4],
+            b"PK\x01\x02",
+            "central directory header"
+        );
+        let method = u16::from_le_bytes(bytes[at + 10..at + 12].try_into().expect("method"));
+        assert_eq!(method, 0, "export entries are stored, not compressed");
+        let crc = u32::from_le_bytes(bytes[at + 16..at + 20].try_into().expect("crc"));
+        let size = u32::from_le_bytes(bytes[at + 20..at + 24].try_into().expect("size")) as usize;
+        let name_len =
+            u16::from_le_bytes(bytes[at + 28..at + 30].try_into().expect("name length")) as usize;
+        let extra_len =
+            u16::from_le_bytes(bytes[at + 30..at + 32].try_into().expect("extra length")) as usize;
+        let comment_len =
+            u16::from_le_bytes(bytes[at + 32..at + 34].try_into().expect("comment length"))
+                as usize;
+        let local =
+            u32::from_le_bytes(bytes[at + 42..at + 46].try_into().expect("local offset")) as usize;
+        let name = String::from_utf8(bytes[at + 46..at + 46 + name_len].to_vec())
+            .expect("utf-8 entry name");
+        assert_eq!(
+            &bytes[local..local + 4],
+            b"PK\x03\x04",
+            "local header for {name}"
+        );
+        let local_name = u16::from_le_bytes(
+            bytes[local + 26..local + 28]
+                .try_into()
+                .expect("name length"),
+        ) as usize;
+        let local_extra = u16::from_le_bytes(
+            bytes[local + 28..local + 30]
+                .try_into()
+                .expect("extra length"),
+        ) as usize;
+        let start = local + 30 + local_name + local_extra;
+        let data = bytes[start..start + size].to_vec();
+        assert_eq!(crc32(&data), crc, "crc for {name}");
+        files.insert(name, data);
+        at += 46 + name_len + extra_len + comment_len;
+    }
+    files
+}
+
+#[test]
+fn export_and_delete_usage_data() {
+    let (dir, path) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let heartbeat = runtime.join("gnome-extension.json");
+    let export_path = dir.join("export.zip");
+
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "daily_limit", "minutes": 60}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    write_heartbeat(
+        &heartbeat,
+        Some(vec!["firefox"]),
+        Some(chrono::Utc::now() - chrono::Duration::seconds(90)),
+        false,
+    );
+    let snapshot = service.ok("snapshot", json!({}));
+    assert!(usage_seconds(&snapshot, "firefox") >= 90);
+
+    let exported = service.ok("export_data", json!({"path": export_path}));
+    assert_eq!(exported["version"], 1);
+    assert_eq!(exported["format"], "stayproductive.export");
+    assert_eq!(exported["usage_included"], true);
+    let bytes = std::fs::read(&export_path).expect("export archive");
+    let files = unzip(&bytes);
+
+    let manifest: Value = serde_json::from_slice(&files["manifest.json"]).expect("manifest json");
+    assert_eq!(manifest["format"], "stayproductive.export");
+    assert_eq!(manifest["version"], 1);
+    assert_eq!(manifest["usage_included"], true);
+
+    let profiles: Value = serde_json::from_slice(&files["profiles.json"]).expect("profiles json");
+    assert_eq!(profiles["profiles"][0]["name"], "Focus");
+
+    let settings: Value = serde_json::from_slice(&files["settings.json"]).expect("settings json");
+    assert_eq!(settings["start_of_day"], "00:00");
+
+    let usage_name = files
+        .keys()
+        .find(|name| name.starts_with("usage/"))
+        .expect("monthly usage file");
+    let usage: Value = serde_json::from_slice(&files[usage_name]).expect("usage json");
+    assert_eq!(usage["intervals"][0]["app"], "firefox");
+
+    // Deleting history needs an explicit decision.
+    let refused = service.request("delete_history", json!({}));
+    assert_eq!(refused["ok"], false, "unconfirmed delete: {refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .expect("error text")
+            .contains("confirm")
+    );
+
+    std::fs::remove_file(&heartbeat).ok();
+    let deleted = service.ok("delete_history", json!({"confirm": true}));
+    assert!(
+        deleted["removed"]["intervals"].as_u64().expect("count") >= 1,
+        "delete reports what it removed: {deleted}"
+    );
+    assert_eq!(deleted["snapshot"]["usage_today"], json!([]));
+    assert_eq!(deleted["snapshot"]["history"], json!([]));
+    assert_eq!(
+        deleted["snapshot"]["profiles"]
+            .as_array()
+            .expect("profiles")
+            .len(),
+        1,
+        "profiles are configuration, not history"
+    );
+
+    // The deletion is persisted, not only in memory.
+    service.shutdown();
+    let mut restarted = Service::start(&path);
+    let snapshot = restarted.ok("snapshot", json!({}));
+    assert_eq!(snapshot["usage_today"], json!([]));
+    assert_eq!(snapshot["profiles"].as_array().expect("profiles").len(), 1);
+    restarted.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -126,6 +126,36 @@ The service has no network listener, no root privileges, and no D-Bus name yet.
 Those belong to M1. Keeping the transport narrow makes the transition to D-Bus a
 replacement rather than a rewrite of the decision path.
 
+### Data export and deletion
+
+`export_data` writes a versioned archive to
+`<state dir>/exports/stayproductive-export-YYYYMMDD-HHMMSS.stayproductive.zip`
+or to a `path` the caller supplies. The zip uses stored (uncompressed) entries
+and a fixed header date, so the same state and clock produce the same bytes, and
+the daemon needs no compression dependency. Entries follow
+`docs/spec/domain-model.md` §13: `manifest.json` (`format`, `version`,
+`exported_at`, `app_version`, `usage_included`), `profiles.json` (profiles with
+rules and schedules, the manual activation, quick blocks, and schedule
+extensions), `settings.json`, `commitments.json`, and — when the user keeps the
+default — `usage/YYYY-MM.json`, one file per month with foreground intervals,
+launches, pickups, and block reasons. The open foreground interval is exported
+with `end = now`, because dropping it would hide the session in progress. History
+is opt-in for callers (`include_usage:false`); the UI exports it by default
+because the user is asking for a copy of their data.
+
+`delete_history` requires `confirm:true`. It resets the usage ledger — closed and
+open intervals, launches, pickups, block records, and the last heartbeat — and
+persists the empty ledger, while profiles, schedules, quick blocks, settings, and
+commitments are untouched: deleting history never weakens an active block or
+ends a strict session. Both commands are also available from the Activity page,
+which states the scope in the confirmation and keeps no copy.
+
+An export is a privacy feature, so it is written with mode `0600` like the state
+file. The archive is not encrypted and has no signature; encrypting it is left to
+the user's filesystem or archive tool. Import (`A-UX-12`) is not implemented yet;
+`manifest.json` exists so an importer can refuse an unknown `version` instead of
+guessing.
+
 ### Usage tracking
 
 Each adapter heartbeat is also a foreground observer. Besides the liveness
@@ -218,8 +248,13 @@ Evidence:
 
 - `crates/daemon/tests/protocol.rs` — socket privacy and mode, single instance,
   stale-socket takeover avoidance, and a policy refreshed with no client.
+  `export_and_delete_usage_data` builds a real archive, parses its central
+  directory, checks the manifest, profile, settings, and monthly usage entries,
+  refuses an unconfirmed delete, and verifies the deletion survives a restart.
+  The zip was also opened with Python's `zipfile` (`testzip()` clean).
 - `crates/ui/tests/test_engine.py` — round trip, disconnect on close, reconnect
-  after restart, mismatched state-file refusal.
+  after restart, mismatched state-file refusal, and the explicit
+  `include_usage`/`path`/`confirm` intent of export and delete.
 - `crates/ui/tests/test_service.py` — unit text, quoting, socket naming, service
   states, and the systemd handover order.
 - Manual end-to-end under Xvfb: UI spawned a detached daemon; `SIGKILL`ing the
@@ -527,8 +562,9 @@ largest missing pieces.
 - **D-Bus name and tray/CLI** — the boundary is newline JSON over a Unix socket;
   systemd can own the daemon, but there is no `org.stayproductive.Daemon1` name,
   tray, or CLI yet.
-- **Usage statistics, notifications, export/delete, backup/restore,
-  localisation catalogs, full accessibility audit**.
+- **Usage statistics views, notifications, backup/restore, localisation catalogs,
+  full accessibility audit**. Export and history deletion exist (see *Data export
+  and deletion*); the Week/Month totals, timeline, and seven-day report do not.
 - **Low-time alerts** (`A-LIM-07` / `A-PLAT-11`).
 - **Optional onboarding capabilities** — notifications and the DNS helper are
   explained in the wizard but not implemented. Autostart is implemented as the

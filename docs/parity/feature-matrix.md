@@ -115,7 +115,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | F-STA-05 | Pickup and launch counts | P1 | logind/tracker | ux §7 | A-STA-05 | todo |
 | F-STA-06 | Seven-day report and comparison | P2 | report view | ux §7 | A-STA-06 | todo |
 | F-STA-07 | Block/deny history with reasons | P1 | event log | block §7 | A-STA-07 | todo |
-| F-STA-08 | Export and delete usage data | P0 | store | ux §8 | A-STA-08 | todo |
+| F-STA-08 | Export and delete usage data | P0 | store | ux §8 | A-STA-08 | done |
 
 ## 7. UX, onboarding, settings
 
@@ -174,6 +174,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | Enforcement policy | daemon protocol test checks active/inactive app entries, policy path, and `0600` mode |
 | Enforcement heartbeat | daemon protocol test checks active only with a fresh `active:true`/`policy_loaded:true` heartbeat with the expected `adapter`, and refuses stale, inactive, policy-less, or foreign files |
 | Usage tracking → limits | daemon protocol tests drive the real binary: reported focus over a daily limit blocks with `R-LIMIT-DAILY` and records history; the block overlay suspends accrual; counters survive restart (A-LIM-05 seed); the same works from either the GNOME extension or the X11 adapter heartbeat, including the daemon's own five-second pulse with no client attached |
+| Export and delete (`F-STA-08`) | `export_and_delete_usage_data` in `crates/daemon/tests/protocol.rs` exports a versioned zip, parses its central directory (offsets and CRC), checks the manifest version, profiles, settings, and monthly usage entries, refuses an unconfirmed delete, and proves the deletion survives restart; the archive also opens cleanly in Python's `zipfile`; `test_engine.py` checks the client's `include_usage`/`path`/`confirm` intent; the Activity page shows both actions with a destructive confirmation |
 | X11 adapter matching (`F-PLAT-02`) | `crates/ui/tests/test_x11_policy.py` covers aliases, expiry, hide-then-overlay ordering, dedupe, re-block, allowed-window hide, and Back |
 | X11 adapter supervision (`F-PLAT-02`) | `crates/daemon/tests/protocol.rs` kills a fake adapter and checks that the daemon removes its stale heartbeat, restarts it, and reports `active`/`x11`; shutdown leaves no orphan |
 | X11 adapter live (`F-PLAT-02`) | opt-in `crates/ui/tests/test_x11_live.py` under Xvfb: blocked window unmapped, allowed window lowers the block, refocusing re-blocks, expiring policy restores the window, and the heartbeat carries `monitors`, `card_monitor`, `locked`, `suspended`, and `session_aware` |

@@ -65,6 +65,41 @@ class ActivityPage:
         history.append(self.history_list)
         self.root.append(history)
 
+        privacy = w.Card(spacing=12)
+        privacy.append(w.label("Your data", "card-title"))
+        privacy.append(
+            w.label(
+                "Usage history never leaves this machine. Export a portable archive "
+                "of profiles, settings, and usage before deleting the history; "
+                "profiles, schedules, quick blocks, and an active strict session are "
+                "kept either way.",
+                "muted",
+            )
+        )
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        actions.append(
+            w.button(
+                "Export data",
+                icon="document-save-symbolic",
+                tooltip="Write a versioned archive to the data folder",
+                on_click=self._export,
+            )
+        )
+        actions.append(
+            w.button(
+                "Delete history",
+                icon="user-trash-symbolic",
+                css="destructive-action",
+                tooltip="Remove recorded usage and block decisions",
+                on_click=self._confirm_delete,
+            )
+        )
+        privacy.append(actions)
+        self.export_note = w.label("No export yet this session.", "muted small")
+        self.export_note.set_selectable(True)
+        privacy.append(self.export_note)
+        self.root.append(privacy)
+
     def refresh(self, snapshot: dict) -> None:
         now = snapshot.get("now")
         tz = snapshot.get("settings", {}).get("timezone", "UTC")
@@ -130,6 +165,51 @@ class ActivityPage:
                 w.label(local_time(entry.get("at"), tz, include_date=True), "muted small")
             )
             self.history_list.append(row)
+
+    def _export(self, _button) -> None:
+        try:
+            result = self.window.engine.export_data()
+        except Exception as error:  # noqa: BLE001
+            self.window.show_error("Could not export your data", error_text(error))
+            return
+        path = result.get("path", "")
+        files = result.get("files", [])
+        self.export_note.set_label(f"Last export: {path}")
+        self.window.toast(f"Exported {len(files)} files")
+        w.alert(
+            self.window,
+            "Export ready",
+            f"Saved to:\n{path}\n\nThe archive is a zip of JSON files with a "
+            "versioned manifest. It contains profiles and settings, and usage "
+            "history. It stays on this machine.",
+        )
+
+    def _confirm_delete(self, _button) -> None:
+        w.confirm(
+            self.window,
+            "Delete usage history?",
+            "This removes recorded foreground intervals, launches, pickups, and "
+            "block decisions. Profiles, schedules, quick blocks, and an active "
+            "strict session are kept. There is no undo, so export first if you "
+            "want a copy.",
+            "Delete history",
+            self._delete_history,
+            destructive=True,
+        )
+
+    def _delete_history(self) -> None:
+        try:
+            result = self.window.engine.delete_history()
+        except Exception as error:  # noqa: BLE001
+            self.window.show_error("Could not delete history", error_text(error))
+            return
+        removed = result.get("removed", {})
+        count = sum(
+            int(removed.get(key, 0) or 0)
+            for key in ("intervals", "launches", "pickups", "blocks")
+        )
+        self.window.refresh()
+        self.window.toast(f"Deleted {count} usage records")
 
     def _clear(self, block: dict) -> None:
         try:

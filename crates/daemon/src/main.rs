@@ -39,6 +39,8 @@ use stayproductive_core::{
     Target, Timestamp, UsageLedger, Window, day_period, decide,
 };
 
+mod export;
+
 type DResult<T> = Result<T, String>;
 
 const FORMAT_VERSION: u32 = 1;
@@ -869,7 +871,7 @@ impl Daemon {
     fn handle(&mut self, command: &str, request: &Value) -> DResult<Value> {
         let now = Utc::now();
         let tracked = self.track_usage(now);
-        let command_dirty = !matches!(command, "snapshot" | "shutdown");
+        let command_dirty = !matches!(command, "snapshot" | "shutdown" | "export_data");
         let result =
             match command {
                 "snapshot" => Ok(self.snapshot()),
@@ -1050,6 +1052,60 @@ impl Daemon {
                     self.state.settings.timezone = timezone;
                     Ok(self.snapshot())
                 }
+                "export_data" => {
+                    // The user asked for their own data, so usage history is
+                    // included unless they explicitly opt out (A-STA-08).
+                    let include_usage = request
+                        .get("include_usage")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    let name = format!(
+                        "stayproductive-export-{}.stayproductive.zip",
+                        now.format("%Y%m%d-%H%M%S")
+                    );
+                    let path = match request.get("path").and_then(Value::as_str) {
+                        Some(value) if !value.trim().is_empty() => PathBuf::from(value),
+                        _ => self.data_dir().join("exports").join(name),
+                    };
+                    if let Some(parent) = path
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        && let Err(error) = fs::create_dir_all(parent)
+                    {
+                        return Err(format!("could not create {}: {error}", parent.display()));
+                    }
+                    let files = export::entries(&self.state, now, include_usage);
+                    let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+                    let bytes = export::archive(&files, now);
+                    write_private(&path, &bytes)
+                        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+                    Ok(json!({
+                        "path": path.display().to_string(),
+                        "bytes": bytes.len(),
+                        "version": export::EXPORT_VERSION,
+                        "format": export::EXPORT_FORMAT,
+                        "usage_included": include_usage,
+                        "files": names,
+                    }))
+                }
+                "delete_history" => {
+                    // The UI asks first; the flag keeps a stray protocol call
+                    // from wiping history without an explicit decision.
+                    if request.get("confirm").and_then(Value::as_bool) != Some(true) {
+                        return Err("delete_history requires confirm: true".into());
+                    }
+                    let removed = json!({
+                        "intervals": self.state.usage.intervals().len(),
+                        "launches": self.state.usage.launches().len(),
+                        "pickups": self.state.usage.pickups().len(),
+                        "blocks": self.state.usage.blocks().len(),
+                    });
+                    // Profiles, schedules, quick blocks, and commitments are
+                    // decisions the user configured, not history: deleting
+                    // history never weakens an active block.
+                    self.state.usage = UsageLedger::new();
+                    Ok(json!({"removed": removed, "snapshot": self.snapshot()}))
+                }
                 "shutdown" => {
                     self.shutdown = true;
                     Ok(json!({"bye": true}))
@@ -1227,6 +1283,13 @@ impl Daemon {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("enforcement.json")
+    }
+
+    fn data_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
     }
 
     fn usage_today(&self, now: Timestamp) -> Value {
