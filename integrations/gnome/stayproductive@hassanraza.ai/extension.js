@@ -223,6 +223,7 @@ export default class StayProductiveExtension extends Extension {
     _writeHeartbeat() {
         const focusSince = this._focus?.since ?? null;
         const text = JSON.stringify({
+            adapter: 'gnome-extension',
             active: true,
             checked_at: new Date().toISOString(),
             shell_version: Config.PACKAGE_VERSION,

@@ -1,20 +1,32 @@
 //! The StayProductive local state service.
 //!
-//! For the first runnable UI this binary owns the core `State` and persists it
-//! atomically as JSON under `$XDG_DATA_HOME/stayproductive/state.json`. It
-//! speaks newline-delimited JSON on stdin/stdout; one request per line and one
-//! response per line. The GTK frontend starts it and sends requests.
+//! The daemon owns the core `State` and persists it atomically as JSON under
+//! `$XDG_DATA_HOME/stayproductive/state.json`. It speaks newline-delimited JSON:
+//! one request per line and one response per line.
 //!
-//! This is deliberately a narrow boundary: replacing stdio with D-Bus later
-//! does not move decision logic out of `stayproductive-core`.
+//! Two transports are supported:
+//!
+//! - `--socket [PATH]` — the normal desktop transport. The daemon binds a
+//!   same-user Unix socket in `$XDG_RUNTIME_DIR/stayproductive/`, refreshes the
+//!   enforcement policy on its own, and keeps running after the GTK window
+//!   closes. systemd starts it at login and restarts it if it is killed.
+//! - stdio (default) — kept for the protocol tests and one-shot tooling. The
+//!   process exits with its parent.
+//!
+//! This is deliberately a narrow boundary: replacing it with D-Bus later does
+//! not move decision logic out of `stayproductive-core`.
 
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
@@ -80,24 +92,92 @@ fn usage_fingerprint(
 }
 
 fn main() {
-    let path = state_path();
-    let mut state = load_state(&path);
-    // A crash can leave a foreground interval open; close it at the last
-    // heartbeat so restored usage is never over-counted.
-    state.recover();
-    let mut daemon = Daemon {
-        state,
-        path,
-        shutdown: false,
-        policy_apps: BTreeSet::new(),
-        policy_seeded: false,
+    let mode = match parse_args(env::args().skip(1).collect()) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("stayproductive-daemon: {error}");
+            eprintln!("usage: stayproductive-daemon [--stdio | --socket [PATH]]");
+            std::process::exit(2);
+        }
     };
+    match mode {
+        Mode::Stdio => run_stdio(),
+        Mode::Socket(path) => run_socket(path),
+    }
+}
+
+enum Mode {
+    Stdio,
+    Socket(PathBuf),
+}
+
+fn parse_args(args: Vec<String>) -> Result<Mode, String> {
+    let mut mode = Mode::Stdio;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        match argument {
+            "--stdio" => {
+                mode = Mode::Stdio;
+                index += 1;
+            }
+            "--socket" => match args.get(index + 1).filter(|value| !value.starts_with('-')) {
+                Some(path) => {
+                    mode = Mode::Socket(PathBuf::from(path));
+                    index += 2;
+                }
+                None => {
+                    mode = Mode::Socket(default_socket_path());
+                    index += 1;
+                }
+            },
+            "--help" | "-h" => {
+                println!("usage: stayproductive-daemon [--stdio | --socket [PATH]]");
+                std::process::exit(0);
+            }
+            other if other.starts_with("--socket=") => {
+                mode = Mode::Socket(PathBuf::from(&other["--socket=".len()..]));
+                index += 1;
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(mode)
+}
+
+/// Same-user control socket. A custom state file gets its own socket so a test
+/// or portable instance never talks to the login service's daemon.
+fn default_socket_path() -> PathBuf {
+    if let Ok(path) = env::var("STAYPRODUCTIVE_SOCKET") {
+        return PathBuf::from(path);
+    }
+    let mut name = String::from("daemon");
+    if let Ok(state) = env::var("STAYPRODUCTIVE_STATE") {
+        if !state.is_empty() {
+            name.push('-');
+            name.push_str(&fnv1a_hex(state.as_bytes()));
+        }
+    }
+    runtime_dir()
+        .join("stayproductive")
+        .join(format!("{name}.sock"))
+}
+
+/// Stable 64-bit FNV-1a, mirrored by `engine.py` for the same socket name.
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn run_stdio() {
+    let mut daemon = Daemon::new(state_path());
     daemon.refresh_policy(Utc::now());
 
-    println!(
-        "{}",
-        json!({"event": "ready", "state_path": daemon.path.display().to_string()})
-    );
+    println!("{}", daemon.greeting());
     io::stdout().flush().ok();
 
     let stdin = io::stdin();
@@ -106,31 +186,157 @@ fn main() {
         if line.trim().is_empty() {
             continue;
         }
-        let request: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(error) => {
-                println!(
-                    "{}",
-                    json!({"id": 0, "ok": false, "error": format!("invalid JSON: {error}")})
-                );
-                continue;
-            }
-        };
-        let id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
-        let command = request
-            .get("cmd")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-
-        let response = match daemon.handle(&command, &request) {
-            Ok(data) => json!({"id": id, "ok": true, "data": data}),
-            Err(error) => json!({"id": id, "ok": false, "error": error}),
-        };
+        let response = daemon.respond(&line);
         println!("{response}");
         io::stdout().flush().ok();
         if daemon.shutdown {
             break;
+        }
+    }
+}
+
+/// Background transport. One daemon per state file; the socket is mode `0600`
+/// inside a `0700` directory, so only the same user can talk to it.
+fn run_socket(socket_path: PathBuf) {
+    if let Some(parent) = socket_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let existed = parent.exists();
+        if let Err(error) = fs::create_dir_all(parent) {
+            eprintln!(
+                "stayproductive-daemon: could not create {}: {error}",
+                parent.display()
+            );
+            std::process::exit(1);
+        }
+        #[cfg(unix)]
+        if !existed {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    if UnixStream::connect(&socket_path).is_ok() {
+        eprintln!(
+            "stayproductive-daemon: already running at {}",
+            socket_path.display()
+        );
+        return;
+    }
+    let _ = fs::remove_file(&socket_path);
+
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+            eprintln!(
+                "stayproductive-daemon: already running at {}",
+                socket_path.display()
+            );
+            return;
+        }
+        Err(error) => {
+            eprintln!(
+                "stayproductive-daemon: could not bind {}: {error}",
+                socket_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600));
+    }
+
+    let daemon = Arc::new(Mutex::new(Daemon::new(state_path())));
+    if let Ok(mut daemon) = daemon.lock() {
+        daemon.refresh_policy(Utc::now());
+    }
+    // On X11 the daemon owns adapter supervision: the adapter is what turns the
+    // short-lived policy into a hidden window and an overlay. It is deliberately
+    // a separate process so closing the GTK window cannot stop enforcement.
+    start_adapter_supervisor(state_path());
+    eprintln!(
+        "stayproductive-daemon: listening on {}",
+        socket_path.display()
+    );
+
+    // The window may be closed for hours. Refreshing the policy from the daemon
+    // itself is what lets enforcement (and schedule starts) continue without a
+    // client; the policy is deliberately short-lived. The same loop restarts a
+    // crashed X11 adapter within a second.
+    {
+        let shared = Arc::clone(&daemon);
+        thread::spawn(move || {
+            let mut last_policy = Instant::now();
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                supervise_adapter();
+                if last_policy.elapsed() < Duration::from_secs(5) {
+                    continue;
+                }
+                last_policy = Instant::now();
+                let Ok(mut daemon) = shared.lock() else {
+                    return;
+                };
+                daemon.refresh_policy(Utc::now());
+            }
+        });
+    }
+
+    for connection in listener.incoming() {
+        match connection {
+            Ok(stream) => {
+                let shared = Arc::clone(&daemon);
+                let path = socket_path.clone();
+                thread::spawn(move || serve_client(stream, shared, path));
+            }
+            Err(error) => eprintln!("stayproductive-daemon: accept failed: {error}"),
+        }
+    }
+}
+
+fn serve_client(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, socket_path: PathBuf) {
+    let Ok(reader_stream) = stream.try_clone() else {
+        return;
+    };
+    let mut writer = stream;
+    {
+        let Ok(daemon) = daemon.lock() else {
+            return;
+        };
+        if writeln!(writer, "{}", daemon.greeting()).is_err() {
+            return;
+        }
+        if writer.flush().is_err() {
+            return;
+        }
+    }
+
+    let reader = BufReader::new(reader_stream);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (response, shutdown) = {
+            let Ok(mut daemon) = daemon.lock() else {
+                return;
+            };
+            let response = daemon.respond(&line);
+            (response, daemon.shutdown)
+        };
+        if writeln!(writer, "{response}")
+            .and_then(|_| writer.flush())
+            .is_err()
+        {
+            return;
+        }
+        if shutdown {
+            stop_adapter();
+            let _ = fs::remove_file(&socket_path);
+            std::process::exit(0);
         }
     }
 }
@@ -200,8 +406,270 @@ fn runtime_dir() -> PathBuf {
         .unwrap_or_else(|_| env::temp_dir())
 }
 
-/// The heartbeat the extension writes while it is enabled. It is deliberately
-/// short-lived so a crashed or disabled extension cannot keep claiming
+fn adapter_runtime_dir() -> PathBuf {
+    runtime_dir().join("stayproductive")
+}
+
+const X11_HEARTBEAT_FILE: &str = "x11-adapter.json";
+const GNOME_HEARTBEAT_FILE: &str = "gnome-extension.json";
+
+/// Whether this session can be enforced through X11 window operations.
+///
+/// ``STAYPRODUCTIVE_X11_ADAPTER`` is both an override and the adapter path, so
+/// a test or a portable install can force the adapter without an X11 login
+/// session. ``0``/``off`` disables it explicitly.
+fn x11_session() -> bool {
+    if let Ok(value) = env::var("STAYPRODUCTIVE_X11_ADAPTER") {
+        let value = value.trim();
+        if value.is_empty() {
+            return false;
+        }
+        match value.to_ascii_lowercase().as_str() {
+            "0" | "off" | "no" | "false" => return false,
+            "1" | "on" | "yes" | "true" => {}
+            _ => return true,
+        }
+    }
+    if env::var_os("WAYLAND_DISPLAY").is_some() {
+        return false;
+    }
+    if env::var("XDG_SESSION_TYPE").is_ok_and(|value| value.eq_ignore_ascii_case("wayland")) {
+        return false;
+    }
+    env::var_os("DISPLAY").is_some_and(|value| !value.is_empty())
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.is_file()
+            && path
+                .metadata()
+                .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+fn which(program: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|directory| directory.join(program))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Find the adapter launcher: explicit override, then `PATH`, then the source
+/// checkout next to the daemon binary.
+fn adapter_program() -> Option<PathBuf> {
+    if let Ok(value) = env::var("STAYPRODUCTIVE_X11_ADAPTER") {
+        let value = value.trim();
+        if !value.is_empty()
+            && !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "off" | "no" | "false" | "1" | "on" | "yes" | "true"
+            )
+        {
+            let candidate = PathBuf::from(value);
+            return if candidate.components().count() > 1 || candidate.is_absolute() {
+                is_executable(&candidate).then_some(candidate)
+            } else {
+                which(value)
+            };
+        }
+    }
+    if let Some(candidate) = which("stayproductive-x11") {
+        return Some(candidate);
+    }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(current) = env::current_dir() {
+        roots.push(current);
+    }
+    if let Ok(executable) = env::current_exe()
+        && let Some(root) = executable
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+    {
+        roots.push(root.to_path_buf());
+    }
+    roots
+        .into_iter()
+        .map(|root| root.join("stayproductive-x11"))
+        .find(|candidate| is_executable(candidate))
+}
+
+struct AdapterSupervisor {
+    program: PathBuf,
+    state: PathBuf,
+    heartbeat: PathBuf,
+    log: PathBuf,
+    child: Option<Child>,
+    last_exit: Option<Instant>,
+}
+
+impl AdapterSupervisor {
+    fn new(program: PathBuf, state: PathBuf) -> Self {
+        Self {
+            program,
+            state,
+            heartbeat: adapter_runtime_dir().join(X11_HEARTBEAT_FILE),
+            log: adapter_runtime_dir().join("x11-adapter.log"),
+            child: None,
+            last_exit: None,
+        }
+    }
+
+    fn spawn(&mut self) {
+        if self.child.is_some() {
+            return;
+        }
+        // Give a crashing adapter a moment before trying again so a broken
+        // launcher cannot turn into a fork loop.
+        if self
+            .last_exit
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(2))
+        {
+            return;
+        }
+        if let Some(parent) = self.log.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "stayproductive-daemon: could not create {}: {error}",
+                parent.display()
+            );
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(
+                self.log.parent().unwrap_or(Path::new(".")),
+                fs::Permissions::from_mode(0o700),
+            );
+        }
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log);
+        let mut command = Command::new(&self.program);
+        command
+            .arg("--state")
+            .arg(&self.state)
+            .arg("--heartbeat")
+            .arg(&self.heartbeat)
+            .arg("--parent-pid")
+            .arg(std::process::id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        match log {
+            Ok(log) => {
+                command.stderr(Stdio::from(log));
+            }
+            Err(error) => {
+                command.stderr(Stdio::null());
+                eprintln!(
+                    "stayproductive-daemon: could not open {}: {error}",
+                    self.log.display()
+                );
+            }
+        }
+        match command.spawn() {
+            Ok(child) => {
+                eprintln!(
+                    "stayproductive-daemon: started X11 adapter pid {} ({})",
+                    child.id(),
+                    self.program.display()
+                );
+                self.child = Some(child);
+            }
+            Err(error) => {
+                eprintln!(
+                    "stayproductive-daemon: could not start X11 adapter {}: {error}",
+                    self.program.display()
+                );
+                self.last_exit = Some(Instant::now());
+            }
+        }
+    }
+
+    fn tick(&mut self) {
+        // Prefer a reporting GNOME extension on an X11 GNOME session: it has
+        // native window/overlay access and running both adapters would mean two
+        // explanations for one block. Hand enforcement back when it goes stale.
+        if fresh_heartbeat(GNOME_HEARTBEAT_FILE, "gnome-extension", Utc::now()) {
+            if self.child.is_some() {
+                eprintln!(
+                    "stayproductive-daemon: GNOME extension is reporting; handing off from the X11 adapter"
+                );
+            }
+            self.stop();
+            return;
+        }
+        if let Some(child) = self.child.as_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            eprintln!(
+                "stayproductive-daemon: X11 adapter pid {} exited: {status}",
+                child.id()
+            );
+            self.child = None;
+            self.last_exit = Some(Instant::now());
+            // Do not let a heartbeat from the process that just died keep
+            // claiming enforcement while the replacement starts.
+            let _ = fs::remove_file(&self.heartbeat);
+        }
+        self.spawn();
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&self.heartbeat);
+        }
+    }
+}
+
+static ADAPTER: Mutex<Option<AdapterSupervisor>> = Mutex::new(None);
+
+fn start_adapter_supervisor(state: PathBuf) {
+    if !x11_session() {
+        return;
+    }
+    let Some(program) = adapter_program() else {
+        eprintln!(
+            "stayproductive-daemon: X11 session but no stayproductive-x11 launcher was found"
+        );
+        return;
+    };
+    if let Ok(mut slot) = ADAPTER.lock() {
+        *slot = Some(AdapterSupervisor::new(program, state));
+    }
+}
+
+fn supervise_adapter() {
+    if let Ok(mut slot) = ADAPTER.lock()
+        && let Some(supervisor) = slot.as_mut()
+    {
+        supervisor.tick();
+    }
+}
+
+fn stop_adapter() {
+    if let Ok(mut slot) = ADAPTER.lock()
+        && let Some(mut supervisor) = slot.take()
+    {
+        supervisor.stop();
+    }
+}
+
+/// The heartbeat an adapter writes while it is enforcing. It is deliberately
+/// short-lived so a crashed or disabled adapter cannot keep claiming
 /// enforcement or keep reporting focus.
 struct Heartbeat {
     /// Enabled, policy loaded, and checked within the freshness window.
@@ -215,10 +683,14 @@ struct Heartbeat {
     focus_since: Option<Timestamp>,
 }
 
-fn read_heartbeat(now: Timestamp) -> Option<Heartbeat> {
-    let path = runtime_dir().join("stayproductive/gnome-extension.json");
+/// Read one adapter heartbeat by file name and expected adapter id.
+fn read_heartbeat(file: &str, adapter: &str, now: Timestamp) -> Option<Heartbeat> {
+    let path = adapter_runtime_dir().join(file);
     let text = fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
+    if value.get("adapter").and_then(Value::as_str) != Some(adapter) {
+        return None;
+    }
     let active = value.get("active").and_then(Value::as_bool) == Some(true);
     let policy_loaded = value.get("policy_loaded").and_then(Value::as_bool) == Some(true);
     let checked_at = value
@@ -228,10 +700,12 @@ fn read_heartbeat(now: Timestamp) -> Option<Heartbeat> {
     let fresh = active
         && policy_loaded
         && now.signed_duration_since(checked_at) <= chrono::TimeDelta::seconds(5);
-    let blocked = value
-        .get("blocked")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    // Adapters have written `blocked` both as a boolean and as 0/1.
+    let blocked = match value.get("blocked") {
+        Some(Value::Bool(blocked)) => *blocked,
+        Some(value) => value.as_i64().is_some_and(|value| value != 0),
+        None => false,
+    };
     let focus = value
         .get("focus")
         .and_then(Value::as_array)
@@ -252,6 +726,22 @@ fn read_heartbeat(now: Timestamp) -> Option<Heartbeat> {
         focus,
         focus_since,
     })
+}
+
+/// Whether an adapter is currently enforcing under the expected identity.
+fn fresh_heartbeat(file: &str, adapter: &str, now: Timestamp) -> bool {
+    read_heartbeat(file, adapter, now).is_some_and(|heartbeat| heartbeat.fresh)
+}
+
+/// The newest fresh observer. On an X11 GNOME session the extension wins
+/// because the supervisor hands enforcement to it; otherwise the X11 adapter
+/// is the only observer.
+fn observer_heartbeat(now: Timestamp) -> Option<Heartbeat> {
+    read_heartbeat(GNOME_HEARTBEAT_FILE, "gnome-extension", now)
+        .filter(|heartbeat| heartbeat.fresh)
+        .or_else(|| {
+            read_heartbeat(X11_HEARTBEAT_FILE, "x11", now).filter(|heartbeat| heartbeat.fresh)
+        })
 }
 
 /// One app the engine would block right now.
@@ -325,6 +815,55 @@ fn system_timezone() -> Tz {
 }
 
 impl Daemon {
+    fn new(path: PathBuf) -> Self {
+        let mut state = load_state(&path);
+        // A crash can leave a foreground interval open; close it at the last
+        // heartbeat so restored usage is never over-counted.
+        state.recover();
+        Self {
+            state,
+            path,
+            shutdown: false,
+            policy_apps: BTreeSet::new(),
+            policy_seeded: false,
+        }
+    }
+
+    fn greeting(&self) -> String {
+        json!({
+            "event": "ready",
+            "state_path": self.path.display().to_string(),
+        })
+        .to_string()
+    }
+
+    /// One newline-delimited request in, one out. Invalid JSON never kills the
+    /// service; it returns an error envelope with a zero id.
+    fn respond(&mut self, line: &str) -> String {
+        let request: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(error) => {
+                return json!({
+                    "id": 0,
+                    "ok": false,
+                    "error": format!("invalid JSON: {error}"),
+                })
+                .to_string();
+            }
+        };
+        let id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
+        let command = request
+            .get("cmd")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        match self.handle(&command, &request) {
+            Ok(data) => json!({"id": id, "ok": true, "data": data}),
+            Err(error) => json!({"id": id, "ok": false, "error": error}),
+        }
+        .to_string()
+    }
+
     fn handle(&mut self, command: &str, request: &Value) -> DResult<Value> {
         let now = Utc::now();
         let tracked = self.track_usage(now);
@@ -532,7 +1071,7 @@ impl Daemon {
     /// overlay, the open interval is closed at `now`. Returns whether the
     /// ledger changed, so the caller knows to persist.
     fn track_usage(&mut self, now: Timestamp) -> bool {
-        let heartbeat = read_heartbeat(now);
+        let heartbeat = observer_heartbeat(now);
         let focus = match &heartbeat {
             Some(hb) if hb.fresh && !hb.blocked && !hb.focus.is_empty() => {
                 // Attribution must use the profile's own app key, or the
@@ -695,20 +1234,39 @@ impl Daemon {
 
     fn snapshot(&self) -> Value {
         let now = Utc::now();
-        let heartbeat = read_heartbeat(now).is_some_and(|heartbeat| heartbeat.fresh);
-        let enforcement = if heartbeat {
+        let policy_path = self.policy_path().display().to_string();
+        let enforcement = if fresh_heartbeat(X11_HEARTBEAT_FILE, "x11", now) {
+            json!({
+                "state": "active",
+                "adapter": "x11",
+                "message": "The X11 enforcement adapter is hiding blocked windows and showing the block overlay.",
+                "policy_path": policy_path,
+            })
+        } else if fresh_heartbeat(GNOME_HEARTBEAT_FILE, "gnome-extension", now) {
             json!({
                 "state": "active",
                 "adapter": "gnome-extension",
                 "message": "The GNOME Shell extension is enforcing app blocks for native Wayland and XWayland windows.",
-                "policy_path": self.policy_path().display().to_string(),
+                "policy_path": policy_path,
+            })
+        } else if x11_session() {
+            let message = if adapter_program().is_some() {
+                "The X11 enforcement adapter is not reporting. The daemon keeps the policy fresh and restarts the adapter if it exits."
+            } else {
+                "No X11 enforcement adapter was found. Install the stayproductive-x11 launcher or set STAYPRODUCTIVE_X11_ADAPTER."
+            };
+            json!({
+                "state": "unavailable",
+                "adapter": "x11",
+                "message": message,
+                "policy_path": policy_path,
             })
         } else {
             json!({
                 "state": "unavailable",
                 "adapter": "gnome-extension",
                 "message": "No enforcement adapter is reporting. The policy file is ready; install and enable the GNOME extension to apply it.",
-                "policy_path": self.policy_path().display().to_string(),
+                "policy_path": policy_path,
             })
         };
         let profiles: Vec<Value> = self
@@ -1279,4 +1837,42 @@ fn commitment_view(commitment: &Commitment) -> Value {
             Restriction::BlockPause => "block_pause",
         }).collect::<Vec<_>>(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fnv_matches_the_python_client() {
+        // `engine.py` derives the same socket suffix for a custom state file.
+        assert_eq!(fnv1a_hex(b""), "cbf29ce484222325");
+        assert_eq!(fnv1a_hex(b"abc"), "e71fa2190541574b");
+    }
+
+    #[test]
+    fn socket_argument_takes_an_optional_explicit_path() {
+        match parse_args(vec!["--socket".into(), "/tmp/chosen.sock".into()]).unwrap() {
+            Mode::Socket(path) => assert_eq!(path, PathBuf::from("/tmp/chosen.sock")),
+            Mode::Stdio => panic!("expected socket mode"),
+        }
+        match parse_args(vec!["--socket=/tmp/inline.sock".into()]).unwrap() {
+            Mode::Socket(path) => assert_eq!(path, PathBuf::from("/tmp/inline.sock")),
+            Mode::Stdio => panic!("expected socket mode"),
+        }
+        assert!(matches!(
+            parse_args(vec!["--stdio".into()]).unwrap(),
+            Mode::Stdio
+        ));
+        assert!(parse_args(vec!["--wat".into()]).is_err());
+    }
+
+    #[test]
+    fn invalid_json_returns_an_error_envelope() {
+        let path = env::temp_dir().join(format!("stayproductive-unit-{}.json", ulid::Ulid::new()));
+        let mut daemon = Daemon::new(path);
+        let response: Value = serde_json::from_str(&daemon.respond("{not json")).unwrap();
+        assert_eq!(response["id"], 0);
+        assert_eq!(response["ok"], false);
+    }
 }

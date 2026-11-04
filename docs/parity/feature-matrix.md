@@ -13,17 +13,18 @@ implemented), `decision` (blocked on a product/architecture decision).
 one required layer or automated acceptance evidence is still outstanding. See
 [`../spec/implementation-notes.md`](../spec/implementation-notes.md).
 
-The runnable build (October 2026) has the core engine, a local JSON state
-service, and a GTK 4 + libadwaita UI. It includes an opt-in GNOME Shell
-extension that enforces application `block` rules, application quick blocks,
-and daily/hourly application usage limits on real windows: the extension
-reports the focused app, the daemon attributes foreground intervals to the
-engine's usage ledger, and a reached limit produces a policy entry like any
-other block. It does **not** yet enforce websites, keywords, site time limits,
-launch/pickup limits, or other compositors. Every row whose user-visible
-result depends on those missing layers remains `wip` or `todo`. The app
-reports enforcement as active only when the extension heartbeat is fresh and
-has loaded a valid policy.
+The runnable build (November 2026) has the core engine, an autonomous local JSON
+state service behind a same-user Unix socket and an opt-in systemd user unit, a
+GTK 4 + libadwaita UI, and a five-step first-run onboarding wizard. A supervised
+X11 adapter enforces application `block` rules, application quick blocks, and
+daily/hourly application usage limits on real windows; an opt-in GNOME Shell
+extension does the same for native Wayland and XWayland. The observer reports
+the focused app, the daemon attributes foreground intervals to the engine's
+usage ledger, and a reached limit produces a policy entry like any other block.
+It does **not** yet enforce websites, keywords, site time limits, launch/pickup
+limits, or other compositors. Every row whose user-visible result depends on
+those missing layers remains `wip` or `todo`. The app reports enforcement as
+active only when an adapter heartbeat is fresh and has loaded a valid policy.
 
 ## 1. Profiles and rules
 
@@ -120,7 +121,7 @@ has loaded a valid policy.
 
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-UX-01 | Onboarding: purpose, permissions, first profile | P0 | GTK wizard | ux §2 | A-UX-01 | todo |
+| F-UX-01 | Onboarding: purpose, permissions, first profile | P0 | GTK wizard | ux §2 | A-UX-01 | wip |
 | F-UX-02 | Dashboard: status, profile, remaining time, quick actions | P0 | GTK | ux §3 | A-UX-02 | wip |
 | F-UX-03 | Block screen explains reason and end time | P0 | GNOME overlay | ux §5 | A-UX-03 | wip |
 | F-UX-04 | Break countdown screen | P1 | overlay | ux §5 | A-UX-04 | todo |
@@ -137,15 +138,15 @@ has loaded a valid policy.
 
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-PLAT-01 | Daemon autostart and restart | P0 | systemd user unit | arch §5 | A-PLAT-01 | todo |
-| F-PLAT-02 | X11 foreground detection and enforcement | P0 | EWMH | arch §4 | A-PLAT-02 | todo |
+| F-PLAT-01 | Daemon autostart and restart | P0 | systemd user unit | arch §5 | A-PLAT-01 | wip |
+| F-PLAT-02 | X11 foreground detection and enforcement | P0 | EWMH | arch §4 | A-PLAT-02 | wip |
 | F-PLAT-03 | sway/i3 adapter | P1 | IPC | arch §4 | A-PLAT-03 | todo |
 | F-PLAT-04 | Hyprland adapter | P1 | IPC | arch §4 | A-PLAT-04 | todo |
 | F-PLAT-05 | GNOME Shell adapter | P2 | extension + policy file | arch §4 | A-PLAT-05 | wip |
 | F-PLAT-06 | KDE/KWin adapter | P2 | script + D-Bus | arch §4 | A-PLAT-06 | todo |
 | F-PLAT-07 | System-wide DNS filtering (optional helper) | P1 | polkit + resolver | arch §7 | A-PLAT-07 | decision |
 | F-PLAT-08 | Browser extension (URL + DOM signals) | P1 | WebExtension | content §2 | A-PLAT-08 | todo |
-| F-PLAT-09 | Idle/lock/suspend awareness | P0 | logind | arch §4 | A-PLAT-09 | todo |
+| F-PLAT-09 | Idle/lock/suspend awareness | P0 | logind | arch §4 | A-PLAT-09 | wip |
 | F-PLAT-10 | Multi-monitor lock overlay | P0 | compositor adapter | arch §6 | A-PLAT-10 | wip |
 | F-PLAT-11 | Notifications and low-time alerts | P1 | D-Bus | arch §5 | A-PLAT-11 | todo |
 
@@ -158,7 +159,7 @@ has loaded a valid policy.
 | F-DATA-03 | Daemon/UI version skew tolerated | P1 | IPC versioning | arch §8 | A-DATA-03 | todo |
 | F-DATA-04 | Full local reset with confirmation | P1 | store | ux §8 | A-DATA-04 | todo |
 
-## Current build evidence (October 2026)
+## Current build evidence (November 2026)
 
 | Check | Result |
 | --- | --- |
@@ -171,10 +172,24 @@ has loaded a valid policy.
 | Profile editor round-trip | created and updated a scheduled profile with apps, site daily limit, keywords, allowlist, and multiple windows; persisted state re-read correctly |
 | Strict cool-down | core test rejects `finish_commitment_end` before the cool-down and accepts it afterwards; locked edits/pauses are rejected |
 | Enforcement policy | daemon protocol test checks active/inactive app entries, policy path, and `0600` mode |
-| Enforcement heartbeat | daemon protocol test checks active only with a fresh `active:true`/`policy_loaded:true` heartbeat and refuses stale, inactive, or policy-less files |
+| Enforcement heartbeat | daemon protocol test checks active only with a fresh `active:true`/`policy_loaded:true` heartbeat with the expected `adapter`, and refuses stale, inactive, policy-less, or foreign files |
 | Usage tracking → limits | daemon protocol test drives the real binary: reported focus over a daily limit blocks with `R-LIMIT-DAILY` and records history; the block overlay suspends accrual; counters survive restart (A-LIM-05 seed) |
+| X11 adapter matching (`F-PLAT-02`) | `crates/ui/tests/test_x11_policy.py` covers aliases, expiry, hide-then-overlay ordering, dedupe, re-block, allowed-window hide, and Back |
+| X11 adapter supervision (`F-PLAT-02`) | `crates/daemon/tests/protocol.rs` kills a fake adapter and checks that the daemon removes its stale heartbeat, restarts it, and reports `active`/`x11`; shutdown leaves no orphan |
+| X11 adapter live (`F-PLAT-02`) | opt-in `crates/ui/tests/test_x11_live.py` under Xvfb: blocked window unmapped, allowed window lowers the block, refocusing re-blocks, expiring policy restores the window, and the heartbeat carries `monitors`, `card_monitor`, `locked`, `suspended`, and `session_aware` |
+| X11 adapter end-to-end (`F-PLAT-02`) | real daemon + real adapter under Xvfb: active profile produced the policy, the focused window was blocked, snapshot reported `active`/`x11` |
+| X11 card placement (`F-PLAT-10`) | `PreferredMonitorTest` in `crates/ui/tests/test_x11_policy.py` covers single monitor, left/right monitor, a spanning window's majority, off-screen and missing geometry, and no monitors; live Xvfb run asserts one monitor and card on monitor 0 |
+| X11 lock/suspend (`F-PLAT-09`) | `PlannerPauseTest` covers pause hiding the overlay, focus/Back ignored while paused, resume re-blocking the still-hidden window, and restoring a policy that expired during the pause; `SessionMonitor` reads logind `Lock`/`Unlock`/`PrepareForSleep` plus a throttled `LockedHint` fallback and reports `session_aware` |
+| X11 multi-monitor visuals (`F-PLAT-10`) | **not measured**: Xvfb rejects RandR monitor objects, so GDK always sees one monitor; card position and focus on a real two-monitor X11 session still need a logged-in desktop |
+| X11 real lock/suspend (`F-PLAT-09`) | **not measured** by locking a live session; logind wiring is exercised against the system bus in the heartbeat, and the release/resume handshake is unit-tested |
+| X11 WM iconification and overlay visuals | **not measured**: Xvfb has no window manager and no logged-in X11 session was available |
+| Socket transport (`F-PLAT-01`) | daemon protocol tests check `0600` socket / `0700` dir, single instance, clean socket removal, and a policy refreshed with no client |
+| Daemon autonomy (`F-PLAT-01`) | Xvfb end-to-end: `SIGKILL`ed the UI, daemon stayed alive and advanced the policy timestamp; relaunch reused the same daemon PID; explicit shutdown removed process and socket |
+| systemd unit and restart (`F-PLAT-01`) | `crates/ui/tests/test_service.py` covers unit text, quoting, socket naming, service states, and handover order; manual transient unit restarted a `kill -9`ed daemon with a new PID and stayed active |
+| Autostart toggle | **not measured** with a real `systemctl --user enable` + logout/login; requires a human session |
 | GNOME matching helpers | `gjs -m integrations/gnome/tests/matching.test.js` pass, including the `FocusTracker` interval rules |
 | Installed-app chooser | `PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests` pass; GTK construction smoke-tested under Xvfb |
+| First-run onboarding | five steps implemented; goal/app selection, starter profile, marker, and the “exactly one profile” guard covered by `crates/ui/tests/test_onboarding.py`; GTK flow construction-smoke-tested under Xvfb. Autostart, notifications, and the DNS helper are listed as unavailable and cannot be enabled from the wizard. |
 | GNOME install flow | exercised with an isolated `XDG_DATA_HOME` and keyfile settings backend; copied the extension and enabled it without touching the host session |
 | GNOME extension load | pass in headless GNOME Shell 49: loads, reads policy, writes heartbeat, drops expired/removed policy |
 | GNOME overlay focus/visuals | **not measured** in headless Shell because it has no seat; requires a logged-in session |

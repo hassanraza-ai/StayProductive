@@ -19,6 +19,7 @@ from .. import widgets as w
 class DashboardPage:
     def __init__(self, window) -> None:
         self.window = window
+        self._enforcement_dismissed = False
         self.root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
         self.root.set_margin_top(28)
         self.root.set_margin_bottom(40)
@@ -99,6 +100,14 @@ class DashboardPage:
         )
         warning_copy.set_hexpand(True)
         warning_row.append(warning_copy)
+        warning_row.append(
+            w.button(
+                icon="window-close-symbolic",
+                css="flat",
+                tooltip="Dismiss this warning for this session",
+                on_click=lambda _button: self._dismiss_enforcement_warning(),
+            )
+        )
         self.enforcement_warning.append(warning_row)
         self.root.append(self.enforcement_warning)
 
@@ -242,13 +251,17 @@ class DashboardPage:
 
         enforcement = snapshot.get("enforcement", {})
         enforcement_active = enforcement.get("state") == "active"
-        self.enforcement_warning.set_visible(not enforcement_active)
+        if enforcement_active:
+            self._enforcement_dismissed = False
+        self.enforcement_warning.set_visible(
+            not enforcement_active and not self._enforcement_dismissed
+        )
         self.enforcement_active.set_visible(enforcement_active)
         if enforcement_active:
             self.enforcement_detail.set_label(
                 enforcement.get(
                     "message",
-                    "The GNOME Shell extension is applying app blocks now.",
+                    "A desktop enforcement adapter is applying app blocks now.",
                 )
             )
 
@@ -320,8 +333,8 @@ class DashboardPage:
         history = snapshot.get("history", [])
         if not history:
             empty = w.label(
-                "No blocks recorded yet. Desktop blocks appear here once the "
-                "GNOME extension is active.",
+                "No blocks recorded yet. Desktop blocks appear here once a "
+                "desktop enforcement adapter is active.",
                 "muted",
             )
             empty.add_css_class("small")
@@ -334,6 +347,10 @@ class DashboardPage:
             row.append(title)
             row.append(w.label(entry.get("reason", ""), "muted small"))
             self.history_list.append(row)
+
+    def _dismiss_enforcement_warning(self) -> None:
+        self._enforcement_dismissed = True
+        self.enforcement_warning.set_visible(False)
 
     def _pause_active(self) -> None:
         active = self.window.snapshot.get("active_profiles", [])
