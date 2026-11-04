@@ -37,6 +37,7 @@ except (ImportError, ValueError):
     GdkX11 = None  # type: ignore[assignment]
 
 from . import paths  # noqa: E402
+from .session import SessionMonitor  # noqa: E402
 from .x11 import X11, WindowGeometry  # noqa: E402
 from .x11_policy import (  # noqa: E402
     Action,
@@ -46,6 +47,7 @@ from .x11_policy import (  # noqa: E402
     PolicyEntry,
     parse_timestamp,
     policy_from_json,
+    preferred_monitor,
     reason_text,
 )
 
@@ -171,11 +173,19 @@ class Overlay:
         self.on_back = on_back
         self._windows: list[Gtk.Window] = []
         self._geometries: list[WindowGeometry] = []
+        self._cards: list[Gtk.Widget] = []
         self._headline: list[Gtk.Label] = []
         self._reason: list[Gtk.Label] = []
         self._until: list[Gtk.Label] = []
         self.visible = False
+        self.card_monitor = 0
         self._css_installed = False
+
+    @property
+    def monitor_count(self) -> int:
+        # Before the first block no overlay window exists yet; report the
+        # display's monitor count so the heartbeat is meaningful from startup.
+        return len(self._windows) or len(self._monitor_geometries())
 
     @property
     def xids(self) -> set[int]:
@@ -238,38 +248,44 @@ class Overlay:
         box.set_hexpand(True)
         box.set_vexpand(True)
 
+        # The window is the dark cover for one monitor; the card holds the
+        # explanation and is only shown on the monitor the blocked window was
+        # on, so the user reads it where they were looking.
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        box.append(card)
+
         brand = Gtk.Label(label="STAYPRODUCTIVE")
         brand.add_css_class("sp-brand")
-        box.append(brand)
+        card.append(brand)
 
         headline = Gtk.Label(label="This app is blocked")
         headline.add_css_class("sp-headline")
         headline.set_wrap(True)
         headline.set_justify(Gtk.Justification.CENTER)
         headline.set_max_width_chars(44)
-        box.append(headline)
+        card.append(headline)
 
         reason = Gtk.Label(label="")
         reason.add_css_class("sp-reason")
         reason.set_wrap(True)
         reason.set_justify(Gtk.Justification.CENTER)
         reason.set_max_width_chars(54)
-        box.append(reason)
+        card.append(reason)
 
         until = Gtk.Label(label="")
         until.add_css_class("sp-until")
-        box.append(until)
+        card.append(until)
 
         back = Gtk.Button(label="Back to the previous app")
         back.add_css_class("sp-back")
         back.connect("clicked", lambda _button: self.on_back())
-        box.append(back)
+        card.append(back)
 
         privacy = Gtk.Label(
             label="Enforced locally. No account, network, or telemetry."
         )
         privacy.add_css_class("sp-privacy")
-        box.append(privacy)
+        card.append(privacy)
 
         window.set_child(box)
 
@@ -280,6 +296,7 @@ class Overlay:
         )
         window.add_controller(controller)
 
+        self._cards.append(card)
         self._headline.append(headline)
         self._reason.append(reason)
         self._until.append(until)
@@ -302,6 +319,7 @@ class Overlay:
             window.destroy()
         self._windows = []
         self._geometries = geometries
+        self._cards = []
         self._headline = []
         self._reason = []
         self._until = []
@@ -324,8 +342,19 @@ class Overlay:
         self.backend.configure(xid, geometry)
         self.backend.raise_window(xid)
 
-    def show(self, entry: PolicyEntry, label: str, until_text: str) -> None:
+    def show(
+        self,
+        entry: PolicyEntry,
+        label: str,
+        until_text: str,
+        window_id: int | None = None,
+    ) -> None:
         self._ensure_windows()
+        geometry = self.backend.root_geometry(window_id) if window_id else None
+        card_index = preferred_monitor(geometry, self._geometries)
+        if card_index < 0 or card_index >= len(self._windows):
+            card_index = 0
+        self.card_monitor = card_index
         headline_text = f"{label} is blocked"
         reason_text_value = reason_text(entry.reason)
         for index, window in enumerate(self._windows):
@@ -333,6 +362,7 @@ class Overlay:
                 self._headline[index].set_label(headline_text)
                 self._reason[index].set_label(reason_text_value)
                 self._until[index].set_label(until_text)
+                self._cards[index].set_visible(index == card_index)
             if not window.get_visible():
                 self._prepare(window, self._geometries[index])
                 window.present()
@@ -343,10 +373,10 @@ class Overlay:
                 except (AttributeError, TypeError):
                     pass
         if self._windows:
-            last = self._windows[-1].get_surface()
-            if last is not None:
+            card_surface = self._windows[card_index].get_surface()
+            if card_surface is not None:
                 try:
-                    self.backend.focus(last.get_xid())
+                    self.backend.focus(card_surface.get_xid())
                 except (AttributeError, TypeError):
                     pass
         self.visible = True
@@ -376,13 +406,16 @@ class X11Adapter:
         self.poll_ms = poll_ms
         self.planner = Planner()
         self.overlay = Overlay(application, backend, self.go_back)
+        self.session = SessionMonitor(self._on_session_change)
         self._last_heartbeat = 0.0
         self._last_parent_check = 0.0
+        self._paused = False
         self._stopping = False
 
     # ------------------------------------------------------------------ loop
     def start(self) -> None:
         self.backend.sync()
+        self.session.start()
         self.write_heartbeat(policy_loaded=False)
         GLib.timeout_add(self.poll_ms, self.tick)
 
@@ -391,7 +424,13 @@ class X11Adapter:
             return False
         now = utc_now()
         self._check_parent(now)
+        self.session.refresh()
+        self._apply_session_state()
         policy = self.policy_cache.load(now)
+        if self._paused:
+            if time.monotonic() - self._last_heartbeat >= HEARTBEAT_SECONDS:
+                self.write_heartbeat(policy_loaded=policy is not None)
+            return True
         focus = self.backend.active_window()
         if focus is not None and focus in self.overlay.xids:
             event = (
@@ -427,7 +466,10 @@ class X11Adapter:
                 self.backend.hide(action.window)
             elif action.kind == "show_overlay" and action.entry is not None:
                 self.overlay.show(
-                    action.entry, action.label, self._until_text(action.entry)
+                    action.entry,
+                    action.label,
+                    self._until_text(action.entry),
+                    action.window,
                 )
             elif action.kind == "hide_overlay":
                 self.overlay.hide()
@@ -452,6 +494,29 @@ class X11Adapter:
         self._execute(self.planner.back())
         self.write_heartbeat(policy_loaded=self.policy_cache.load() is not None)
 
+    def _apply_session_state(self) -> None:
+        """Pause enforcement while the screen is locked or the system suspends.
+
+        The overlay must never cover a lock screen or a security prompt, and
+        the lock screen's focus changes must not be read as an allowed app.
+        The blocked window stays hidden and the block resumes on unlock.
+        """
+
+        paused = self.session.locked or self.session.suspended
+        if paused == self._paused:
+            return
+        self._paused = paused
+        if paused:
+            self._execute(self.planner.pause())
+        else:
+            self.planner.resume()
+        self.write_heartbeat(policy_loaded=self.policy_cache.load() is not None)
+
+    def _on_session_change(self) -> None:
+        """React to a logind signal between two polls."""
+
+        self._apply_session_state()
+
     def _check_parent(self, now: datetime) -> None:
         if not self.parent_pid:
             return
@@ -472,6 +537,11 @@ class X11Adapter:
             "blocked": 1 if self.planner.overlay_visible else 0,
             "overlay_visible": self.planner.overlay_visible,
             "blocks": self.planner.blocks,
+            "monitors": self.overlay.monitor_count,
+            "card_monitor": self.overlay.card_monitor,
+            "locked": self.session.locked,
+            "suspended": self.session.suspended,
+            "session_aware": self.session.available,
             "display": os.environ.get("DISPLAY", ""),
             "checked_at": iso_timestamp(),
         }

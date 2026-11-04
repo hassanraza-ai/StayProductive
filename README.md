@@ -148,7 +148,11 @@ On a plain X11 session there is nothing to install. When the environment has
 `DISPLAY`, no `WAYLAND_DISPLAY`, and `XDG_SESSION_TYPE` is not `wayland`, the
 daemon starts `stayproductive-x11` itself and restarts it if it exits. The
 adapter watches EWMH focus, hides a blocked window, and covers every monitor
-with the block explanation. It is a separate process so closing the
+with the block explanation. The explanation card is shown on the monitor that
+holds the blocked window, and keyboard focus follows it there. When
+systemd-logind reports a screen lock or suspend, the overlay is released so it
+cannot cover a lock screen or security prompt; the blocked window stays hidden
+and the block resumes on unlock. It is a separate process so closing the
 StayProductive window does not stop enforcement.
 
 If the daemon cannot find the launcher, point it at the checkout script
@@ -165,11 +169,14 @@ cat "${XDG_RUNTIME_DIR:-/tmp}/stayproductive/x11-adapter.json"
 cat "${XDG_RUNTIME_DIR:-/tmp}/stayproductive/x11-adapter.log"
 ```
 
-The adapter covers application windows only. A compositor without EWMH support,
-screen lock/suspend, and dynamic workspace changes are not handled yet. Xvfb test
-runs use a direct unmap because there is no window manager; a real X11 login is
-still needed to judge iconification and overlay visuals. Start at login also
-depends on the session exporting `DISPLAY`/`XAUTHORITY` to the systemd user
+The adapter covers application windows only. A compositor without EWMH support
+and dynamic workspace changes are not handled yet. Card placement across
+monitors and the lock/suspend handshake are implemented, but Xvfb cannot present
+two monitors to GDK or lock a real session, so those visuals still need a
+logged-in X11 desktop; the live test asserts the single-monitor heartbeat fields.
+Xvfb test runs use a direct unmap because there is no window manager; a real X11
+login is still needed to judge iconification and overlay visuals. Start at login
+also depends on the session exporting `DISPLAY`/`XAUTHORITY` to the systemd user
 manager; enabling autostart from Settings imports them for the current manager,
 and the unit passes them through with `PassEnvironment`. See
 [`docs/spec/implementation-notes.md`](docs/spec/implementation-notes.md).
@@ -205,9 +212,10 @@ STAYPRODUCTIVE_X11_LIVE=1 PYTHONPATH=crates/ui \
 
 The Python suite covers desktop-entry discovery, the onboarding goal/starter
 profile logic, the socket client (detach, reconnect, state mismatch), the
-systemd unit text and service-state logic, and the display-free X11 matching and
-planner rules. The GTK wizard itself is construction-smoke-tested under Xvfb;
-visual inspection is not an acceptance test.
+systemd unit text and service-state logic, and the display-free X11 matching,
+monitor-card choice, and planner pause/resume rules. The GTK wizard itself is
+construction-smoke-tested under Xvfb; visual inspection is not an acceptance
+test.
 
 ## What "identical behaviour" means here
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 # Reason text is original copy, not extracted from any reference artifact.
 REASON_TEXT = {
@@ -140,6 +140,49 @@ def policy_from_json(value: Any, now: datetime | None = None) -> Policy | None:
 
 
 @dataclass(frozen=True)
+class Rect:
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+def _intersection_area(first: Rect, second: Rect) -> int:
+    width = (
+        min(first.x + first.width, second.x + second.width) - max(first.x, second.x)
+    )
+    height = (
+        min(first.y + first.height, second.y + second.height) - max(first.y, second.y)
+    )
+    return max(0, width) * max(0, height)
+
+
+def preferred_monitor(window: Rect | None, monitors: Sequence[Rect]) -> int:
+    """Index of the monitor that should show the block card.
+
+    The card belongs where the user is looking, so the monitor sharing the
+    most area with the blocked window wins. A window that is entirely off
+    screen, or a missing geometry, falls back to the first monitor: every
+    monitor still gets covered, so enforcement never weakens.
+    """
+
+    if not monitors:
+        return -1
+    best = -1
+    best_area = 0
+    for index, monitor in enumerate(monitors):
+        if window is None:
+            break
+        area = _intersection_area(window, monitor)
+        if area > best_area:
+            best_area = area
+            best = index
+    if best >= 0:
+        return best
+    return 0
+
+
+@dataclass(frozen=True)
 class FocusEvent:
     window: int
     identifiers: frozenset[str]
@@ -170,8 +213,11 @@ class Planner:
         self.blocked_entry: PolicyEntry | None = None
         self.previous_allowed: int | None = None
         self.blocks = 0
+        self.paused = False
 
     def update(self, event: FocusEvent | None, policy: Policy | None) -> list[Action]:
+        if self.paused:
+            return []
         if policy is None:
             return self.clear()
         if event is None:
@@ -233,12 +279,32 @@ class Planner:
     def back(self) -> list[Action]:
         """Leave the overlay for the last allowed window, if there is one."""
 
-        if not self.overlay_visible or self.previous_allowed is None:
+        if self.paused or not self.overlay_visible or self.previous_allowed is None:
             return []
         actions = [Action("focus_window", window=self.previous_allowed)]
         actions.append(Action("hide_overlay"))
         self._reset_block()
         return actions
+
+    def pause(self) -> list[Action]:
+        """Release the overlay for a lock screen or suspend.
+
+        The blocked window stays hidden; only the explanation goes away so it
+        never covers a lock screen or a security prompt.
+        """
+
+        if self.paused:
+            return []
+        self.paused = True
+        if not self.overlay_visible:
+            return []
+        self.overlay_visible = False
+        return [Action("hide_overlay")]
+
+    def resume(self) -> None:
+        """Let the next focus event re-block the still-hidden window."""
+
+        self.paused = False
 
     def _reset_block(self) -> None:
         self.overlay_visible = False

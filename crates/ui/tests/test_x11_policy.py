@@ -9,8 +9,10 @@ from stayproductive.x11_policy import (
     Action,
     FocusEvent,
     Planner,
+    Rect,
     app_aliases,
     policy_from_json,
+    preferred_monitor,
     reason_text,
 )
 
@@ -176,6 +178,125 @@ class PlannerTest(unittest.TestCase):
 
     def test_actions_are_comparable_dataclasses(self) -> None:
         self.assertEqual(Action("hide_overlay"), Action("hide_overlay"))
+
+
+class PreferredMonitorTest(unittest.TestCase):
+    """The card belongs on the monitor the blocked window was on."""
+
+    LEFT = Rect(0, 0, 1920, 1080)
+    RIGHT = Rect(1920, 0, 1920, 1080)
+
+    def test_single_monitor(self) -> None:
+        self.assertEqual(
+            preferred_monitor(Rect(100, 100, 800, 600), [self.LEFT]),
+            0,
+        )
+
+    def test_window_on_the_right_monitor(self) -> None:
+        window = Rect(2400, 100, 800, 600)
+        self.assertEqual(
+            preferred_monitor(window, [self.LEFT, self.RIGHT]),
+            1,
+        )
+
+    def test_window_on_the_left_monitor(self) -> None:
+        window = Rect(200, 100, 800, 600)
+        self.assertEqual(
+            preferred_monitor(window, [self.LEFT, self.RIGHT]),
+            0,
+        )
+
+    def test_spanning_window_uses_the_larger_share(self) -> None:
+        window = Rect(1200, 0, 1400, 1080)
+        self.assertEqual(
+            preferred_monitor(window, [self.LEFT, self.RIGHT]),
+            0,
+        )
+        self.assertEqual(
+            preferred_monitor(Rect(1200, 0, 1500, 1080), [self.LEFT, self.RIGHT]),
+            1,
+        )
+
+    def test_off_screen_window_falls_back_to_the_first_monitor(self) -> None:
+        window = Rect(5000, 4000, 800, 600)
+        self.assertEqual(
+            preferred_monitor(window, [self.LEFT, self.RIGHT]),
+            0,
+        )
+
+    def test_missing_geometry_falls_back_to_the_first_monitor(self) -> None:
+        self.assertEqual(
+            preferred_monitor(None, [self.LEFT, self.RIGHT]),
+            0,
+        )
+
+    def test_no_monitors_reports_no_card(self) -> None:
+        self.assertEqual(preferred_monitor(self.LEFT, []), -1)
+        self.assertEqual(preferred_monitor(None, []), -1)
+
+
+class PlannerPauseTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.now = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+        self.policy = policy(
+            self.now,
+            [{"app": "firefox", "reason": "R-PROFILE", "until": None}],
+        )
+        assert self.policy is not None
+        self.planner = Planner()
+
+    def event(self, window: int, name: str) -> FocusEvent:
+        return FocusEvent(window=window, identifiers=frozenset({name}), label=name)
+
+    def test_pause_hides_the_overlay(self) -> None:
+        self.planner.update(self.event(11, "firefox"), self.policy)
+        self.assertEqual(
+            [action.kind for action in self.planner.pause()],
+            ["hide_overlay"],
+        )
+        self.assertTrue(self.planner.paused)
+        self.assertFalse(self.planner.overlay_visible)
+
+    def test_pause_without_an_overlay_does_nothing(self) -> None:
+        self.assertEqual(self.planner.pause(), [])
+        self.assertEqual(self.planner.pause(), [])
+
+    def test_updates_are_ignored_while_paused(self) -> None:
+        self.planner.update(self.event(11, "firefox"), self.policy)
+        self.planner.pause()
+        self.assertEqual(
+            self.planner.update(self.event(11, "firefox"), self.policy), []
+        )
+        self.assertEqual(self.planner.update(self.event(10, "nautilus"), self.policy), [])
+        self.assertEqual(self.planner.update(self.event(11, "firefox"), None), [])
+
+    def test_back_is_ignored_while_paused(self) -> None:
+        self.planner.update(self.event(10, "nautilus"), self.policy)
+        self.planner.update(self.event(11, "firefox"), self.policy)
+        self.planner.pause()
+        self.assertEqual(self.planner.back(), [])
+        self.assertEqual(self.planner.back(), [])
+
+    def test_resume_reblocks_the_still_hidden_window(self) -> None:
+        self.planner.update(self.event(11, "firefox"), self.policy)
+        self.planner.pause()
+        self.planner.resume()
+        self.assertFalse(self.planner.paused)
+        actions = self.planner.update(self.event(11, "firefox"), self.policy)
+        # The window is already hidden; only the explanation comes back.
+        self.assertEqual([action.kind for action in actions], ["show_overlay"])
+        self.assertTrue(self.planner.overlay_visible)
+
+    def test_policy_expiry_while_paused_restores_after_resume(self) -> None:
+        self.planner.update(self.event(11, "firefox"), self.policy)
+        self.planner.pause()
+        self.planner.resume()
+        # The overlay was already hidden by pause(), so only the restore is
+        # left to do: the window must not stay hidden forever.
+        self.assertEqual(
+            [action.kind for action in self.planner.update(self.event(11, "firefox"), None)],
+            ["restore_window"],
+        )
 
 
 if __name__ == "__main__":

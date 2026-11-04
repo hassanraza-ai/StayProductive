@@ -259,17 +259,35 @@ end.
   panel, menu, notification, and other non-application window types are
   ignored, and the last known block is kept while they have focus.
 - **Overlay** — one override-redirect GTK window per `Gdk.Monitor`, positioned
-  and raised through Xlib and given keyboard focus. The card names the app, the
-  reason from the `R-*` code, the end time, a Back action, and local-only copy.
-  The overlay is created before it is mapped so the window manager does not
+  and raised through Xlib and given keyboard focus. Every monitor is covered;
+  the explanation card is only shown on the monitor that shares the most area
+  with the blocked window (`preferred_monitor`), and keyboard focus goes to
+  that window so the Back button is where the user is looking. A window with
+  no known geometry or one entirely off screen falls back to the first
+  monitor, so enforcement never weakens. The card names the app, the reason
+  from the `R-*` code, the end time, a Back action, and local-only copy. The
+  overlay is created before it is mapped so the window manager does not
   decorate or reposition it.
+- **Lock and suspend** — `session.py` watches systemd-logind over the system
+  bus: `Manager.PrepareForSleep`, `Session.Lock`/`Unlock`, and a throttled
+  (two-second) `LockedHint` property read as a fallback when a signal is
+  missed. While locked or suspended the planner is paused: the overlay is
+  released so it never covers a lock screen or a security prompt, focus
+  changes are ignored so the lock screen cannot be mistaken for an allowed
+  application, and the blocked window stays hidden. Unlocking resumes the
+  planner, and the next focus event re-blocks the still-hidden window; a
+  policy that expired during the pause is cleared on resume, which restores
+  the window. When logind is unreachable the adapter reports
+  `session_aware:false` and keeps enforcing without pausing.
 - **Hide** — ICCCM `WM_CHANGE_STATE` `IconicState` when
   `_NET_SUPPORTING_WM_CHECK` exists; a direct `XUnmapWindow` when there is no
   window manager (headless/Xvfb).
 - **Heartbeat** — `$XDG_RUNTIME_DIR/stayproductive/x11-adapter.json` is written
   after every action and at least once a second. It contains `adapter:"x11"`,
-  `active`, `policy_loaded`, `blocked`, `overlay_visible`, `blocks`, `display`,
-  and `checked_at`; no window titles or per-app history are recorded.
+  `active`, `policy_loaded`, `blocked`, `overlay_visible`, `blocks`,
+  `monitors`, `card_monitor`, `locked`, `suspended`, `session_aware`,
+  `display`, and `checked_at`; no window titles or per-app history are
+  recorded.
 - **Supervision** — the daemon finds the launcher from an explicit
   `STAYPRODUCTIVE_X11_ADAPTER`, `stayproductive-x11` on `PATH`, or the checkout
   next to the binary, then starts it with `--state`, `--heartbeat`, and
@@ -289,25 +307,37 @@ Evidence:
 
 - `crates/ui/tests/test_x11_policy.py` — aliases, policy expiry, hide/overlay
   ordering, dedupe, re-block, allowed-window hide, and Back with and without a
-  previous window.
+  previous window. `PreferredMonitorTest` covers single-monitor, left/right
+  monitor, spanning-window majority, off-screen and missing geometry, and no
+  monitors; `PlannerPauseTest` covers pause hiding the overlay, updates and
+  Back being ignored while paused, resume re-blocking the still-hidden window,
+  and a policy that expires during the pause being restored on resume.
 - `crates/daemon/tests/protocol.rs::socket_service_supervises_the_x11_adapter`
   — a fake adapter writes a heartbeat, is `SIGKILL`ed, and is restarted; the
   snapshot reports `active`/`x11`, and shutdown leaves no orphan.
 - `crates/ui/tests/test_x11_live.py` (opt in with
   `STAYPRODUCTIVE_X11_LIVE=1`) — Xvfb end-to-end: a focused blocked window is
   unmapped, switching to an allowed window lowers the block, refocusing
-  re-blocks and increments `blocks`, and an expiring policy maps the window
-  again.
+  re-blocks and increments `blocks`, an expiring policy maps the window again,
+  and the heartbeat reports `monitors`, `card_monitor`, `locked`,
+  `suspended`, and `session_aware`.
 - Manual Xvfb end-to-end with the real daemon and real adapter: an active
   profile produced the policy, the adapter blocked the focused window, and the
   snapshot reported `active`/`x11`.
 
 Limitations: Xvfb has no window manager, so the measured run exercised the
 `XUnmapWindow` fallback rather than WM iconification, real decorations, or a
-compositor's focus rules. Overlay pixels and multi-monitor placement have not
-been inspected in a logged-in X11 session. Dynamic workspaces, screen
-lock/suspend, and compositors that refuse override-redirect focus remain open
-(`A-PLAT-09`, `A-PLAT-10`). Autostart at login relies on the graphical session
+compositor's focus rules. Xvfb also cannot present two RandR monitors to GDK,
+so the multi-monitor card choice is covered by display-free unit tests only;
+overlay pixels, the card position, and focus behaviour on a real multi-monitor
+X11 session still need a logged-in desktop. The logind wiring is exercised
+against the live system bus in the heartbeat (`session_aware`), but locking a
+real session to watch the release/resume handshake has not been done and is
+left to a manual check. When logind is unreachable the adapter keeps the
+block active and may cover a lock screen, which is the documented trade-off
+between enforcement and recovery. Dynamic workspaces and compositors that
+refuse override-redirect focus remain open (`A-PLAT-09`, `A-PLAT-10`).
+Autostart at login relies on the graphical session
 exporting `DISPLAY`/`XAUTHORITY` into the systemd user manager; importing them
 when autostart is enabled covers the current manager, but a session that never
 exports them will start the daemon without an adapter and report `unavailable`.

@@ -194,6 +194,17 @@ class LiveAdapterTest(unittest.TestCase):
             self.assertGreaterEqual(heartbeat.get("blocks", 0), 2)
             self.assertEqual(heartbeat.get("adapter"), "x11")
             self.assertEqual(heartbeat.get("display"), self.display)
+            # Card placement and session awareness are reported so the daemon
+            # and the UI can explain what the adapter sees. Xvfb presents a
+            # single monitor, so the card belongs there.
+            self.assertEqual(heartbeat.get("monitors"), 1)
+            self.assertEqual(heartbeat.get("card_monitor"), 0)
+            self.assertIn("session_aware", heartbeat)
+            self.assertIsInstance(heartbeat.get("session_aware"), bool)
+            # This test must never lock or suspend the real session; it only
+            # verifies that the adapter reports the session as usable.
+            self.assertFalse(heartbeat.get("locked", True))
+            self.assertFalse(heartbeat.get("suspended", True))
 
             # When the policy expires, enforcement stops and the window that
             # was unmapped must become reachable again instead of staying

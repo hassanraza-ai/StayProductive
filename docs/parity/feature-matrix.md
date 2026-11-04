@@ -143,7 +143,7 @@ has loaded a valid policy.
 | F-PLAT-06 | KDE/KWin adapter | P2 | script + D-Bus | arch §4 | A-PLAT-06 | todo |
 | F-PLAT-07 | System-wide DNS filtering (optional helper) | P1 | polkit + resolver | arch §7 | A-PLAT-07 | decision |
 | F-PLAT-08 | Browser extension (URL + DOM signals) | P1 | WebExtension | content §2 | A-PLAT-08 | todo |
-| F-PLAT-09 | Idle/lock/suspend awareness | P0 | logind | arch §4 | A-PLAT-09 | todo |
+| F-PLAT-09 | Idle/lock/suspend awareness | P0 | logind | arch §4 | A-PLAT-09 | wip |
 | F-PLAT-10 | Multi-monitor lock overlay | P0 | compositor adapter | arch §6 | A-PLAT-10 | wip |
 | F-PLAT-11 | Notifications and low-time alerts | P1 | D-Bus | arch §5 | A-PLAT-11 | todo |
 
@@ -172,8 +172,12 @@ has loaded a valid policy.
 | Enforcement heartbeat | daemon protocol test checks active only with a fresh `active:true`/`policy_loaded:true` heartbeat with the expected `adapter`, and refuses stale, inactive, policy-less, or foreign files |
 | X11 adapter matching (`F-PLAT-02`) | `crates/ui/tests/test_x11_policy.py` covers aliases, expiry, hide-then-overlay ordering, dedupe, re-block, allowed-window hide, and Back |
 | X11 adapter supervision (`F-PLAT-02`) | `crates/daemon/tests/protocol.rs` kills a fake adapter and checks that the daemon removes its stale heartbeat, restarts it, and reports `active`/`x11`; shutdown leaves no orphan |
-| X11 adapter live (`F-PLAT-02`) | opt-in `crates/ui/tests/test_x11_live.py` under Xvfb: blocked window unmapped, allowed window lowers the block, refocusing re-blocks, expiring policy restores the window |
+| X11 adapter live (`F-PLAT-02`) | opt-in `crates/ui/tests/test_x11_live.py` under Xvfb: blocked window unmapped, allowed window lowers the block, refocusing re-blocks, expiring policy restores the window, and the heartbeat carries `monitors`, `card_monitor`, `locked`, `suspended`, and `session_aware` |
 | X11 adapter end-to-end (`F-PLAT-02`) | real daemon + real adapter under Xvfb: active profile produced the policy, the focused window was blocked, snapshot reported `active`/`x11` |
+| X11 card placement (`F-PLAT-10`) | `PreferredMonitorTest` in `crates/ui/tests/test_x11_policy.py` covers single monitor, left/right monitor, a spanning window's majority, off-screen and missing geometry, and no monitors; live Xvfb run asserts one monitor and card on monitor 0 |
+| X11 lock/suspend (`F-PLAT-09`) | `PlannerPauseTest` covers pause hiding the overlay, focus/Back ignored while paused, resume re-blocking the still-hidden window, and restoring a policy that expired during the pause; `SessionMonitor` reads logind `Lock`/`Unlock`/`PrepareForSleep` plus a throttled `LockedHint` fallback and reports `session_aware` |
+| X11 multi-monitor visuals (`F-PLAT-10`) | **not measured**: Xvfb rejects RandR monitor objects, so GDK always sees one monitor; card position and focus on a real two-monitor X11 session still need a logged-in desktop |
+| X11 real lock/suspend (`F-PLAT-09`) | **not measured** by locking a live session; logind wiring is exercised against the system bus in the heartbeat, and the release/resume handshake is unit-tested |
 | X11 WM iconification and overlay visuals | **not measured**: Xvfb has no window manager and no logged-in X11 session was available |
 | Socket transport (`F-PLAT-01`) | daemon protocol tests check `0600` socket / `0700` dir, single instance, clean socket removal, and a policy refreshed with no client |
 | Daemon autonomy (`F-PLAT-01`) | Xvfb end-to-end: `SIGKILL`ed the UI, daemon stayed alive and advanced the policy timestamp; relaunch reused the same daemon PID; explicit shutdown removed process and socket |

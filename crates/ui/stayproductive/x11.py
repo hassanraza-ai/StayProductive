@@ -198,6 +198,17 @@ def _configure(lib) -> None:
         ctypes.POINTER(ctypes.c_uint),
     ]
     lib.XQueryTree.restype = ctypes.c_int
+    lib.XTranslateCoordinates.argtypes = [
+        Display,
+        Window,
+        Window,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(Window),
+    ]
+    lib.XTranslateCoordinates.restype = Bool
     lib.XSendEvent.argtypes = [Display, Window, Bool, ctypes.c_long, ctypes.POINTER(_XEvent)]
     lib.XSendEvent.restype = ctypes.c_int
     lib.XUnmapWindow.argtypes = [Display, Window]
@@ -358,6 +369,33 @@ class X11:
     def is_viewable(self, window: int) -> bool:
         attributes = self.window_attributes(window)
         return attributes is not None and attributes.map_state == IS_VIEWABLE
+
+    def root_geometry(self, window: int) -> WindowGeometry | None:
+        """Position and size relative to the root window."""
+
+        attributes = self.window_attributes(window)
+        if attributes is None:
+            return None
+        x = ctypes.c_int()
+        y = ctypes.c_int()
+        child = Window()
+        if not self._lib.XTranslateCoordinates(
+            self._display,
+            window,
+            self._root,
+            0,
+            0,
+            ctypes.byref(x),
+            ctypes.byref(y),
+            ctypes.byref(child),
+        ):
+            return None
+        return WindowGeometry(
+            x=x.value,
+            y=y.value,
+            width=max(1, attributes.width),
+            height=max(1, attributes.height),
+        )
 
     def toplevel(self, window: int) -> int:
         if not window:
