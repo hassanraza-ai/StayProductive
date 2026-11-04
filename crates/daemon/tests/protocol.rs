@@ -646,6 +646,84 @@ fn x11_focus_reports_feed_usage_limits() {
 }
 
 #[test]
+fn a_clean_install_restores_an_export() {
+    let (source_dir, source_path) = temp_state();
+    let backup = source_dir.join("backup.zip");
+
+    let mut source = Service::start(&source_path);
+    let created = source.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "block"}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    source.ok("activate_profile", json!({"profile_id": profile_id}));
+    source.ok(
+        "set_settings",
+        json!({"start_of_day": "04:00", "timezone": "Europe/Berlin"}),
+    );
+    source.ok(
+        "start_strict",
+        json!({"minutes": 30, "cooldown_minutes": 5}),
+    );
+    source.ok(
+        "export_data",
+        json!({"path": backup, "include_usage": false}),
+    );
+    source.shutdown();
+
+    let (target_dir, target_path) = temp_state();
+    let mut target = Service::start(&target_path);
+    let empty = target.ok("snapshot", json!({}));
+    assert_eq!(empty["profiles"], json!([]));
+
+    // A file that is not our archive fails cleanly and changes nothing.
+    let bogus = target_dir.join("bogus.zip");
+    std::fs::write(&bogus, b"not a zip archive").expect("write bogus file");
+    let refused = target.request("import_data", json!({"path": bogus}));
+    assert_eq!(refused["ok"], false);
+    assert!(
+        refused["error"]
+            .as_str()
+            .expect("error text")
+            .contains("zip"),
+        "unexpected error: {refused}"
+    );
+    assert_eq!(target.ok("snapshot", json!({}))["profiles"], json!([]));
+
+    let imported = target.ok("import_data", json!({"path": backup}));
+    assert_eq!(imported["replaced"], true, "a clean install is replaced");
+    assert_eq!(imported["profiles_added"], 1);
+    assert_eq!(imported["settings_applied"], true);
+    assert_eq!(imported["usage_imported"], false);
+    let snapshot = &imported["snapshot"];
+    assert_eq!(snapshot["profiles"][0]["name"], "Focus");
+    assert_eq!(snapshot["settings"]["start_of_day"], "04:00");
+    assert_eq!(snapshot["settings"]["timezone"], "Europe/Berlin");
+    assert_eq!(
+        snapshot["commitment"]["state"], "active",
+        "the strict session is restored: {snapshot}"
+    );
+
+    // The restored state is persisted, not only held in memory.
+    target.shutdown();
+    let mut restarted = Service::start(&target_path);
+    let snapshot = restarted.ok("snapshot", json!({}));
+    assert_eq!(snapshot["profiles"][0]["name"], "Focus");
+    restarted.shutdown();
+    let _ = std::fs::remove_dir_all(&source_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+}
+
+#[test]
 fn enforcement_snapshot_requires_a_fresh_adapter_heartbeat() {
     let (dir, path) = temp_state();
     let mut service = Service::start(&path);

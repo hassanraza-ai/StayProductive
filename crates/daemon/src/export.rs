@@ -11,9 +11,13 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveTime, Timelike, Utc};
+use chrono_tz::Tz;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use stayproductive_core::{AppKey, State, Target, Timestamp};
+use stayproductive_core::{
+    AppKey, ClockSettings, Commitment, Profile, ProfileId, QuickBlock, State, Target, Timestamp,
+};
 
 /// Schema version written into `manifest.json`.
 ///
@@ -155,6 +159,246 @@ fn push_interval(
 
 fn month(at: Timestamp) -> String {
     format!("{:04}-{:02}", at.year(), at.month())
+}
+
+/// What an import did, so the UI can report it instead of guessing.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ImportSummary {
+    /// The export replaced an empty state instead of merging.
+    pub replaced: bool,
+    pub profiles_added: usize,
+    pub profiles_skipped: usize,
+    pub commitments_added: usize,
+    pub commitments_skipped: usize,
+    pub settings_applied: bool,
+}
+
+/// Apply an export to `state`.
+///
+/// An empty state is replaced wholesale: profiles, manual activation, quick
+/// blocks, schedule extensions, settings, and commitments. A state that already
+/// has profiles or commitments is merged additively: unknown profiles are added
+/// by identity, settings are left alone, and commitments are only added when no
+/// commitment is enforcing right now. That is the "never weaken it" rule from
+/// `A-UX-12`: an import can add strict time, never shorten or remove it.
+///
+/// Usage files are validated when present but not re-imported; the counters
+/// have no restore path yet, and a silently partial history would be worse than
+/// none. This is stated in the response and the return summary has no usage
+/// count on purpose.
+pub fn import(
+    state: &mut State,
+    files: &BTreeMap<String, Vec<u8>>,
+    now: Timestamp,
+) -> Result<ImportSummary, String> {
+    let manifest: Value = parse_file(files, "manifest.json")?;
+    if manifest.get("format").and_then(Value::as_str) != Some(EXPORT_FORMAT) {
+        return Err("not a StayProductive export".into());
+    }
+    let version = manifest.get("version").and_then(Value::as_u64).unwrap_or(0);
+    if version == 0 || version > u64::from(EXPORT_VERSION) {
+        return Err(format!(
+            "export version {version} is not supported by this build (supports {EXPORT_VERSION})"
+        ));
+    }
+    let profiles: Vec<Profile> = parse_list(files, "profiles.json", "profiles")?;
+    let commitments: Vec<Commitment> = parse_list(files, "commitments.json", "all")?;
+
+    let clean = state.profiles.is_empty() && state.commitments.is_empty();
+    let mut summary = ImportSummary {
+        replaced: clean,
+        ..ImportSummary::default()
+    };
+
+    if clean {
+        if let Some(settings) = files.get("settings.json") {
+            let settings: Value = serde_json::from_slice(settings)
+                .map_err(|e| format!("invalid settings.json: {e}"))?;
+            state.settings = clock_settings(&settings)?;
+            summary.settings_applied = true;
+        }
+        for profile in profiles {
+            state
+                .add_profile(profile)
+                .map_err(|e| format!("invalid profile in export: {e}"))?;
+            summary.profiles_added += 1;
+        }
+        if let Some(value) = files
+            .get("profiles.json")
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+        {
+            if let Some(active) = value.get("active").and_then(Value::as_str)
+                && let Ok(id) = active.parse::<ProfileId>()
+                && state.profiles.iter().any(|profile| profile.id == id)
+            {
+                state.manual_active = Some(id);
+            }
+            if let Some(blocks) = value.get("quick_blocks")
+                && let Ok(blocks) = serde_json::from_value::<Vec<QuickBlock>>(blocks.clone())
+            {
+                state.quick_blocks = blocks;
+            }
+            if let Some(extensions) = value.get("extensions")
+                && let Ok(extensions) =
+                    serde_json::from_value::<BTreeMap<ProfileId, Timestamp>>(extensions.clone())
+            {
+                state.extensions = extensions;
+            }
+        }
+        for commitment in commitments {
+            state
+                .add_commitment(commitment)
+                .map_err(|e| format!("invalid commitment in export: {e}"))?;
+            summary.commitments_added += 1;
+        }
+        return Ok(summary);
+    }
+
+    for profile in profiles {
+        if state.profiles.iter().any(|known| known.id == profile.id)
+            || state.profile_by_name(&profile.name).is_some()
+        {
+            summary.profiles_skipped += 1;
+            continue;
+        }
+        state
+            .add_profile(profile)
+            .map_err(|e| format!("invalid profile in export: {e}"))?;
+        summary.profiles_added += 1;
+    }
+    let enforcing = state.active_commitment(now).is_some();
+    for commitment in commitments {
+        if enforcing
+            || state
+                .commitments
+                .iter()
+                .any(|known| known.id == commitment.id)
+        {
+            summary.commitments_skipped += 1;
+            continue;
+        }
+        state
+            .add_commitment(commitment)
+            .map_err(|e| format!("invalid commitment in export: {e}"))?;
+        summary.commitments_added += 1;
+    }
+    Ok(summary)
+}
+
+fn clock_settings(settings: &Value) -> Result<ClockSettings, String> {
+    let start = settings
+        .get("start_of_day")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "settings.json is missing start_of_day".to_owned())?;
+    let start_of_day = NaiveTime::parse_from_str(start, "%H:%M")
+        .map_err(|_| format!("invalid start_of_day: {start}"))?;
+    let timezone = settings
+        .get("timezone")
+        .and_then(Value::as_str)
+        .unwrap_or("UTC");
+    let timezone = timezone
+        .parse::<Tz>()
+        .map_err(|_| format!("unknown time zone: {timezone}"))?;
+    Ok(ClockSettings {
+        start_of_day,
+        timezone,
+    })
+}
+
+fn parse_file<T: DeserializeOwned>(
+    files: &BTreeMap<String, Vec<u8>>,
+    name: &str,
+) -> Result<T, String> {
+    let bytes = files
+        .get(name)
+        .ok_or_else(|| format!("archive is missing {name}"))?;
+    serde_json::from_slice(bytes).map_err(|e| format!("invalid {name}: {e}"))
+}
+
+fn parse_list<T: DeserializeOwned>(
+    files: &BTreeMap<String, Vec<u8>>,
+    name: &str,
+    key: &str,
+) -> Result<Vec<T>, String> {
+    let value: Value = parse_file(files, name)?;
+    let list = value
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    serde_json::from_value(list).map_err(|e| format!("invalid {name}: {e}"))
+}
+
+/// Read a stored zip into memory.
+///
+/// Only method 0 entries are accepted: our export never compresses, and
+/// refusing deflate is better than silently treating compressed bytes as
+/// content. Bounds are checked before slicing so a truncated or hand-edited
+/// file returns an error instead of panicking.
+pub fn read_archive(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err("export archive is too large".into());
+    }
+    let eocd = (0..bytes.len().saturating_sub(4))
+        .rev()
+        .find(|&at| &bytes[at..at + 4] == b"PK\x05\x06")
+        .ok_or_else(|| "not a zip archive".to_owned())?;
+    let count = read_u16(bytes, eocd + 10)? as usize;
+    if count > 1024 {
+        return Err("export archive has too many entries".into());
+    }
+    let mut at = read_u32(bytes, eocd + 16)? as usize;
+    let mut files = BTreeMap::new();
+    for _ in 0..count {
+        if bytes.get(at..at + 4) != Some(b"PK\x01\x02") {
+            return Err("damaged zip central directory".into());
+        }
+        let method = read_u16(bytes, at + 10)?;
+        if method != 0 {
+            return Err("compressed export entries are not supported".into());
+        }
+        let crc = read_u32(bytes, at + 16)?;
+        let size = read_u32(bytes, at + 20)? as usize;
+        let name_len = read_u16(bytes, at + 28)? as usize;
+        let extra_len = read_u16(bytes, at + 30)? as usize;
+        let comment_len = read_u16(bytes, at + 32)? as usize;
+        let local = read_u32(bytes, at + 42)? as usize;
+        let name = std::str::from_utf8(read_slice(bytes, at + 46, name_len)?)
+            .map_err(|_| "zip entry name is not UTF-8".to_owned())?
+            .to_owned();
+        if bytes.get(local..local + 4) != Some(b"PK\x03\x04") {
+            return Err(format!("damaged zip local header for {name}"));
+        }
+        let local_name = read_u16(bytes, local + 26)? as usize;
+        let local_extra = read_u16(bytes, local + 28)? as usize;
+        let start = local + 30 + local_name + local_extra;
+        let data = read_slice(bytes, start, size)?;
+        if crc32(data) != crc {
+            return Err(format!("checksum mismatch for {name}"));
+        }
+        files.insert(name, data.to_vec());
+        at += 46 + name_len + extra_len + comment_len;
+    }
+    Ok(files)
+}
+
+fn read_u16(bytes: &[u8], at: usize) -> Result<u16, String> {
+    let slice = bytes
+        .get(at..at + 2)
+        .ok_or_else(|| "truncated zip archive".to_owned())?;
+    Ok(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+fn read_u32(bytes: &[u8], at: usize) -> Result<u32, String> {
+    let slice = bytes
+        .get(at..at + 4)
+        .ok_or_else(|| "truncated zip archive".to_owned())?;
+    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn read_slice(bytes: &[u8], at: usize, len: usize) -> Result<&[u8], String> {
+    bytes
+        .get(at..at + len)
+        .ok_or_else(|| "truncated zip archive".to_owned())
 }
 
 fn encode(value: &Value) -> Vec<u8> {
@@ -329,5 +573,96 @@ mod tests {
                 .expect("crc"),
         );
         assert_eq!(stored_crc, crc32(b"hello"));
+    }
+
+    fn commitment(now: Timestamp, hours: i64) -> stayproductive_core::Commitment {
+        stayproductive_core::Commitment::new(
+            stayproductive_core::CommitmentKind::Strict,
+            now,
+            Some(now + chrono::TimeDelta::hours(hours)),
+            stayproductive_core::DeactivationMethod::Cooldown(std::time::Duration::from_secs(600)),
+        )
+    }
+
+    #[test]
+    fn an_unknown_export_version_is_refused() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "manifest.json".to_owned(),
+            br#"{"format":"stayproductive.export","version":99}"#.to_vec(),
+        );
+        let mut state = State::fixture();
+        let error = import(&mut state, &files, at("2026-11-04T10:00:00Z")).expect_err("version");
+        assert!(error.contains("not supported"), "{error}");
+    }
+
+    #[test]
+    fn a_clean_state_is_restored_from_an_export() {
+        let now = at("2026-11-04T10:00:00Z");
+        let mut source = State::fixture();
+        let mut profile = stayproductive_core::Profile::new("Focus", now).expect("profile");
+        profile.rules.apps.insert(
+            AppKey::new("firefox").expect("app"),
+            stayproductive_core::AppRuleEntry {
+                id: stayproductive_core::ids::new_id(),
+                rule: stayproductive_core::AppRule::Block,
+            },
+        );
+        source.add_profile(profile).expect("add profile");
+        source.settings.start_of_day = NaiveTime::from_hms_opt(4, 0, 0).expect("time");
+        source.settings.timezone = "Europe/Berlin".parse().expect("zone");
+        source
+            .add_commitment(commitment(now, 8))
+            .expect("commitment");
+
+        let files = entries(&source, now, false);
+        let packed = archive(&files, now);
+        let read = read_archive(&packed).expect("read archive");
+        let mut target = State::fixture();
+        let summary = import(&mut target, &read, now).expect("import");
+
+        assert!(summary.replaced);
+        assert_eq!(summary.profiles_added, 1);
+        assert_eq!(summary.commitments_added, 1);
+        assert!(summary.settings_applied);
+        assert_eq!(target.profiles[0].name, "Focus");
+        assert_eq!(target.settings.start_of_day.to_string(), "04:00:00");
+        assert_eq!(target.settings.timezone.name(), "Europe/Berlin");
+        assert_eq!(target.commitments.len(), 1);
+    }
+
+    #[test]
+    fn merging_never_weakens_an_active_commitment() {
+        let now = at("2026-11-04T10:00:00Z");
+        let mut source = State::fixture();
+        source
+            .add_profile(stayproductive_core::Profile::new("Imported", now).expect("profile"))
+            .expect("add profile");
+        source
+            .add_commitment(commitment(now, 2))
+            .expect("commitment");
+
+        let mut target = State::fixture();
+        target
+            .add_profile(stayproductive_core::Profile::new("Existing", now).expect("profile"))
+            .expect("add profile");
+        target
+            .add_commitment(commitment(now, 8))
+            .expect("commitment");
+        let before = target.commitments.clone();
+
+        let files = entries(&source, now, false);
+        let read = read_archive(&archive(&files, now)).expect("read archive");
+        let summary = import(&mut target, &read, now).expect("import");
+
+        assert!(!summary.replaced);
+        assert_eq!(summary.profiles_added, 1);
+        assert_eq!(summary.commitments_skipped, 1);
+        assert_eq!(target.commitments, before, "the longer commitment wins");
+        assert_eq!(
+            target.settings,
+            State::fixture().settings,
+            "an import never resets the clock settings of a used install"
+        );
     }
 }

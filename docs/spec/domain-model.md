@@ -268,7 +268,7 @@ commitments.json     current state + history
 Import validates `version`, never overwrites an active commitment with a weaker
 one, and refuses to import a commitment whose password hash it cannot verify.
 
-Implementation notes (`F-STA-08`, see `implementation-notes.md`):
+Implementation notes (`F-STA-08`, `F-UX-12`; see `implementation-notes.md`):
 
 - the archive is a stored zip (no compression) with `manifest.json` naming
   `format: "stayproductive.export"` and `version: 1`;
@@ -277,4 +277,6 @@ Implementation notes (`F-STA-08`, see `implementation-notes.md`):
 - "delete history" resets the usage ledger (intervals, launches, pickups,
   blocks, last heartbeat) but keeps profiles, schedules, quick blocks, settings,
   and commitments, so blocking never weakens;
-- import is still `todo` (`F-UX-12`).
+- import refuses an unknown format or newer version, replaces an empty state, and
+  merges additively into a used one; it never shortens an active commitment;
+- usage files are exported for analysis but not re-imported yet.

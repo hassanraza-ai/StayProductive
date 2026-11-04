@@ -174,17 +174,19 @@ class EngineSocketTest(unittest.TestCase):
         engine.export_data()
         engine.export_data("/tmp/elsewhere.zip", include_usage=False)
         engine.delete_history()
+        engine.import_data("/tmp/backup.zip")
 
         commands = [request["cmd"] for request in self.daemon.requests]
         self.assertEqual(
             commands,
-            ["snapshot", "export_data", "export_data", "delete_history"],
+            ["snapshot", "export_data", "export_data", "delete_history", "import_data"],
         )
         self.assertEqual(self.daemon.requests[1]["include_usage"], True)
         self.assertNotIn("path", self.daemon.requests[1])
         self.assertEqual(self.daemon.requests[2]["path"], "/tmp/elsewhere.zip")
         self.assertEqual(self.daemon.requests[2]["include_usage"], False)
         self.assertIs(self.daemon.requests[3]["confirm"], True)
+        self.assertEqual(self.daemon.requests[4]["path"], "/tmp/backup.zip")
 
 
 if __name__ == "__main__":

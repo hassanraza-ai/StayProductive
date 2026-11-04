@@ -1106,6 +1106,33 @@ impl Daemon {
                     self.state.usage = UsageLedger::new();
                     Ok(json!({"removed": removed, "snapshot": self.snapshot()}))
                 }
+                "import_data" => {
+                    require_rule_edits_allowed(&self.state, now)?;
+                    let value = request
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .ok_or_else(|| "missing path".to_owned())?;
+                    let path = PathBuf::from(value);
+                    let bytes = fs::read(&path)
+                        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+                    let files = export::read_archive(&bytes)?;
+                    let summary = export::import(&mut self.state, &files, now)?;
+                    Ok(json!({
+                        "path": path.display().to_string(),
+                        "replaced": summary.replaced,
+                        "profiles_added": summary.profiles_added,
+                        "profiles_skipped": summary.profiles_skipped,
+                        "commitments_added": summary.commitments_added,
+                        "commitments_skipped": summary.commitments_skipped,
+                        "settings_applied": summary.settings_applied,
+                        // Usage files are validated but not re-imported: the
+                        // counters have no restore path yet, and a partial
+                        // history would be misleading.
+                        "usage_imported": false,
+                        "snapshot": self.snapshot(),
+                    }))
+                }
                 "shutdown" => {
                     self.shutdown = true;
                     Ok(json!({"bye": true}))

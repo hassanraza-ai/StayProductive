@@ -67,7 +67,10 @@ and Settings page report the adapter state rather than pretending.
 - Export and delete usage data from the Activity page. An export is a versioned
   zip of profiles, settings, commitments, and monthly usage, written with mode
   `0600`; deleting history asks first, removes intervals, launches, pickups, and
-  block decisions, and keeps profiles plus any active strict session.
+  block decisions, and keeps profiles plus any active strict session. Settings →
+  Backup restores an export: a clean install is replaced, a used install is
+  merged without shortening an active strict session, and usage counters are
+  left in the archive rather than re-imported.
 - GNOME Shell integration: a short-lived `enforcement.json` policy, an opt-in
   extension that overlays blocked application windows on Wayland and XWayland,
   a runtime heartbeat, and an install/status flow in Settings.
@@ -86,8 +89,9 @@ and Settings page report the adapter state rather than pretending.
 Website and keyword enforcement, the browser extension, site time limits,
 launch/pickup limits, non-GNOME compositor adapters, tray integration, DNS
 helper, SQLite history/migrations, usage statistics beyond today's totals,
-low-time notifications, backup/restore, full translation catalogs, and a
-complete screen-reader audit. Notifications and the DNS helper are listed in
+low-time notifications, restoring usage counters from a backup, full
+translation catalogs, and a complete screen-reader audit. Notifications and the
+DNS helper are listed in
 onboarding but deliberately unavailable, so nothing is enabled by clicking
 through the wizard. Autostart is implemented through the systemd user unit, but
 only for the default data file with a running systemd user manager. These

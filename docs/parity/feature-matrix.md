@@ -132,7 +132,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | F-UX-09 | Tray icon with pause/resume/quick block | P1 | StatusNotifier | ux §9 | A-UX-09 | todo |
 | F-UX-10 | Keyboard-first navigation and screen-reader labels | P0 | GTK/a11y | ux §10 | A-UX-10 | todo |
 | F-UX-11 | Localisation-ready strings | P1 | gettext | ux §10 | A-UX-11 | todo |
-| F-UX-12 | Backup/restore of all state | P1 | JSON archive | ux §8 | A-UX-12 | todo |
+| F-UX-12 | Backup/restore of all state | P1 | JSON archive | ux §8 | A-UX-12 | wip |
 
 ## 8. Platform integration
 
@@ -175,6 +175,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | Enforcement heartbeat | daemon protocol test checks active only with a fresh `active:true`/`policy_loaded:true` heartbeat with the expected `adapter`, and refuses stale, inactive, policy-less, or foreign files |
 | Usage tracking → limits | daemon protocol tests drive the real binary: reported focus over a daily limit blocks with `R-LIMIT-DAILY` and records history; the block overlay suspends accrual; counters survive restart (A-LIM-05 seed); the same works from either the GNOME extension or the X11 adapter heartbeat, including the daemon's own five-second pulse with no client attached |
 | Export and delete (`F-STA-08`) | `export_and_delete_usage_data` in `crates/daemon/tests/protocol.rs` exports a versioned zip, parses its central directory (offsets and CRC), checks the manifest version, profiles, settings, and monthly usage entries, refuses an unconfirmed delete, and proves the deletion survives restart; the archive also opens cleanly in Python's `zipfile`; `test_engine.py` checks the client's `include_usage`/`path`/`confirm` intent; the Activity page shows both actions with a destructive confirmation |
+| Restore (`F-UX-12`) | `a_clean_install_restores_an_export` exports from one daemon and imports into a second clean one, checking the restored profile, clock settings, and active strict session; a non-archive is refused with no state change; the restore survives restart. Unit tests refuse a newer manifest version and keep the longer active commitment when merging into a used install. Usage counters are **not** re-imported, so the row stays `wip` |
 | X11 adapter matching (`F-PLAT-02`) | `crates/ui/tests/test_x11_policy.py` covers aliases, expiry, hide-then-overlay ordering, dedupe, re-block, allowed-window hide, and Back |
 | X11 adapter supervision (`F-PLAT-02`) | `crates/daemon/tests/protocol.rs` kills a fake adapter and checks that the daemon removes its stale heartbeat, restarts it, and reports `active`/`x11`; shutdown leaves no orphan |
 | X11 adapter live (`F-PLAT-02`) | opt-in `crates/ui/tests/test_x11_live.py` under Xvfb: blocked window unmapped, allowed window lowers the block, refocusing re-blocks, expiring policy restores the window, and the heartbeat carries `monitors`, `card_monitor`, `locked`, `suspended`, and `session_aware` |

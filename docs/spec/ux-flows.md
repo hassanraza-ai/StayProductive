@@ -130,8 +130,8 @@ allows it. During a commitment, ending early is impossible.
 
 Groups: General (start of day, language, theme, start at login), Enforcement
 (adapters, DNS helper, browser extension), Notifications (low-time alerts,
-block alerts), Privacy (history retention, export, delete), Advanced (CLI, daemon
-socket, logs), About (version, licenses, credits).
+block alerts), Privacy (history retention, export, delete), Backup (restore an
+export), Advanced (CLI, daemon socket, logs), About (version, licenses, credits).
 
 - The "Enforcement" page is the single place that reports what is actually
   enforced and what is degraded, per desktop.

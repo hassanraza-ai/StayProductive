@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from gi.repository import Adw, Gdk, Gio, Gtk
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 from .. import desktop
 from .. import service
@@ -84,6 +84,29 @@ class SettingsPage:
         open_folder.connect("activated", lambda _row: self._open_folder())
         capabilities.add(open_folder)
         self.page.add(capabilities)
+
+        backup = Adw.PreferencesGroup(
+            title="Backup",
+            description=(
+                "Export from Activity, restore here. Restoring replaces an empty "
+                "install and merges into an existing one; it never shortens an "
+                "active strict session or resets your clock settings."
+            ),
+        )
+        self.restore_row = Adw.ActionRow(
+            title="Restore from an export",
+            subtitle="Choose a .stayproductive.zip archive",
+        )
+        self.restore_row.add_suffix(
+            w.button(
+                "Restore",
+                css="flat",
+                tooltip="Restore profiles, settings, and commitments",
+                on_click=lambda _button: self._restore(),
+            )
+        )
+        backup.add(self.restore_row)
+        self.page.add(backup)
 
         background = Adw.PreferencesGroup(
             title="Background service",
@@ -428,3 +451,40 @@ class SettingsPage:
             )
         except Exception as error:  # noqa: BLE001
             self.window.show_error("Could not open the data folder", error_text(error))
+
+    def _restore(self) -> None:
+        dialog = Gtk.FileDialog(title="Restore from an export")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        archive = Gtk.FileFilter()
+        archive.set_name("StayProductive export")
+        archive.add_pattern("*.zip")
+        filters.append(archive)
+        dialog.set_filters(filters)
+        dialog.open(self.window, None, self._restore_chosen, None)
+
+    def _restore_chosen(self, dialog: Gtk.FileDialog, result, _data) -> None:
+        try:
+            file = dialog.open_finish(result)
+        except GLib.Error:
+            return  # the user closed the picker
+        path = file.get_path() if file is not None else None
+        if not path:
+            return
+        try:
+            restored = self.window.engine.import_data(path)
+        except Exception as error:  # noqa: BLE001
+            self.window.show_error("Could not restore the export", error_text(error))
+            return
+        self.window.refresh()
+        lines = [f"Profiles added: {restored.get('profiles_added', 0)}"]
+        skipped = restored.get("profiles_skipped", 0)
+        if skipped:
+            lines.append(f"Profiles skipped (already present): {skipped}")
+        lines.append(f"Commitments restored: {restored.get('commitments_added', 0)}")
+        if restored.get("commitments_skipped"):
+            lines.append(
+                "Commitments skipped: an active session already protects this install."
+            )
+        if not restored.get("usage_imported"):
+            lines.append("Usage history is not re-imported; it stays in the archive.")
+        w.alert(self.window, "Restore complete", "\n".join(lines))

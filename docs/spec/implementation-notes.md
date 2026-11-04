@@ -152,9 +152,26 @@ which states the scope in the confirmation and keeps no copy.
 
 An export is a privacy feature, so it is written with mode `0600` like the state
 file. The archive is not encrypted and has no signature; encrypting it is left to
-the user's filesystem or archive tool. Import (`A-UX-12`) is not implemented yet;
-`manifest.json` exists so an importer can refuse an unknown `version` instead of
-guessing.
+the user's filesystem or archive tool.
+
+`import_data` accepts the path of such an archive and validates the manifest
+before touching anything: an unknown `format`, a version newer than this build,
+a non-zip file, a compressed entry, or a bad checksum is refused with a message
+and no state change. On an empty state it restores profiles with their rules and
+schedules, the manual activation, quick blocks, schedule extensions, clock
+settings, and commitments — the `A-UX-12` clean-install case. On a state that
+already has profiles or commitments it merges additively: a profile whose id or
+name is already present is skipped, clock settings and quick blocks are left
+alone, and imported commitments are only added when no commitment is enforcing
+right now. An import can therefore add strict time but can never shorten or
+remove an active session. An active commitment also blocks imports, like any
+other rule edit.
+
+Usage history is **not** re-imported. The monthly files are validated for
+structure, but `UsageLedger` has no restore path for launches and pickups yet, and
+a silently partial history would be misleading. The response reports
+`usage_imported:false` and the UI says so after a restore. `F-UX-12` therefore
+stays `wip` until counters can be restored too.
 
 ### Usage tracking
 
@@ -252,6 +269,11 @@ Evidence:
   directory, checks the manifest, profile, settings, and monthly usage entries,
   refuses an unconfirmed delete, and verifies the deletion survives a restart.
   The zip was also opened with Python's `zipfile` (`testzip()` clean).
+  `a_clean_install_restores_an_export` drives export from one daemon into a
+  second clean daemon, checks the restored profile, clock settings, and active
+  strict session, rejects a non-archive with no state change, and proves the
+  restore persists; unit tests refuse a newer manifest version and keep the
+  longer commitment when merging into a used install.
 - `crates/ui/tests/test_engine.py` — round trip, disconnect on close, reconnect
   after restart, mismatched state-file refusal, and the explicit
   `include_usage`/`path`/`confirm` intent of export and delete.
@@ -562,9 +584,12 @@ largest missing pieces.
 - **D-Bus name and tray/CLI** — the boundary is newline JSON over a Unix socket;
   systemd can own the daemon, but there is no `org.stayproductive.Daemon1` name,
   tray, or CLI yet.
-- **Usage statistics views, notifications, backup/restore, localisation catalogs,
-  full accessibility audit**. Export and history deletion exist (see *Data export
-  and deletion*); the Week/Month totals, timeline, and seven-day report do not.
+- **Usage statistics views, notifications, full backup/restore of counters,
+  localisation catalogs, full accessibility audit**. Export and history deletion
+  exist, and profiles, settings, and commitments can be restored from an export
+  (see *Data export and deletion*); usage counters are exported but not
+  re-imported, and the Week/Month totals, timeline, and seven-day report do not
+  exist.
 - **Low-time alerts** (`A-LIM-07` / `A-PLAT-11`).
 - **Optional onboarding capabilities** — notifications and the DNS helper are
   explained in the wizard but not implemented. Autostart is implemented as the

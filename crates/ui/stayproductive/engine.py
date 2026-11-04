@@ -305,6 +305,11 @@ class Engine:
 
         return self.request("delete_history", confirm=True)
 
+    def import_data(self, path: str) -> dict[str, Any]:
+        """Restore profiles, settings, and commitments from an export archive."""
+
+        return self.request("import_data", path=path)
+
     # --------------------------------------------------------------- lifecycle
     def shutdown_service(self) -> None:
         """Ask the daemon to stop. Only used for explicit service handover."""
