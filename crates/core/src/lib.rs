@@ -27,7 +27,9 @@ pub use domain::{
 pub use engine::{Decision, Event, MessageKey, State, Verdict, decide};
 pub use error::{Error, Result};
 pub use ids::{CommitmentId, ProfileId, RuleId, SessionId, Ulid};
-pub use period::{ClockSettings, Period, day_period, hour_period, logical_date};
+pub use period::{
+    ClockSettings, Period, day_period, hour_period, logical_date, month_period, week_period,
+};
 pub use reason::ReasonCode;
 pub use schedule::{
     DateRange, DayPattern, HourlyPattern, Schedule, ScheduleKind, ScheduleStatus, Window,

@@ -67,9 +67,12 @@ and Settings page report the adapter state rather than pretending.
   GNOME extension or the X11 adapter) names the focused app, the daemon
   attributes intervals to the core usage ledger, and daily/hourly app limits
   enforce for real, even with the GTK window closed. Usage survives restart,
-  stops behind the block overlay or a locked session, and is shown per app on
-  the Activity page.
-- Export and delete usage data from the Activity page. An export is a versioned
+  stops behind the block overlay or a locked session, and drives launch limits.
+- Stats: today, week, and month screen time; top distractions ranked by time
+  with share and previous-period trend; block, pickup, and launch counts; and
+  block history with reason codes and end times. The dashboard shows today's
+  total and top three distractions.
+- Export and delete usage data from the Stats page. An export is a versioned
   zip of profiles, settings, commitments, and monthly usage, written with mode
   `0600`; deleting history asks first, removes intervals, launches, pickups, and
   block decisions, and keeps profiles plus any active strict session. Settings →
@@ -93,9 +96,10 @@ and Settings page report the adapter state rather than pretending.
 
 Website and keyword enforcement, the browser extension, site time limits,
 launch/pickup limits, non-GNOME compositor adapters, tray integration, DNS
-helper, SQLite history/migrations, usage statistics beyond today's totals,
-low-time notifications, restoring usage counters from a backup, full
-translation catalogs, and manual screen-reader/high-contrast verification.
+helper, SQLite history/migrations, usage timeline charts, a separate seven-day
+report, site usage, runtime pickup events, low-time notifications, restoring
+usage counters from a backup, full translation catalogs, and manual
+screen-reader/high-contrast verification.
 Notifications and the DNS helper are listed in
 onboarding but deliberately unavailable, so nothing is enabled by clicking
 through the wizard. Autostart is implemented through the systemd user unit, but

@@ -485,6 +485,91 @@ fn a_lim_06_start_of_day_counts_after_midnight_against_the_logical_day() {
     );
 }
 
+// ------------------------------------------------------------- statistics
+
+#[test]
+fn a_sta_02_day_week_month_totals_use_the_clock_boundaries() {
+    let settings =
+        stayproductive_core::ClockSettings::with_start_of_day(time(4, 0), chrono_tz::UTC);
+    let mut state = State::new(settings);
+    let social = AppKey::new("social").unwrap();
+    let editor = AppKey::new("editor").unwrap();
+    let usage = &mut state.usage;
+
+    // Now is Wednesday 2026-10-28 12:00. The logical week starts Monday
+    // 2026-10-26 04:00 and the logical month starts 2026-10-01 04:00.
+    usage.foreground(social.clone(), at(2026, 10, 28, 11, 0, 0));
+    usage.close_foreground(at(2026, 10, 28, 12, 0, 0));
+    usage.foreground(editor.clone(), at(2026, 10, 26, 9, 0, 0));
+    usage.close_foreground(at(2026, 10, 26, 9, 30, 0));
+    usage.foreground(social.clone(), at(2026, 10, 20, 9, 0, 0));
+    usage.close_foreground(at(2026, 10, 20, 9, 20, 0));
+    usage.foreground(editor.clone(), at(2026, 9, 18, 9, 0, 0));
+    usage.close_foreground(at(2026, 9, 18, 9, 15, 0));
+
+    let now = at(2026, 10, 28, 12, 0, 0);
+    let today = day_period(now, &state.settings);
+    let week = stayproductive_core::week_period(now, &state.settings);
+    let month = stayproductive_core::month_period(now, &state.settings);
+
+    assert_eq!(
+        usage.usage(&social, &today, now),
+        Duration::from_secs(60 * 60)
+    );
+    assert_eq!(
+        usage.total_usage(&week, now),
+        Duration::from_secs(90 * 60),
+        "the week includes Monday and today, not last week"
+    );
+    assert_eq!(
+        usage.total_usage(&month, now),
+        Duration::from_secs(110 * 60),
+        "the month includes October, not September"
+    );
+    assert_eq!(
+        usage.usage(&editor, &month, now),
+        Duration::from_secs(30 * 60)
+    );
+}
+
+#[test]
+fn a_sta_03_ranking_is_by_time_with_stable_ties() {
+    let mut state = State::fixture();
+    let app = |name: &str| AppKey::new(name).unwrap();
+    state.usage.foreground(app("beta"), thu(9, 0));
+    state.usage.foreground(app("alpha"), thu(9, 10));
+    state.usage.foreground(app("gamma"), thu(9, 20));
+    state.usage.close_foreground(thu(9, 50));
+    // beta 10 min, alpha 10 min, gamma 30 min.
+    let ranking = state
+        .usage
+        .usage_ranking(&day_period(thu(12, 0), &state.settings), thu(12, 0));
+    assert_eq!(
+        ranking,
+        vec![
+            (app("gamma"), Duration::from_secs(30 * 60)),
+            (app("alpha"), Duration::from_secs(10 * 60)),
+            (app("beta"), Duration::from_secs(10 * 60)),
+        ],
+        "ties are broken by application key, not insertion order"
+    );
+}
+
+#[test]
+fn a_sta_05_pickups_and_launches_count_once_per_event() {
+    let mut state = State::fixture();
+    for minute in [0, 1, 2] {
+        state.observe(&Event::ScreenUnlocked, thu(9, minute));
+    }
+    state.observe(&fg("firefox"), thu(9, 10));
+    state.observe(&fg("editor"), thu(9, 20));
+    state.observe(&fg("firefox"), thu(9, 30)); // > 5 s away: a second launch
+    state.observe(&fg("firefox"), thu(9, 31)); // same app: heartbeat, not a launch
+    let period = day_period(thu(12, 0), &state.settings);
+    assert_eq!(state.usage.pickup_count(&period), 3);
+    assert_eq!(state.usage.launch_total(&period), 3);
+}
+
 // --------------------------------------------------------------- schedules
 
 #[test]

@@ -529,6 +529,47 @@ impl UsageLedger {
         .unwrap_or(u32::MAX)
     }
 
+    /// Number of counted launches inside `period`, across every app.
+    pub fn launch_total(&self, period: &Period) -> u32 {
+        u32::try_from(
+            self.launches
+                .iter()
+                .filter(|launch| period.contains(launch.at))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
+    /// Number of enforced blocks recorded inside `period`.
+    pub fn block_count(&self, period: &Period) -> u32 {
+        u32::try_from(
+            self.blocks
+                .iter()
+                .filter(|block| period.contains(block.at))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
+    /// Foreground time per app, longest first, ties broken by app key.
+    ///
+    /// Stable ordering keeps the Stats ranking from jumping between polls when
+    /// two apps have the same duration.
+    pub fn usage_ranking(&self, period: &Period, now: Timestamp) -> Vec<(AppKey, Duration)> {
+        let mut rows: Vec<(AppKey, Duration)> = self
+            .usage_per_app(period, now)
+            .into_iter()
+            .filter(|(_app, duration)| *duration > Duration::ZERO)
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        rows
+    }
+
+    /// Total foreground time attributed to any app inside `period`.
+    pub fn total_usage(&self, period: &Period, now: Timestamp) -> Duration {
+        self.usage_per_app(period, now).values().copied().sum()
+    }
+
     /// The instant at which cumulative usage of `app` inside `period` reached
     /// `threshold`, if it did.
     ///
@@ -678,6 +719,50 @@ mod tests {
         ledger.screen_unlocked(ts(1));
         ledger.screen_unlocked(ts(2));
         assert_eq!(ledger.pickup_count(&period()), 2);
+    }
+
+    #[test]
+    fn ranking_is_by_time_then_app_key() {
+        let mut ledger = UsageLedger::new();
+        let beta = AppKey::new("beta").unwrap();
+        let alpha = AppKey::new("alpha").unwrap();
+        let gamma = AppKey::new("gamma").unwrap();
+        ledger.foreground(beta.clone(), ts(0));
+        ledger.foreground(alpha.clone(), ts(10));
+        ledger.foreground(gamma.clone(), ts(20));
+        ledger.close_foreground(ts(40));
+        // beta 10 min, alpha 10 min, gamma 20 min.
+        let ranking = ledger.usage_ranking(&period(), ts(40));
+        assert_eq!(
+            ranking,
+            vec![
+                (gamma, Duration::from_secs(20 * 60)),
+                (alpha, Duration::from_secs(10 * 60)),
+                (beta, Duration::from_secs(10 * 60)),
+            ]
+        );
+        assert_eq!(
+            ledger.total_usage(&period(), ts(40)),
+            Duration::from_secs(40 * 60)
+        );
+    }
+
+    #[test]
+    fn totals_count_launches_and_blocks_once() {
+        let mut ledger = UsageLedger::new();
+        let app = AppKey::new("social").unwrap();
+        ledger.foreground(app.clone(), ts(0));
+        ledger.close_foreground(ts(10));
+        ledger.foreground(app.clone(), ts(20));
+        ledger.blocked(
+            crate::domain::Target::App(app.clone()),
+            crate::reason::ReasonCode::LimitDaily,
+            ts(30),
+            None,
+            None,
+        );
+        assert_eq!(ledger.launch_total(&period()), 2);
+        assert_eq!(ledger.block_count(&period()), 1);
     }
 
     #[test]

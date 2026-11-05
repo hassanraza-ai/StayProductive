@@ -88,7 +88,7 @@ class SettingsPage:
         backup = Adw.PreferencesGroup(
             title="Backup",
             description=(
-                "Export from Activity, restore here. Restoring replaces an empty "
+                "Export from Stats, restore here. Restoring replaces an empty "
                 "install and merges into an existing one; it never shortens an "
                 "active strict session or resets your clock settings."
             ),

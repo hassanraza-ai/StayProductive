@@ -36,7 +36,7 @@ use stayproductive_core::{
     Activation, AppKey, AppRule, ClockSettings, Commitment, CommitmentKind, CountLimit, DateRange,
     DayPattern, DeactivationMethod, Event, HostPattern, HourlyPattern, Keyword, LimitPeriod,
     PauseReason, Profile, ProfileId, ReasonCode, Restriction, RuleSet, Schedule, SiteAction, State,
-    Target, Timestamp, UsageLedger, Window, day_period, decide,
+    Target, Timestamp, UsageLedger, Window, day_period, decide, month_period, week_period,
 };
 
 mod export;
@@ -1336,6 +1336,62 @@ impl Daemon {
         )
     }
 
+    /// One Stats range: totals, ranked apps, and the equal-length period
+    /// before it for the trend column (`F-STA-02`, `F-STA-03`, `F-STA-05`).
+    fn stats_range(&self, period: &stayproductive_core::Period, now: Timestamp) -> Value {
+        let length = period.end - period.start;
+        let previous = stayproductive_core::Period::new(period.start - length, period.start);
+        let previous_by_app = self.state.usage.usage_per_app(&previous, now);
+        let ranking: Vec<(AppKey, u64)> = self
+            .state
+            .usage
+            .usage_ranking(period, now)
+            .into_iter()
+            .map(|(app, duration)| (app, duration.as_secs()))
+            .collect();
+        // The range total is the sum of the integer seconds shown per app, so
+        // the rows always add up to the headline even when durations have a
+        // sub-second tail.
+        let total: u64 = ranking.iter().map(|(_app, seconds)| *seconds).sum();
+        let apps: Vec<Value> = ranking
+            .into_iter()
+            .map(|(app, seconds)| {
+                let previous_seconds = previous_by_app
+                    .get(&app)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0);
+                let share = if total == 0 {
+                    0.0
+                } else {
+                    (seconds as f64 / total as f64 * 100.0).round()
+                };
+                json!({
+                    "app": app.as_str(),
+                    "seconds": seconds,
+                    "share": share,
+                    "previous_seconds": previous_seconds,
+                })
+            })
+            .collect();
+        json!({
+            "start": period.start,
+            "end": period.end,
+            "seconds": total,
+            "blocks": self.state.usage.block_count(period),
+            "pickups": self.state.usage.pickup_count(period),
+            "launches": self.state.usage.launch_total(period),
+            "apps": apps,
+        })
+    }
+
+    fn stats(&self, now: Timestamp) -> Value {
+        json!({
+            "today": self.stats_range(&day_period(now, &self.state.settings), now),
+            "week": self.stats_range(&week_period(now, &self.state.settings), now),
+            "month": self.stats_range(&month_period(now, &self.state.settings), now),
+        })
+    }
+
     fn snapshot(&self) -> Value {
         let now = Utc::now();
         let policy_path = self.policy_path().display().to_string();
@@ -1430,6 +1486,7 @@ impl Daemon {
             })).collect::<Vec<_>>(),
             "history": history,
             "usage_today": self.usage_today(now),
+            "stats": self.stats(now),
             "enforcement": enforcement,
             "state_path": self.path.display().to_string(),
         })

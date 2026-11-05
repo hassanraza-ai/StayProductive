@@ -9,12 +9,12 @@ from .editor import ProfileEditor
 from .engine import Engine, EngineError
 from .formatting import error_text
 from .onboarding import Onboarding, should_show_onboarding
-from .pages.activity import ActivityPage
 from .pages.dashboard import DashboardPage
 from .pages.focus import FocusPage
 from .pages.profiles import ProfilesPage
 from .pages.schedules import SchedulesPage
 from .pages.settings import SettingsPage
+from .pages.stats import StatsPage
 
 APP_TITLE = "StayProductive"
 
@@ -23,7 +23,7 @@ PAGES = [
     ("profiles", "Profiles", "view-list-symbolic", "Rules and activation"),
     ("schedules", "Schedules", "appointment-new-symbolic", "When focus applies"),
     ("focus", "Strict session", "channel-secure-symbolic", "Commitments and cool-down"),
-    ("activity", "Activity", "document-open-recent-symbolic", "Local records"),
+    ("stats", "Stats", "office-chart-bar-symbolic", "Screen time and history"),
     ("settings", "Settings", "emblem-system-symbolic", "Clock and capabilities"),
 ]
 
@@ -140,14 +140,14 @@ class MainWindow(Adw.ApplicationWindow):
         self.profiles = ProfilesPage(self)
         self.schedules = SchedulesPage(self)
         self.focus = FocusPage(self)
-        self.activity = ActivityPage(self)
+        self.stats = StatsPage(self)
         self.settings = SettingsPage(self)
         self.page_widgets = {
             "dashboard": self.dashboard,
             "profiles": self.profiles,
             "schedules": self.schedules,
             "focus": self.focus,
-            "activity": self.activity,
+            "stats": self.stats,
             "settings": self.settings,
         }
         for key, title, _icon, _subtitle in PAGES:

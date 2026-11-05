@@ -147,7 +147,7 @@ because the user is asking for a copy of their data.
 open intervals, launches, pickups, block records, and the last heartbeat — and
 persists the empty ledger, while profiles, schedules, quick blocks, settings, and
 commitments are untouched: deleting history never weakens an active block or
-ends a strict session. Both commands are also available from the Activity page,
+ends a strict session. Both commands are also available from the Stats page,
 which states the scope in the confirmation and keeps no copy.
 
 An export is a privacy feature, so it is written with mode `0600` like the state
@@ -205,12 +205,12 @@ is capped (`EVENT_LOG_CAP`) and not persisted; intervals, launches, pickups,
 blocks, and the last heartbeat are.
 
 Because the ledger feeds `decide`, daily and hourly application limits now
-produce real policy entries (`R-LIMIT-DAILY`/`R-LIMIT-HOURY`) once usage
+produce real policy entries (`R-LIMIT-DAILY`/`R-LIMIT-HOURLY`) once usage
 reaches the limit. Blocks that newly engage are recorded in the usage history
 with their reason and end time; the first policy after a daemon start only
 seeds the comparison so a restart does not duplicate records. The snapshot
 exposes `usage_today` (seconds per app for the current logical day), which the
-Activity page renders.
+Stats page and the dashboard render.
 
 After every successful command the service also publishes
 `enforcement.json` beside the state file. It contains only applications the
@@ -231,6 +231,38 @@ the expected `adapter`, say `active:true` and `policy_loaded:true`, and have a
 reports the adapter that is actually operating. Without a fresh heartbeat the
 snapshot says `unavailable` and names the adapter expected for the session. This
 keeps “active” an observation, not a configuration claim.
+
+### Statistics (`F-STA-02`, `F-STA-03`, `F-STA-05`, `F-STA-07`)
+
+The snapshot carries `stats.today`, `stats.week`, and `stats.month`. Each range
+has its half-open `start`/`end`, total foreground `seconds`, `blocks`, `pickups`,
+`launches`, and a ranked `apps` list. The range boundaries use the same
+start-of-day and IANA timezone as the engine: weeks start on Monday, months on
+the first local day, and a clock change can make a week 167 or 169 hours long.
+The per-app `previous_seconds` comes from the immediately preceding period of
+equal length, so the UI can show a trend without a separate report.
+
+`UsageLedger::usage_ranking` orders by duration and breaks ties by application
+key, so the ranking does not jump between polls when two apps are equal. The
+range total is the sum of the per-app integer seconds, which keeps the headline
+and the rows consistent at sub-second boundaries.
+
+The GTK **Stats** page replaces the old Activity page. It offers Today / Week /
+Month, four summary metrics, the ranked apps with share and trend, active quick
+blocks, block history (target, `R-*` reason, timestamp, no window titles), and
+the export/delete controls. The dashboard shows today's total, block count, and
+top three distractions with a link to Stats.
+
+Limits: there is no timeline chart or per-hour/per-day bar (`F-STA-04`), and the
+seven-day report is the week range with a trend rather than a separate printable
+report (`F-STA-06` stays `wip`). Site usage is not recorded because no adapter
+reports site intervals. Pickups are stored by the core and shown in Stats, but
+neither adapter heartbeat reports lock/unlock transitions yet, so a real
+session records launches and blocks but no pickups (`F-STA-05` stays `wip`).
+Evidence: the core acceptance tests cover range boundaries, DST-length weeks,
+ranking ties, and one launch per foreground entry; the daemon protocol test
+seeds a real state file and checks the computed snapshot; the Stats page is
+built in the accessibility test.
 
 ### Daemon autonomy and autostart (`F-PLAT-01`)
 
@@ -451,7 +483,9 @@ exporting `DISPLAY`/`XAUTHORITY` into the systemd user manager; importing them
 when autostart is enabled covers the current manager, but a session that never
 exports them will start the daemon without an adapter and report `unavailable`.
 The adapter covers application windows only; sites and keywords still need the
-browser extension, and launch/pickup limits are not tracked.
+browser extension. Launch limits are tracked from foreground entries; pickup
+limits have no unlock source. Usage limits and the Stats totals are recorded per
+application.
 
 ### GTK frontend
 
@@ -460,7 +494,8 @@ decision logic; every mutation is a command to the service, and every screen is
 rendered from the returned snapshot. Pages:
 
 - **Dashboard** — active profiles, next boundary, rule count, commitment,
-  honest enforcement state, quick block form, recent decisions.
+  honest enforcement state, today's screen time with the top three
+  distractions, quick block form, and recent decisions.
 - **Profiles** — CRUD, manual activation, pause/resume, delete confirmation,
   and three newly written starter profiles (Work hours, Evening wind-down,
   Deep work).
@@ -472,7 +507,8 @@ rendered from the returned snapshot. Pages:
 - **Schedules** — schedule summary and active/waiting/next-start state.
 - **Strict session** — start, visible commitment, request early exit, cool-down
   countdown, and end when the cool-down is ready.
-- **Activity** — active quick blocks and recorded block decisions.
+- **Stats** — Today / Week / Month totals, ranked top distractions with share
+  and trend, active quick blocks, recorded block decisions, and export/delete.
 - **Settings** — start of day, IANA timezone, desktop integration install and
   status, policy path, capability status, data path, copy path, open folder, a
   Help group that re-runs onboarding, and About dialog.
@@ -625,14 +661,16 @@ largest missing pieces.
 - **D-Bus name and tray/CLI** — the boundary is newline JSON over a Unix socket;
   systemd can own the daemon, but there is no `org.stayproductive.Daemon1` name,
   tray, or CLI yet.
-- **Usage statistics views, notifications, full backup/restore of counters,
-  localisation catalogs, manual screen-reader and high-contrast verification**.
-  Export and history deletion exist, and profiles, settings, and commitments can
-  be restored from an export (see *Data export and deletion*); usage counters
-  are exported but not re-imported, and the Week/Month totals, timeline, and
-  seven-day report do not exist. Keyboard navigation and explicit accessible
-  names are in place (see *Keyboard navigation and screen readers*); an Orca
-  pass, real key injection, and contrast-theme review are still manual.
+- **Usage timeline charts, pickup events, notifications, full backup/restore of
+  counters, localisation catalogs, manual screen-reader and high-contrast
+  verification**. Export and history deletion exist, and profiles, settings, and
+  commitments can be restored from an export (see *Data export and deletion*);
+  usage counters are exported but not re-imported. Today/week/month totals, top
+  distractions, launch counts, and block history are in Stats; the timeline and
+  a separate seven-day report do not exist, site usage is not tracked, and
+  pickups have no adapter source yet. Keyboard navigation and explicit
+  accessible names are in place (see *Keyboard navigation and screen readers*);
+  an Orca pass, real key injection, and contrast-theme review are still manual.
 - **Low-time alerts** (`A-LIM-07` / `A-PLAT-11`).
 - **Optional onboarding capabilities** — notifications and the DNS helper are
   explained in the wizard but not implemented. Autostart is implemented as the

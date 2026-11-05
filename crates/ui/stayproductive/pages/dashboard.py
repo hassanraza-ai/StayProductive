@@ -5,7 +5,9 @@ from __future__ import annotations
 from gi.repository import Gtk
 
 from ..formatting import (
+    app_name,
     commitment_remaining,
+    duration_text,
     error_text,
     local_time,
     parse_time,
@@ -84,6 +86,32 @@ class DashboardPage:
         self.commit_metric = self._metric(metrics, 1, 1, "Commitment", "None", "No strict session")
         self.root.append(metrics)
 
+        # ------------------------------------------------------------- today
+        today = w.Card(spacing=12)
+        today_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        today_head.append(w.label("Today", "card-title"))
+        today_head.set_hexpand(True)
+        today_head.append(
+            w.button(
+                "View stats",
+                icon="office-chart-bar-symbolic",
+                css="flat",
+                tooltip="Open today, week, and month statistics",
+                on_click=lambda _button: self.window.switch_page("stats"),
+            )
+        )
+        today.append(today_head)
+        summary = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
+        self.today_time = w.label("0 min", "metric-value")
+        summary.append(self.today_time)
+        self.today_blocks = w.label("0 blocks", "muted")
+        self.today_blocks.set_valign(Gtk.Align.END)
+        summary.append(self.today_blocks)
+        today.append(summary)
+        self.today_top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        today.append(self.today_top)
+        self.root.append(today)
+
         # --------------------------------------------------- enforcement
         self.enforcement_warning = w.Card(warning=True)
         warning_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
@@ -132,7 +160,7 @@ class DashboardPage:
         quick.append(
             w.label(
                 "Creates a real time-boxed quick block in the engine. It is stored locally "
-                "and can be ended from this card or Activity.",
+                "and can be ended from this card or Stats.",
                 "muted",
             )
         )
@@ -292,6 +320,26 @@ class DashboardPage:
         else:
             self.commit_metric[0].set_label("None")
             self.commit_metric[1].set_label("No strict session")
+
+        today_stats = (snapshot.get("stats") or {}).get("today") or {}
+        self.today_time.set_label(duration_text(today_stats.get("seconds", 0)))
+        blocks = int(today_stats.get("blocks", 0) or 0)
+        self.today_blocks.set_label(
+            "1 block" if blocks == 1 else f"{blocks} blocks"
+        )
+        w.clear(self.today_top)
+        ranking = today_stats.get("apps") or []
+        if not ranking:
+            self.today_top.append(
+                w.label("No tracked screen time yet today.", "muted small")
+            )
+        for entry in ranking[:3]:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            title = w.label(app_name(entry.get("app", "?")), "row-title")
+            title.set_hexpand(True)
+            row.append(title)
+            row.append(w.label(duration_text(entry.get("seconds", 0)), "muted small"))
+            self.today_top.append(row)
 
         self._refresh_quick(snapshot)
         self._refresh_history(snapshot)

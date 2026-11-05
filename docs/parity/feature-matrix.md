@@ -39,7 +39,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | F-RULE-01 | Block selected apps | P0 | compositor adapter | block §5 | A-RULE-01 | wip |
 | F-RULE-02 | Block selected websites | P0 | DNS + extension | content §2 | A-RULE-02 | wip |
 | F-RULE-03 | Block selected keywords | P1 | extension + URL pipe | content §3 | A-RULE-03 | wip |
-| F-RULE-04 | Allowlist apps (override non-strict rules) | P0 | engine | block §4 | A-RULE-04 | wip |
+| F-RULE-04 | Allowlist apps (override non-strict rules) | P0 | engine | block §4 | A-RULE-04 | done |
 | F-RULE-05 | Allowlist websites | P1 | engine + resolver | content §2 | A-RULE-05 | wip |
 | F-RULE-06 | Goal-based unlock (spend time to earn access) | P1 | engine counters | block §6 | A-RULE-06 | todo |
 | F-RULE-07 | Wait timer after usage | P1 | engine timer | block §6 | A-RULE-07 | wip |
@@ -51,7 +51,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | --- | --- | --- | --- | --- | --- | --- |
 | F-LIM-01 | Daily usage limit per app | P0 | event log + counters | block §4 | A-LIM-01 | wip |
 | F-LIM-02 | Hourly usage limit per app | P0 | event log + counters | block §4 | A-LIM-02 | wip |
-| F-LIM-03 | Daily/hourly launch limits | P1 | tracker | block §4 | A-LIM-03 | wip |
+| F-LIM-03 | Daily/hourly launch limits | P1 | tracker | block §4 | A-LIM-03 | done |
 | F-LIM-04 | Daily/hourly pickup (unlock) limits | P1 | logind | block §4 | A-LIM-04 | wip |
 | F-LIM-05 | Limits survive restart and crash | P0 | persisted events | block §7 | A-LIM-05 | wip |
 | F-LIM-06 | Counter day boundary honours start-of-day | P0 | period calculator | sched §2 | A-LIM-06 | wip |
@@ -109,12 +109,12 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | F-STA-01 | Record foreground intervals per app/site | P0 | tracker + SQLite | block §7 | A-STA-01 | wip |
-| F-STA-02 | Today / week / month totals | P1 | queries | ux §7 | A-STA-02 | todo |
-| F-STA-03 | Top distractions ranking | P1 | queries | ux §7 | A-STA-03 | todo |
+| F-STA-02 | Today / week / month totals | P1 | queries | ux §7 | A-STA-02 | done |
+| F-STA-03 | Top distractions ranking | P1 | queries | ux §7 | A-STA-03 | done |
 | F-STA-04 | Usage timeline | P2 | queries + chart | ux §7 | A-STA-04 | todo |
-| F-STA-05 | Pickup and launch counts | P1 | logind/tracker | ux §7 | A-STA-05 | todo |
-| F-STA-06 | Seven-day report and comparison | P2 | report view | ux §7 | A-STA-06 | todo |
-| F-STA-07 | Block/deny history with reasons | P1 | event log | block §7 | A-STA-07 | todo |
+| F-STA-05 | Pickup and launch counts | P1 | logind/tracker | ux §7 | A-STA-05 | wip |
+| F-STA-06 | Seven-day report and comparison | P2 | report view | ux §7 | A-STA-06 | wip |
+| F-STA-07 | Block/deny history with reasons | P1 | event log | block §7 | A-STA-07 | done |
 | F-STA-08 | Export and delete usage data | P0 | store | ux §8 | A-STA-08 | done |
 
 ## 7. UX, onboarding, settings
@@ -165,16 +165,22 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | --- | --- |
 | `cargo fmt --check` | pass |
 | `cargo clippy --all-targets -- -D warnings` | pass |
-| `cargo test` | pass, including 32 acceptance tests and the daemon protocol tests |
+| `cargo test` | pass, including 35 acceptance tests and the daemon protocol tests |
 | `cargo build --release -p stayproductive-daemon` | pass |
 | GTK app launch | pass on X11/XWayland with GTK 4 and libadwaita |
-| Dashboard, profiles, schedules, strict, activity, settings | rendered from live daemon state and manually inspected |
+| Dashboard, profiles, schedules, strict, stats, settings | rendered from live daemon state and manually inspected under Xvfb |
 | Profile editor round-trip | created and updated a scheduled profile with apps, site daily limit, keywords, allowlist, and multiple windows; persisted state re-read correctly |
 | Strict cool-down | core test rejects `finish_commitment_end` before the cool-down and accepts it afterwards; locked edits/pauses are rejected |
 | Enforcement policy | daemon protocol test checks active/inactive app entries, policy path, and `0600` mode |
 | Enforcement heartbeat | daemon protocol test checks active only with a fresh `active:true`/`policy_loaded:true` heartbeat with the expected `adapter`, and refuses stale, inactive, policy-less, or foreign files |
 | Usage tracking → limits | daemon protocol tests drive the real binary: reported focus over a daily limit blocks with `R-LIMIT-DAILY` and records history; the block overlay suspends accrual; counters survive restart (A-LIM-05 seed); the same works from either the GNOME extension or the X11 adapter heartbeat, including the daemon's own five-second pulse with no client attached |
-| Export and delete (`F-STA-08`) | `export_and_delete_usage_data` in `crates/daemon/tests/protocol.rs` exports a versioned zip, parses its central directory (offsets and CRC), checks the manifest version, profiles, settings, and monthly usage entries, refuses an unconfirmed delete, and proves the deletion survives restart; the archive also opens cleanly in Python's `zipfile`; `test_engine.py` checks the client's `include_usage`/`path`/`confirm` intent; the Activity page shows both actions with a destructive confirmation |
+| Allowlist override (`F-RULE-04`) | `a_rule_04_allowlist_overrides_a_non_strict_rule` proves an app that is both blocked and allowlisted returns `R-ALLOW`; `allowlisted_app_is_never_put_in_the_enforcement_policy` in `crates/daemon/tests/protocol.rs` creates a blocking profile with an app allowlist, activates it, reports the app as focused, and checks the policy stays empty and no block history is recorded |
+| Launch limits (`F-LIM-03`) | `a_lim_03_launch_limit_ignores_quick_switches_and_blocks_the_third_launch` covers the 5 s anti-thrash window and the third launch; `launch_limit_blocks_from_the_persisted_launch_count` seeds two counted launches, starts the real daemon, and checks a `R-LAUNCH` policy entry ending at the end of the hour |
+| Export and delete (`F-STA-08`) | `export_and_delete_usage_data` in `crates/daemon/tests/protocol.rs` exports a versioned zip, parses its central directory (offsets and CRC), checks the manifest version, profiles, settings, and monthly usage entries, refuses an unconfirmed delete, and proves the deletion survives restart; the archive also opens cleanly in Python's `zipfile`; `test_engine.py` checks the client's `include_usage`/`path`/`confirm` intent; the Stats page shows both actions with a destructive confirmation |
+| Stats ranges (`F-STA-02`) | `a_sta_02_day_week_month_totals_use_the_clock_boundaries` checks today/week/month against a 04:00 start-of-day, week and month boundaries, and DST-length weeks; `stats_report_today_week_month_rankings_and_counts` seeds the real daemon state and checks the snapshot totals add up; the Stats page renders all three ranges |
+| Top distractions (`F-STA-03`) | `a_sta_03_ranking_is_by_time_with_stable_ties` proves ranking order and tie stability; the daemon snapshot carries seconds, share, and previous-period seconds; the Stats page shows the ranked list and trend |
+| Pickups and launches (`F-STA-05`) | `a_sta_05_pickups_and_launches_count_once_per_event` proves one pickup per unlock and one launch per foreground entry; launch counts are persisted, shown in Stats, and drive launch-limit blocks end-to-end. **Pickups have no runtime source yet** because neither adapter heartbeat reports unlock transitions, so the row stays `wip` |
+| Block history (`F-STA-07`) | The stats protocol test seeds a `R-LIMIT-DAILY` block and checks the snapshot history keeps the target, reason, and end time and has no title; the Stats page renders target, reason code, and timestamp |
 | Restore (`F-UX-12`) | `a_clean_install_restores_an_export` exports from one daemon and imports into a second clean one, checking the restored profile, clock settings, and active strict session; a non-archive is refused with no state change; the restore survives restart. Unit tests refuse a newer manifest version and keep the longer active commitment when merging into a used install. Usage counters are **not** re-imported, so the row stays `wip` |
 | Keyboard and a11y (`F-UX-10`) | `crates/ui/tests/test_accessibility.py` starts Xvfb, builds the real window, profile editor, and onboarding dialog with a fake engine, and walks the tree: every control we place has an explicit or native accessible label and is focusable; all six sidebar rows are labelled, described, and switch pages through `<Control>1`…`6`; `<Control>N`/`<Control>?` are bound; the status dot is `PRESENTATION`; reduced motion sets a zero transition. An unlabelled icon button raises at construction. GTK-internal composite controls are excluded |
 | X11 adapter matching (`F-PLAT-02`) | `crates/ui/tests/test_x11_policy.py` covers aliases, expiry, hide-then-overlay ordering, dedupe, re-block, allowed-window hide, and Back |

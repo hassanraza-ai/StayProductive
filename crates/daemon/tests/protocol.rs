@@ -221,6 +221,23 @@ fn usage_seconds(snapshot: &Value, app: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Seed a state file directly so period totals can be checked without waiting
+/// for real focus intervals (`A-STA-02`, `A-STA-03`, `A-STA-05`, `A-STA-07`).
+fn seed_state(state: &stayproductive_core::State, path: &Path) {
+    let payload = json!({
+        "version": 1,
+        "state": serde_json::to_value(state).expect("state json"),
+    });
+    std::fs::write(path, payload.to_string()).expect("seed state");
+}
+
+fn stats_apps(snapshot: &Value, range: &str) -> Vec<Value> {
+    snapshot["stats"][range]["apps"]
+        .as_array()
+        .expect("stats apps")
+        .clone()
+}
+
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
@@ -519,6 +536,207 @@ fn blocked_overlay_suspends_usage_accrual() {
         stopped - after < 30,
         "attribution must stop without a fresh observer: after {after}, stopped {stopped}"
     );
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stats_report_today_week_month_rankings_and_counts() {
+    use stayproductive_core::{AppKey, ClockSettings, ReasonCode, State, Target, day_period};
+
+    let (dir, path) = temp_state();
+    let mut state = State::new(ClockSettings::default());
+    let mut now = chrono::Utc::now();
+    let period = day_period(now, &state.settings);
+    if now - period.start < chrono::Duration::seconds(2) {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        now = chrono::Utc::now();
+    }
+    let period = day_period(now, &state.settings);
+    let start = (now - chrono::Duration::minutes(10)).max(period.start);
+    let end = now - chrono::Duration::seconds(1);
+    let split = start + (end - start) / 3 * 2;
+
+    let social = AppKey::new("social").unwrap();
+    let editor = AppKey::new("editor").unwrap();
+    state.usage.foreground(social.clone(), start);
+    state.usage.close_foreground(split);
+    state.usage.foreground(editor.clone(), split);
+    state.usage.close_foreground(end);
+    state
+        .usage
+        .screen_unlocked(now - chrono::Duration::seconds(45));
+    state.usage.blocked(
+        Target::App(social.clone()),
+        ReasonCode::LimitDaily,
+        now - chrono::Duration::seconds(30),
+        Some(now + chrono::Duration::hours(1)),
+        None,
+    );
+    seed_state(&state, &path);
+
+    let service = Service::start(&path);
+    let mut service = service;
+    let snapshot = service.ok("snapshot", json!({}));
+    let today = &snapshot["stats"]["today"];
+    assert!(
+        today["seconds"].as_u64().unwrap() >= 500,
+        "today's seeded intervals are counted: {today}"
+    );
+    assert_eq!(today["blocks"], 1);
+    assert_eq!(today["pickups"], 1);
+    assert_eq!(today["launches"], 2, "one launch per foreground entry");
+
+    let apps = stats_apps(&snapshot, "today");
+    assert_eq!(apps.len(), 2, "only apps with time are ranked: {apps:?}");
+    assert_eq!(apps[0]["app"], "social", "longest first: {apps:?}");
+    assert_eq!(apps[1]["app"], "editor");
+    assert!(
+        apps[0]["seconds"].as_u64() > apps[1]["seconds"].as_u64(),
+        "the ranking is ordered by time"
+    );
+    let app_seconds: u64 = apps
+        .iter()
+        .map(|app| app["seconds"].as_u64().unwrap())
+        .sum();
+    assert_eq!(
+        app_seconds,
+        today["seconds"].as_u64().unwrap(),
+        "ranked apps add up to the range total"
+    );
+    assert!(apps[0]["share"].as_f64().unwrap() > 0.0);
+
+    let week = snapshot["stats"]["week"]["seconds"].as_u64().unwrap();
+    let month = snapshot["stats"]["month"]["seconds"].as_u64().unwrap();
+    assert!(week >= today["seconds"].as_u64().unwrap());
+    assert!(month >= week, "month contains the week");
+
+    let history = snapshot["history"].as_array().expect("history");
+    assert_eq!(history[0]["target"], "social");
+    assert_eq!(history[0]["reason"], "R-LIMIT-DAILY");
+    assert!(
+        history[0]["until"].as_str().is_some(),
+        "history keeps the block end time"
+    );
+    assert!(
+        history[0].get("title").is_none(),
+        "history never records window titles"
+    );
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn allowlisted_app_is_never_put_in_the_enforcement_policy() {
+    let (dir, path) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let heartbeat = runtime.join("gnome-extension.json");
+    let policy_path = dir.join("enforcement.json");
+
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "block"}],
+                "allow_apps": ["firefox"]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    write_heartbeat(
+        &heartbeat,
+        Some(vec!["firefox"]),
+        Some(chrono::Utc::now() - chrono::Duration::seconds(30)),
+        false,
+    );
+    let snapshot = service.ok("snapshot", json!({}));
+    assert!(
+        policy_apps(&policy_path).is_empty(),
+        "an allowlist overrides a non-strict block in the policy: {:?}",
+        policy_apps(&policy_path)
+    );
+    assert_eq!(
+        snapshot["history"],
+        json!([]),
+        "nothing is recorded as blocked when the allowlist wins"
+    );
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn launch_limit_blocks_from_the_persisted_launch_count() {
+    use stayproductive_core::{
+        Activation, AppKey, ClockSettings, LimitPeriod, Profile, State, hour_period,
+    };
+
+    let (dir, path) = temp_state();
+    let mut now = chrono::Utc::now();
+    let hour = hour_period(now, chrono_tz::UTC);
+    if now - hour.start < chrono::Duration::seconds(30) {
+        std::thread::sleep(std::time::Duration::from_secs(31));
+        now = chrono::Utc::now();
+    }
+    let hour = hour_period(now, chrono_tz::UTC);
+    let social = AppKey::new("social").unwrap();
+    let mut state = State::new(ClockSettings::default());
+    state
+        .add_profile(
+            Profile::new("Focus", now)
+                .unwrap()
+                .with_activation(Activation::Always)
+                .launch_limit("social", 2, LimitPeriod::Hourly)
+                .unwrap(),
+        )
+        .unwrap();
+    // Three counted launches inside the current hour; each foreground return
+    // is more than five seconds after the previous exit, so all three count.
+    let first = hour.start + chrono::Duration::seconds(1);
+    state.usage.foreground(social.clone(), first);
+    state
+        .usage
+        .close_foreground(first + chrono::Duration::seconds(7));
+    state
+        .usage
+        .foreground(social.clone(), first + chrono::Duration::seconds(13));
+    state
+        .usage
+        .close_foreground(first + chrono::Duration::seconds(19));
+    state
+        .usage
+        .foreground(social.clone(), first + chrono::Duration::seconds(25));
+    state
+        .usage
+        .close_foreground(first + chrono::Duration::seconds(26));
+    seed_state(&state, &path);
+
+    let mut service = Service::start(&path);
+    let snapshot = service.ok("snapshot", json!({}));
+    let apps = policy_apps(&dir.join("enforcement.json"));
+    assert_eq!(apps.len(), 1, "the launch limit blocks: {apps:?}");
+    assert_eq!(apps[0]["app"], "social");
+    assert_eq!(apps[0]["reason"], "R-LAUNCH");
+    let until =
+        chrono::DateTime::parse_from_rfc3339(apps[0]["until"].as_str().expect("launch block end"))
+            .expect("rfc3339")
+            .with_timezone(&chrono::Utc);
+    assert_eq!(
+        until, hour.end,
+        "the launch allowance resets at the next hour"
+    );
+    assert_eq!(snapshot["stats"]["today"]["launches"], 3);
 
     service.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
