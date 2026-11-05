@@ -54,6 +54,11 @@ and Settings page report the adapter state rather than pretending.
   chooser by display name, sites, keywords, allowlists, limits, pickup limits,
   six schedule kinds), schedules, quick blocks, strict sessions with a real
   cool-down, activity, and settings.
+- Keyboard and screen-reader support: Control+1…6 switch pages in sidebar
+  order, Control+N creates a profile, Control+? lists every shortcut; icon-only
+  buttons and sidebar rows carry explicit accessible names, the decorative
+  enforcement dot is not announced, and reduced-motion settings remove the page
+  transition.
 - Timezone defaults to the system zone through `iana-time-zone`; the start of day
   and timezone are editable.
 - Strict commitments block profile edits and pauses in both the UI and the
@@ -90,8 +95,8 @@ Website and keyword enforcement, the browser extension, site time limits,
 launch/pickup limits, non-GNOME compositor adapters, tray integration, DNS
 helper, SQLite history/migrations, usage statistics beyond today's totals,
 low-time notifications, restoring usage counters from a backup, full
-translation catalogs, and a complete screen-reader audit. Notifications and the
-DNS helper are listed in
+translation catalogs, and manual screen-reader/high-contrast verification.
+Notifications and the DNS helper are listed in
 onboarding but deliberately unavailable, so nothing is enabled by clicking
 through the wizard. Autostart is implemented through the systemd user unit, but
 only for the default data file with a running systemd user manager. These

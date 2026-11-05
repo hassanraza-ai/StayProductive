@@ -27,6 +27,21 @@ PAGES = [
     ("settings", "Settings", "emblem-system-symbolic", "Clock and capabilities"),
 ]
 
+# The shortcut help is generated from these bindings so it cannot drift from
+# what the application actually installs.
+SHORTCUTS = [
+    ("<Control>1 … <Control>6", "Switch between pages, in the order shown in the sidebar"),
+    ("<Control>n", "Create a profile"),
+    ("<Control>question", "Show this shortcut list"),
+]
+
+
+def reduced_motion() -> bool:
+    """Whether the desktop asks for fewer animations."""
+
+    settings = Gtk.Settings.get_default()
+    return settings is not None and not settings.get_property("gtk-enable-animations")
+
 
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, application: Adw.Application, engine: Engine) -> None:
@@ -70,8 +85,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.nav = Gtk.ListBox()
         self.nav.add_css_class("navigation-sidebar")
         self.nav.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        for key, title, icon, _subtitle in PAGES:
-            self.nav.append(w.nav_row(key, title, icon))
+        for key, title, icon, subtitle in PAGES:
+            self.nav.append(w.nav_row(key, title, icon, subtitle))
         self.nav.connect("row-selected", self._on_row_selected)
         sidebar_content.append(self.nav)
 
@@ -88,6 +103,9 @@ class MainWindow(Adw.ApplicationWindow):
         status_line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.enforcement_dot = Gtk.Label(label="●")
         self.enforcement_dot.add_css_class("status-dot-offline")
+        # The dot repeats the text next to it; screen readers should read the
+        # sentence, not "black circle" (`A-UX-10`).
+        self.enforcement_dot.set_accessible_role(Gtk.AccessibleRole.PRESENTATION)
         status_line.append(self.enforcement_dot)
         self.enforcement_label = w.label("Enforcement offline", "row-title")
         status_line.append(self.enforcement_label)
@@ -113,7 +131,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
-        self.stack.set_transition_duration(160)
+        self.stack.set_transition_duration(0 if reduced_motion() else 160)
         self.stack.set_hhomogeneous(False)
         self.stack.set_vhomogeneous(False)
         self.stack.set_vexpand(True)
@@ -140,9 +158,45 @@ class MainWindow(Adw.ApplicationWindow):
         split.set_content(content_page)
         self.toast_overlay.set_child(split)
         self.set_content(self.toast_overlay)
+        self._install_actions()
 
         GLib.idle_add(self._select_initial)
         GLib.idle_add(self._maybe_onboard)
+
+    def _install_actions(self) -> None:
+        """Window actions plus their accelerators, so nothing is mouse-only.
+
+        A widget's own action map is not exported to ``win.`` automatically in
+        GTK4, so the actions live in an explicit ``nav`` group. The group name
+        is part of the accelerator identifier and the acceptance test.
+        """
+
+        application = self.get_application()
+        group = Gio.SimpleActionGroup()
+        for index, (key, _title, _icon, _subtitle) in enumerate(PAGES, start=1):
+            action = Gio.SimpleAction.new(f"page-{key}", None)
+            action.connect(
+                "activate", lambda _action, _param, page=key: self.switch_page(page)
+            )
+            group.add_action(action)
+            if application is not None:
+                application.set_accels_for_action(
+                    f"nav.page-{key}", [f"<Control>{index}"]
+                )
+
+        new_profile = Gio.SimpleAction.new("new-profile", None)
+        new_profile.connect("activate", lambda _action, _param: self.create_profile())
+        group.add_action(new_profile)
+
+        shortcuts = Gio.SimpleAction.new("shortcuts", None)
+        shortcuts.connect("activate", lambda _action, _param: self.show_shortcuts())
+        group.add_action(shortcuts)
+
+        self.nav_actions = group
+        self.insert_action_group("nav", group)
+        if application is not None:
+            application.set_accels_for_action("nav.new-profile", ["<Control>n"])
+            application.set_accels_for_action("nav.shortcuts", ["<Control>question"])
 
     def _select_initial(self) -> bool:
         self.nav.select_row(self.nav.get_row_at_index(0))
@@ -175,12 +229,22 @@ class MainWindow(Adw.ApplicationWindow):
         data.set_halign(Gtk.Align.FILL)
         data.connect("clicked", lambda _button: self._copy_data_path())
         box.append(data)
+
+        shortcuts = Gtk.Button(label="Keyboard shortcuts")
+        shortcuts.add_css_class("flat")
+        shortcuts.set_halign(Gtk.Align.FILL)
+        shortcuts.connect("clicked", lambda _button: self.show_shortcuts())
+        box.append(shortcuts)
         menu.set_child(box)
 
         button = Gtk.MenuButton()
         button.set_icon_name("open-menu-symbolic")
         button.set_popover(menu)
         button.set_tooltip_text("Main menu")
+        # GTK leaves menu buttons out of the tab chain; the main menu must stay
+        # reachable without a pointer (`A-UX-10`).
+        button.set_focusable(True)
+        w.accessible(button, label="Main menu")
         return button
 
     def _install_css(self) -> None:
@@ -299,6 +363,10 @@ class MainWindow(Adw.ApplicationWindow):
 
     def show_message(self, text: str) -> None:
         self.toast(text)
+
+    def show_shortcuts(self) -> None:
+        body = "\n".join(f"{keys} — {what}" for keys, what in SHORTCUTS)
+        w.alert(self, "Keyboard shortcuts", body)
 
     def show_error(self, heading: str, body: str | Exception) -> None:
         text = body if isinstance(body, str) else error_text(body)

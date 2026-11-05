@@ -483,6 +483,47 @@ and reports a loaded policy; otherwise it shows “Enforcement offline” and
 explains which adapter is missing. The sidebar and enforcement card name the
 reporting adapter (X11 or GNOME).
 
+### Keyboard navigation and screen readers (`F-UX-10`)
+
+Every control is built so a keyboard and a screen reader can reach it, and GTK's
+focus order follows the visual order:
+
+- `widgets.accessible()` sets `Gtk.AccessibleProperty.LABEL`/`DESCRIPTION`
+  explicitly. `widgets.button()` derives an icon-only button's name from its
+  tooltip and **raises** when neither a tooltip nor `accessible_label` is given,
+  so an unlabelled icon fails at construction instead of shipping. Text+icon
+  buttons use a custom child, where GTK cannot derive a name either, so they set
+  one too.
+- Sidebar rows carry the page title as their accessible name and the page's
+  purpose as the description, and the nav icon is `PRESENTATION`. Selecting a
+  row is what switches pages, so arrow keys move between pages directly.
+- The enforcement dot is a decorative `●` label marked `PRESENTATION`; the
+  adjacent text ("Enforcement active/offline") carries the meaning.
+- `Gtk.MenuButton` is not focusable by default in GTK 4, so the main menu and
+  every compact overflow menu opt back into the tab chain.
+- Window actions live in a `nav` action group: `<Control>1`…`<Control>6` switch
+  pages in sidebar order, `<Control>n` creates a profile, `<Control>question`
+  opens the shortcut list (also in the main menu). The help text is generated
+  from the same `SHORTCUTS` table that documents the bindings.
+- With `gtk-enable-animations` off, the page transition duration is zero, so
+  reduced motion is honoured without a second setting.
+
+Evidence: `crates/ui/tests/test_accessibility.py` starts its own Xvfb, builds
+the real `MainWindow`, profile editor, and onboarding dialog against a fake
+engine, and walks the widget tree. It asserts every control we place has an
+explicit or native accessible label and is focusable, that all six sidebar rows
+are labelled and described, that the accelerators match the sidebar order and
+actually switch the stack, that the status dot stays `PRESENTATION`, and that
+reduced motion removes the transition. Standard controls that GTK builds inside
+itself (spin buttons, an entry row's apply button, menu-button internals,
+drop-down arrows) are named by GTK and are excluded from the audit.
+
+Limits: this checks GTK's accessible properties and the action wiring, not a
+running screen reader. No Orca run, real Tab/Space key injection, or
+high-contrast theme check was performed here; those remain manual verification.
+Chart text summaries are still pending with the Week/Month statistics views
+(`F-STA-02`, `F-STA-03`).
+
 ### First-run onboarding
 
 `crates/ui/stayproductive/onboarding.py` implements `F-UX-01` as an
@@ -585,11 +626,13 @@ largest missing pieces.
   systemd can own the daemon, but there is no `org.stayproductive.Daemon1` name,
   tray, or CLI yet.
 - **Usage statistics views, notifications, full backup/restore of counters,
-  localisation catalogs, full accessibility audit**. Export and history deletion
-  exist, and profiles, settings, and commitments can be restored from an export
-  (see *Data export and deletion*); usage counters are exported but not
-  re-imported, and the Week/Month totals, timeline, and seven-day report do not
-  exist.
+  localisation catalogs, manual screen-reader and high-contrast verification**.
+  Export and history deletion exist, and profiles, settings, and commitments can
+  be restored from an export (see *Data export and deletion*); usage counters
+  are exported but not re-imported, and the Week/Month totals, timeline, and
+  seven-day report do not exist. Keyboard navigation and explicit accessible
+  names are in place (see *Keyboard navigation and screen readers*); an Orca
+  pass, real key injection, and contrast-theme review are still manual.
 - **Low-time alerts** (`A-LIM-07` / `A-PLAT-11`).
 - **Optional onboarding capabilities** — notifications and the DNS helper are
   explained in the wizard but not implemented. Autostart is implemented as the

@@ -175,7 +175,13 @@ no command that bypasses a commitment.
 
 - All controls reachable by keyboard; focus order follows visual order.
 - Every icon-only button has an accessible label; charts have text summaries.
-- Respect high-contrast and reduced-motion settings.
+  A tooltip alone is not a label: the accessible name is set explicitly.
+- Keyboard shortcuts: `<Control>1`…`<Control>6` switch pages in sidebar order,
+  `<Control>N` creates a profile, and `<Control>?` opens the shortcut list.
+  Sidebar rows and every button are in the tab chain; decorative glyphs (the
+  enforcement dot, nav icons) are not announced.
+- Respect high-contrast and reduced-motion settings: with animations disabled,
+  page transitions are instant.
 - Strings live in gettext catalogs; plural forms used for counts; no sentence
   concatenation.
 - Minimum contrast 4.5:1 for text, 3:1 for large text and focus rings.

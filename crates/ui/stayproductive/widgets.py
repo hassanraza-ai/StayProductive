@@ -18,6 +18,35 @@ def clear(widget: Gtk.Widget) -> None:
         child = next_child
 
 
+def accessible(
+    widget: Gtk.Widget,
+    *,
+    label: str | None = None,
+    description: str | None = None,
+    role: Gtk.AccessibleRole | None = None,
+) -> Gtk.Widget:
+    """Give a widget an explicit accessible name or description.
+
+    GTK derives a name from a plain label, but not from an icon or from a
+    custom child, so icon-only controls must set one themselves: a tooltip is
+    not a screen-reader label (`docs/spec/ux-flows.md` §12, `A-UX-10`).
+    """
+
+    properties: list[Gtk.AccessibleProperty] = []
+    values: list[str] = []
+    if label:
+        properties.append(Gtk.AccessibleProperty.LABEL)
+        values.append(label)
+    if description:
+        properties.append(Gtk.AccessibleProperty.DESCRIPTION)
+        values.append(description)
+    if properties:
+        widget.update_property(properties, values)
+    if role is not None:
+        widget.set_accessible_role(role)
+    return widget
+
+
 class Card(Gtk.Box):
     def __init__(self, *, hero: bool = False, warning: bool = False, spacing: int = 14):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=spacing)
@@ -84,6 +113,7 @@ def button(
     *,
     css: str | None = None,
     tooltip: str | None = None,
+    accessible_label: str | None = None,
     on_click: Callable[[Gtk.Button], None] | None = None,
 ) -> Gtk.Button:
     widget = Gtk.Button()
@@ -100,6 +130,18 @@ def button(
         widget.add_css_class(css)
     if tooltip:
         widget.set_tooltip_text(tooltip)
+
+    name = accessible_label or text or tooltip
+    if name:
+        accessible(
+            widget,
+            label=name,
+            description=tooltip if tooltip and tooltip != name else None,
+        )
+    elif icon is not None:
+        # An unlabelled icon is silent to a screen reader: refuse it at
+        # construction instead of shipping it (`A-UX-10`).
+        raise ValueError("an icon-only button needs a tooltip or accessible_label")
     if on_click:
         widget.connect("clicked", on_click)
     return widget
@@ -117,7 +159,7 @@ def page_scroller(content: Gtk.Widget, max_width: int = 1000) -> Gtk.ScrolledWin
     return scroller
 
 
-def nav_row(key: str, title: str, icon: str) -> Gtk.ListBoxRow:
+def nav_row(key: str, title: str, icon: str, subtitle: str | None = None) -> Gtk.ListBoxRow:
     row = Gtk.ListBoxRow()
     row.add_css_class("nav-row")
     row.key = key  # type: ignore[attr-defined]
@@ -128,11 +170,13 @@ def nav_row(key: str, title: str, icon: str) -> Gtk.ListBoxRow:
     box.set_margin_end(10)
     image = Gtk.Image.new_from_icon_name(icon)
     image.set_pixel_size(18)
+    image.set_accessible_role(Gtk.AccessibleRole.PRESENTATION)
     box.append(image)
     text = Gtk.Label(label=title, xalign=0)
     text.set_hexpand(True)
     box.append(text)
     row.set_child(box)
+    accessible(row, label=title, description=subtitle)
     return row
 
 
@@ -195,6 +239,10 @@ def menu_button(
     widget.add_css_class("flat")
     widget.set_popover(menu)
     widget.set_tooltip_text(name)
+    # GTK's menu button is not focusable by default; a keyboard user still
+    # needs to reach it, so put it in the tab chain ourselves (`A-UX-10`).
+    widget.set_focusable(True)
+    accessible(widget, label=name)
     return widget
 
 
