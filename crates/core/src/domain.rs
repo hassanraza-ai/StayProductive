@@ -453,6 +453,40 @@ fn merge_site_action(current: SiteAction, incoming: SiteAction) -> SiteAction {
     }
 }
 
+/// An if-then plan the person wrote for this profile.
+///
+/// The cue is the situation; the response is what they intend to do then.
+/// It is a reminder, not a rule the engine enforces.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImplementationIntention {
+    /// Situation, in the person's words.
+    pub cue: String,
+    /// Response, in the person's words.
+    pub response: String,
+}
+
+impl ImplementationIntention {
+    /// Build a plan from the two sentences the person wrote.
+    ///
+    /// Both sides are required. Each is capped at 120 characters so a reminder
+    /// stays a sentence.
+    pub fn new(cue: impl Into<String>, response: impl Into<String>) -> Result<Self> {
+        let cue = cue.into().trim().to_owned();
+        let response = response.into().trim().to_owned();
+        if cue.is_empty() || response.is_empty() {
+            return Err(Error::InvalidRule(
+                "an if-then plan needs both a situation and a response".into(),
+            ));
+        }
+        if cue.chars().count() > 120 || response.chars().count() > 120 {
+            return Err(Error::InvalidRule(
+                "an if-then plan must be 120 characters or fewer".into(),
+            ));
+        }
+        Ok(Self { cue, response })
+    }
+}
+
 /// A named bundle of rules and an optional schedule.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
@@ -484,6 +518,9 @@ pub struct Profile {
     pub created_at: Timestamp,
     /// Last edit time.
     pub updated_at: Timestamp,
+    /// Optional if-then plan. Absent on profiles saved before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intention: Option<ImplementationIntention>,
 }
 
 impl Profile {
@@ -511,6 +548,7 @@ impl Profile {
             template: None,
             created_at,
             updated_at: created_at,
+            intention: None,
         })
     }
 
@@ -970,6 +1008,18 @@ mod tests {
         assert!(!pause.is_paused(start + chrono::TimeDelta::minutes(15)));
         assert!(pause.expire(start + chrono::TimeDelta::minutes(15)));
         assert!(!pause.paused);
+    }
+
+    #[test]
+    fn a_profile_saved_before_if_then_plans_still_loads() {
+        let created = Profile::new("Focus", now()).unwrap();
+        let mut value = serde_json::to_value(&created).unwrap();
+        value.as_object_mut().unwrap().remove("intention");
+        let loaded: Profile = serde_json::from_value(value).unwrap();
+        assert!(loaded.intention.is_none());
+        let plan = ImplementationIntention::new("I open a chat app", "I leave it closed").unwrap();
+        assert!(ImplementationIntention::new("", "leave").is_err());
+        assert_eq!(plan.cue, "I open a chat app");
     }
 
     #[test]

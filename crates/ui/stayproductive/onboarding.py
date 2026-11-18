@@ -235,6 +235,8 @@ def starter_profile(
     *,
     selected_apps: list[DesktopApp] | None = None,
     name: str | None = None,
+    cue: str = "",
+    response: str = "",
 ) -> dict:
     """Build the profile specification the daemon accepts.
 
@@ -267,6 +269,10 @@ def starter_profile(
         "allow_sites": [],
         "pickup_limit": None,
     }
+    cue = cue.strip()
+    response = response.strip()
+    if cue and response:
+        spec["intention"] = {"cue": cue, "response": response}
     if goal.schedule is not None:
         spec["schedule"] = goal.schedule
     return spec
@@ -331,10 +337,19 @@ class StarterProfileCreator:
         *,
         selected_apps: list[DesktopApp],
         name: str,
+        cue: str = "",
+        response: str = "",
     ) -> dict | None:
         if self.spec is not None:
             return None
-        spec = starter_profile(goal, apps, selected_apps=selected_apps, name=name)
+        spec = starter_profile(
+            goal,
+            apps,
+            selected_apps=selected_apps,
+            name=name,
+            cue=cue,
+            response=response,
+        )
         self.engine.create_profile(spec)
         self.calls += 1
         mark_onboarding_complete(self.snapshot)
@@ -575,9 +590,9 @@ class Onboarding(Adw.Dialog):
 
         page.append(
             w.label(
-                "You can change all of this later in Settings. Website and "
-                "keyword enforcement is not active in this build; application "
-                "blocks are.",
+                "You can change all of this later in Settings. Application blocks "
+                "need a desktop adapter. Website and keyword blocks apply in "
+                "the browser extension.",
                 "muted small",
             )
         )
@@ -593,6 +608,20 @@ class Onboarding(Adw.Dialog):
         self.name_row = Adw.EntryRow(title="Profile name")
         self.name_row.connect("changed", lambda _row: self._update_buttons())
         profile_group.add(self.name_row)
+        plan = Adw.PreferencesGroup(
+            title="If-then plan",
+            description=(
+                "Optional. A specific plan is easier to follow than a general "
+                "intention. For example: when a chat app opens during work, "
+                "leave it until this profile's window ends. Leave both blank "
+                "to skip."
+            ),
+        )
+        self.cue_row = Adw.EntryRow(title="When this happens")
+        self.response_row = Adw.EntryRow(title="I will")
+        plan.add(self.cue_row)
+        plan.add(self.response_row)
+        page.append(plan)
         self.schedule_row = Adw.ActionRow(title="Schedule")
         self.schedule_pill = w.status_pill("Manual", "accent")
         self.schedule_row.add_suffix(self.schedule_pill)
@@ -639,9 +668,9 @@ class Onboarding(Adw.Dialog):
 
         page.append(
             w.label(
-                "Website and keyword rules are saved, but this build only "
-                "enforces application blocks. Site enforcement is still being "
-                "built.",
+                "Application blocks need a desktop adapter. Website and keyword "
+                "blocks apply in the browser extension, not as a system-wide "
+                "network filter.",
                 "muted small",
             )
         )
@@ -986,6 +1015,8 @@ class Onboarding(Adw.Dialog):
                 self._installed,
                 selected_apps=self._selected_apps,
                 name=name,
+                cue=self.cue_row.get_text(),
+                response=self.response_row.get_text(),
             )
         except Exception as error:  # noqa: BLE001
             self.window.show_error("Could not create the profile", error_text(error))

@@ -22,8 +22,8 @@ pub mod usage;
 pub use app::{AppKey, Host, HostPattern, Keyword, KeywordScope, SurfaceId, WindowKey};
 pub use domain::{
     Activation, AppRule, AppRuleEntry, Commitment, CommitmentKind, CommitmentState, CountLimit,
-    DeactivationMethod, LimitPeriod, PauseReason, PauseState, Profile, QuickBlock, Restriction,
-    RuleSet, SiteAction, SiteRule, Target,
+    DeactivationMethod, ImplementationIntention, LimitPeriod, PauseReason, PauseState, Profile,
+    QuickBlock, Restriction, RuleSet, SiteAction, SiteRule, Target,
 };
 pub use engine::{Decision, Event, MessageKey, State, Verdict, decide};
 pub use error::{Error, Result};
