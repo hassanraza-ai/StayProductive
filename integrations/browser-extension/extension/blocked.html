@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Blocked — StayProductive</title>
+    <link rel="stylesheet" href="blocked.css" />
+  </head>
+  <body>
+    <main class="card" role="alertdialog" aria-labelledby="title" aria-describedby="detail">
+      <p class="eyebrow">StayProductive</p>
+      <h1 id="title">This page is blocked</h1>
+      <p id="detail">A rule in an active profile covers this site.</p>
+      <p class="meta"><span id="target" class="target"></span> <span id="until"></span></p>
+      <div class="actions">
+        <button id="back" class="primary" type="button">Go back</button>
+        <button id="retry" type="button" hidden>Try again</button>
+      </div>
+      <p class="hint">
+        Your local StayProductive service made this decision. Nothing was uploaded,
+        and the block follows your profile and strict-mode settings.
+      </p>
+    </main>
+    <script src="lib/policy.js"></script>
+    <script src="lib/blockpage.js"></script>
+    <script src="blocked.js"></script>
+  </body>
+</html>

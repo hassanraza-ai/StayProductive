@@ -24,6 +24,13 @@ use crate::time::Timestamp;
 /// (`docs/spec/blocking-engine.md` §4).
 pub const LAUNCH_ANTI_THRASH: Duration = Duration::from_secs(5);
 
+/// How many usage events the in-memory log keeps.
+///
+/// The log is a debugging and future-statistics aid; the ledger's intervals,
+/// launches, pickups and blocks are the data that must survive a restart, so
+/// the event tail is bounded and never persisted.
+pub const EVENT_LOG_CAP: usize = 1024;
+
 /// A category of usage event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UsageKind {
@@ -156,9 +163,11 @@ pub struct UsageLedger {
     launches: Vec<LaunchRecord>,
     pickups: Vec<Timestamp>,
     blocks: Vec<BlockRecord>,
+    #[serde(skip)]
     events: Vec<UsageEvent>,
     last_exit: BTreeMap<AppKey, Timestamp>,
     last_heartbeat: Option<Timestamp>,
+    #[serde(skip)]
     next_event_id: u64,
 }
 
@@ -166,6 +175,42 @@ impl UsageLedger {
     /// An empty ledger.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Rebuild a ledger from persisted parts.
+    ///
+    /// The append-only event tail is deliberately not restored: it is a
+    /// bounded debugging aid, not accounting data.
+    pub fn from_persisted(
+        intervals: Vec<UsageInterval>,
+        open: Option<(AppKey, Timestamp)>,
+        launches: Vec<LaunchRecord>,
+        pickups: Vec<Timestamp>,
+        blocks: Vec<BlockRecord>,
+        last_exit: BTreeMap<AppKey, Timestamp>,
+        last_heartbeat: Option<Timestamp>,
+    ) -> Self {
+        Self {
+            intervals,
+            open: open.map(|(app, start)| OpenForeground { app, start }),
+            launches,
+            pickups,
+            blocks,
+            events: Vec::new(),
+            last_exit,
+            last_heartbeat,
+            next_event_id: 0,
+        }
+    }
+
+    /// The open foreground interval, if one is being tracked.
+    pub fn open_foreground(&self) -> Option<(&AppKey, Timestamp)> {
+        self.open.as_ref().map(|open| (&open.app, open.start))
+    }
+
+    /// When each application last left the foreground.
+    pub fn last_exits(&self) -> &BTreeMap<AppKey, Timestamp> {
+        &self.last_exit
     }
 
     /// All closed intervals.
@@ -477,6 +522,27 @@ impl UsageLedger {
         closed + open
     }
 
+    /// Foreground time per app inside `period`, including the open interval.
+    ///
+    /// Apps with no time inside the period are absent from the map.
+    pub fn usage_per_app(&self, period: &Period, now: Timestamp) -> BTreeMap<AppKey, Duration> {
+        let mut totals: BTreeMap<AppKey, Duration> = BTreeMap::new();
+        for interval in &self.intervals {
+            let clipped = interval.clipped_duration(period);
+            if clipped > Duration::ZERO {
+                *totals.entry(interval.app.clone()).or_default() += clipped;
+            }
+        }
+        if let Some(open) = &self.open {
+            let end = now.min(period.end);
+            if open.start < end {
+                let start = open.start.max(period.start);
+                *totals.entry(open.app.clone()).or_default() += duration_between(start, end);
+            }
+        }
+        totals
+    }
+
     /// Number of counted launches of `app` inside `period`.
     pub fn launch_count(&self, app: &AppKey, period: &Period) -> u32 {
         u32::try_from(
@@ -497,6 +563,47 @@ impl UsageLedger {
                 .count(),
         )
         .unwrap_or(u32::MAX)
+    }
+
+    /// Number of counted launches inside `period`, across every app.
+    pub fn launch_total(&self, period: &Period) -> u32 {
+        u32::try_from(
+            self.launches
+                .iter()
+                .filter(|launch| period.contains(launch.at))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
+    /// Number of enforced blocks recorded inside `period`.
+    pub fn block_count(&self, period: &Period) -> u32 {
+        u32::try_from(
+            self.blocks
+                .iter()
+                .filter(|block| period.contains(block.at))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
+    /// Foreground time per app, longest first, ties broken by app key.
+    ///
+    /// Stable ordering keeps the Stats ranking from jumping between polls when
+    /// two apps have the same duration.
+    pub fn usage_ranking(&self, period: &Period, now: Timestamp) -> Vec<(AppKey, Duration)> {
+        let mut rows: Vec<(AppKey, Duration)> = self
+            .usage_per_app(period, now)
+            .into_iter()
+            .filter(|(_app, duration)| *duration > Duration::ZERO)
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        rows
+    }
+
+    /// Total foreground time attributed to any app inside `period`.
+    pub fn total_usage(&self, period: &Period, now: Timestamp) -> Duration {
+        self.usage_per_app(period, now).values().copied().sum()
     }
 
     /// The instant at which cumulative usage of `app` inside `period` reached
@@ -567,6 +674,10 @@ impl UsageLedger {
         event.id = self.next_event_id;
         self.next_event_id += 1;
         self.events.push(event);
+        let excess = self.events.len().saturating_sub(EVENT_LOG_CAP);
+        if excess > 0 {
+            self.events.drain(..excess);
+        }
     }
 }
 
@@ -647,6 +758,50 @@ mod tests {
     }
 
     #[test]
+    fn ranking_is_by_time_then_app_key() {
+        let mut ledger = UsageLedger::new();
+        let beta = AppKey::new("beta").unwrap();
+        let alpha = AppKey::new("alpha").unwrap();
+        let gamma = AppKey::new("gamma").unwrap();
+        ledger.foreground(beta.clone(), ts(0));
+        ledger.foreground(alpha.clone(), ts(10));
+        ledger.foreground(gamma.clone(), ts(20));
+        ledger.close_foreground(ts(40));
+        // beta 10 min, alpha 10 min, gamma 20 min.
+        let ranking = ledger.usage_ranking(&period(), ts(40));
+        assert_eq!(
+            ranking,
+            vec![
+                (gamma, Duration::from_secs(20 * 60)),
+                (alpha, Duration::from_secs(10 * 60)),
+                (beta, Duration::from_secs(10 * 60)),
+            ]
+        );
+        assert_eq!(
+            ledger.total_usage(&period(), ts(40)),
+            Duration::from_secs(40 * 60)
+        );
+    }
+
+    #[test]
+    fn totals_count_launches_and_blocks_once() {
+        let mut ledger = UsageLedger::new();
+        let app = AppKey::new("social").unwrap();
+        ledger.foreground(app.clone(), ts(0));
+        ledger.close_foreground(ts(10));
+        ledger.foreground(app.clone(), ts(20));
+        ledger.blocked(
+            crate::domain::Target::App(app.clone()),
+            crate::reason::ReasonCode::LimitDaily,
+            ts(30),
+            None,
+            None,
+        );
+        assert_eq!(ledger.launch_total(&period()), 2);
+        assert_eq!(ledger.block_count(&period()), 1);
+    }
+
+    #[test]
     fn usage_crossing_is_anchored_to_the_first_crossing() {
         let mut ledger = UsageLedger::new();
         let app = AppKey::new("social").unwrap();
@@ -669,5 +824,51 @@ mod tests {
             ledger.usage(&app, &period(), ts(30)),
             Duration::from_secs(5 * 60)
         );
+    }
+
+    #[test]
+    fn event_log_is_bounded_and_not_persisted() {
+        let mut ledger = UsageLedger::new();
+        let a = AppKey::new("alpha").unwrap();
+        let b = AppKey::new("beta").unwrap();
+        for i in 0..(EVENT_LOG_CAP + 100) {
+            if i % 2 == 0 {
+                ledger.foreground(a.clone(), ts_secs(i as i64));
+            } else {
+                ledger.foreground(b.clone(), ts_secs(i as i64));
+            }
+        }
+        assert!(
+            ledger.events().len() <= EVENT_LOG_CAP,
+            "event log must stay bounded, got {}",
+            ledger.events().len()
+        );
+        let encoded = serde_json::to_value(&ledger).unwrap();
+        assert!(
+            encoded.get("events").is_none(),
+            "events must not be persisted with the state"
+        );
+        let restored: UsageLedger = serde_json::from_value(encoded).unwrap();
+        assert!(restored.events().is_empty());
+        assert_eq!(restored.intervals().len(), ledger.intervals().len());
+        assert_eq!(restored.last_heartbeat(), ledger.last_heartbeat());
+    }
+
+    #[test]
+    fn usage_per_app_sums_closed_and_open_intervals() {
+        let mut ledger = UsageLedger::new();
+        let firefox = AppKey::new("firefox").unwrap();
+        let editor = AppKey::new("editor").unwrap();
+        ledger.foreground(firefox.clone(), ts(0));
+        ledger.foreground(editor.clone(), ts(10));
+        ledger.foreground(firefox.clone(), ts(20));
+        let totals = ledger.usage_per_app(&period(), ts(30));
+        assert_eq!(
+            totals.get(&firefox),
+            Some(&Duration::from_secs(20 * 60)),
+            "firefox: 10 closed minutes plus the open interval"
+        );
+        assert_eq!(totals.get(&editor), Some(&Duration::from_secs(10 * 60)));
+        assert_eq!(totals.len(), 2, "no other app is attributed");
     }
 }

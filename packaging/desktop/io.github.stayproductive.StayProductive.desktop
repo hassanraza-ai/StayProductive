@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=StayProductive
+GenericName=Focus and Screen Time
+Comment=Plan focus sessions and block distracting apps and sites
+Exec=stayproductive
+Icon=io.github.stayproductive.StayProductive
+Terminal=false
+Categories=Utility;
+Keywords=focus;productivity;screen time;blocker;timer;
+StartupNotify=true
+X-GNOME-UsesNotifications=true

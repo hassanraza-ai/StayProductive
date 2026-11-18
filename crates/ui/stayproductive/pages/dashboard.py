@@ -5,7 +5,9 @@ from __future__ import annotations
 from gi.repository import Gtk
 
 from ..formatting import (
+    app_name,
     commitment_remaining,
+    duration_text,
     error_text,
     local_time,
     parse_time,
@@ -19,6 +21,7 @@ from .. import widgets as w
 class DashboardPage:
     def __init__(self, window) -> None:
         self.window = window
+        self._enforcement_dismissed = False
         self.root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
         self.root.set_margin_top(28)
         self.root.set_margin_bottom(40)
@@ -56,11 +59,7 @@ class DashboardPage:
             on_click=lambda _button: self.window.switch_page("profiles"),
         )
         actions.append(self.primary_action)
-        self.pause_action = w.button(
-            "Pause for 15 min",
-            "media-playback-pause-symbolic",
-            on_click=self._pause_active,
-        )
+        self.pause_action = w.pause_menu(self._pause_active)
         actions.append(self.pause_action)
         actions.append(
             w.button(
@@ -83,6 +82,32 @@ class DashboardPage:
         self.commit_metric = self._metric(metrics, 1, 1, "Commitment", "None", "No strict session")
         self.root.append(metrics)
 
+        # ------------------------------------------------------------- today
+        today = w.Card(spacing=12)
+        today_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        today_head.append(w.label("Today", "card-title"))
+        today_head.set_hexpand(True)
+        today_head.append(
+            w.button(
+                "View stats",
+                icon="office-chart-bar-symbolic",
+                css="flat",
+                tooltip="Open today, week, and month statistics",
+                on_click=lambda _button: self.window.switch_page("stats"),
+            )
+        )
+        today.append(today_head)
+        summary = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18)
+        self.today_time = w.label("0 min", "metric-value")
+        summary.append(self.today_time)
+        self.today_blocks = w.label("0 blocks", "muted")
+        self.today_blocks.set_valign(Gtk.Align.END)
+        summary.append(self.today_blocks)
+        today.append(summary)
+        self.today_top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        today.append(self.today_top)
+        self.root.append(today)
+
         # --------------------------------------------------- enforcement
         self.enforcement_warning = w.Card(warning=True)
         warning_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
@@ -99,6 +124,14 @@ class DashboardPage:
         )
         warning_copy.set_hexpand(True)
         warning_row.append(warning_copy)
+        warning_row.append(
+            w.button(
+                icon="window-close-symbolic",
+                css="flat",
+                tooltip="Dismiss this warning for this session",
+                on_click=lambda _button: self._dismiss_enforcement_warning(),
+            )
+        )
         self.enforcement_warning.append(warning_row)
         self.root.append(self.enforcement_warning)
 
@@ -123,7 +156,7 @@ class DashboardPage:
         quick.append(
             w.label(
                 "Creates a real time-boxed quick block in the engine. It is stored locally "
-                "and can be ended from this card or Activity.",
+                "and can be ended from this card or Stats.",
                 "muted",
             )
         )
@@ -237,18 +270,22 @@ class DashboardPage:
         self.pause_action.set_tooltip_text(
             "Pausing is blocked by the active strict session."
             if pause_blocked
-            else "Pause the active profile for 15 minutes."
+            else "Pause the active profile. It resumes at the time you pick."
         )
 
         enforcement = snapshot.get("enforcement", {})
         enforcement_active = enforcement.get("state") == "active"
-        self.enforcement_warning.set_visible(not enforcement_active)
+        if enforcement_active:
+            self._enforcement_dismissed = False
+        self.enforcement_warning.set_visible(
+            not enforcement_active and not self._enforcement_dismissed
+        )
         self.enforcement_active.set_visible(enforcement_active)
         if enforcement_active:
             self.enforcement_detail.set_label(
                 enforcement.get(
                     "message",
-                    "The GNOME Shell extension is applying app blocks now.",
+                    "A desktop enforcement adapter is applying app blocks now.",
                 )
             )
 
@@ -279,6 +316,26 @@ class DashboardPage:
         else:
             self.commit_metric[0].set_label("None")
             self.commit_metric[1].set_label("No strict session")
+
+        today_stats = (snapshot.get("stats") or {}).get("today") or {}
+        self.today_time.set_label(duration_text(today_stats.get("seconds", 0)))
+        blocks = int(today_stats.get("blocks", 0) or 0)
+        self.today_blocks.set_label(
+            "1 block" if blocks == 1 else f"{blocks} blocks"
+        )
+        w.clear(self.today_top)
+        ranking = today_stats.get("apps") or []
+        if not ranking:
+            self.today_top.append(
+                w.label("No tracked screen time yet today.", "muted small")
+            )
+        for entry in ranking[:3]:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            title = w.label(app_name(entry.get("app", "?")), "row-title")
+            title.set_hexpand(True)
+            row.append(title)
+            row.append(w.label(duration_text(entry.get("seconds", 0)), "muted small"))
+            self.today_top.append(row)
 
         self._refresh_quick(snapshot)
         self._refresh_history(snapshot)
@@ -320,8 +377,8 @@ class DashboardPage:
         history = snapshot.get("history", [])
         if not history:
             empty = w.label(
-                "No blocks recorded yet. Desktop blocks appear here once the "
-                "GNOME extension is active.",
+                "No blocks recorded yet. Desktop blocks appear here once a "
+                "desktop enforcement adapter is active.",
                 "muted",
             )
             empty.add_css_class("small")
@@ -335,14 +392,20 @@ class DashboardPage:
             row.append(w.label(entry.get("reason", ""), "muted small"))
             self.history_list.append(row)
 
-    def _pause_active(self) -> None:
+    def _dismiss_enforcement_warning(self) -> None:
+        self._enforcement_dismissed = True
+        self.enforcement_warning.set_visible(False)
+
+    def _pause_active(self, minutes: int, until_end_of_day: bool) -> None:
         active = self.window.snapshot.get("active_profiles", [])
         if not active:
             return
         try:
-            self.window.engine.pause_profile(active[0]["id"], 15)
+            self.window.engine.pause_profile(
+                active[0]["id"], minutes, until_end_of_day=until_end_of_day
+            )
             self.window.refresh()
-            self.window.toast("Paused for 15 minutes")
+            self.window.toast(w.pause_toast(minutes, until_end_of_day))
         except Exception as error:  # noqa: BLE001
             self.window.show_error("Could not pause", error_text(error))
 

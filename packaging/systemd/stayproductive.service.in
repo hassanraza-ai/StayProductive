@@ -1,0 +1,16 @@
+[Unit]
+Description=StayProductive focus daemon
+Documentation=https://github.com/hassanraza-ai/StayProductive
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/stayproductive-daemon --socket
+PassEnvironment=DISPLAY XAUTHORITY WAYLAND_DISPLAY XDG_SESSION_TYPE
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

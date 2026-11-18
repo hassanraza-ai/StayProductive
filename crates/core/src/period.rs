@@ -9,8 +9,8 @@
 //! when the daemon reloads it. No function here reads the wall clock.
 
 use chrono::{
-    DateTime, Days, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, TimeZone,
-    Timelike, Utc,
+    DateTime, Datelike, Days, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta,
+    TimeZone, Timelike, Utc,
 };
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -182,6 +182,34 @@ pub fn next_day_boundary(now: Timestamp, settings: &ClockSettings) -> Timestamp 
     day_period(now, settings).end
 }
 
+/// The logical week containing `now`.
+///
+/// Weeks start on Monday in the local calendar, then use the same
+/// start-of-day offset as [`day_period`]. A week that contains a clock change is
+/// 167 or 169 hours long, not always 168.
+pub fn week_period(now: Timestamp, settings: &ClockSettings) -> Period {
+    let date = logical_date(now, settings);
+    let monday = date - TimeDelta::days(i64::from(date.weekday().num_days_from_monday()));
+    let start = day_period_for(monday, settings).start;
+    let end = day_period_for(monday + TimeDelta::days(7), settings).start;
+    Period::new(start, end.max(start + TimeDelta::seconds(1)))
+}
+
+/// The logical month containing `now`.
+///
+/// Months start on the first local calendar day and honour the start-of-day
+/// offset, so the period can begin on the last day of the previous month.
+pub fn month_period(now: Timestamp, settings: &ClockSettings) -> Period {
+    let date = logical_date(now, settings);
+    let first = date.with_day(1).unwrap_or(date);
+    let next_month = first
+        .checked_add_months(chrono::Months::new(1))
+        .unwrap_or(first);
+    let start = day_period_for(first, settings).start;
+    let end = day_period_for(next_month, settings).start;
+    Period::new(start, end.max(start + TimeDelta::seconds(1)))
+}
+
 /// The local wall-clock hour containing `now`, expressed as a UTC period.
 ///
 /// A skipped hour collapses to an empty period and therefore records no usage;
@@ -310,5 +338,54 @@ mod tests {
         assert_eq!(p.end, Utc.with_ymd_and_hms(2026, 10, 22, 10, 0, 0).unwrap());
         assert!(p.contains(now));
         assert!(!p.contains(Utc.with_ymd_and_hms(2026, 10, 22, 10, 0, 0).unwrap()));
+    }
+
+    #[test]
+    fn week_period_starts_monday_at_start_of_day() {
+        // Thursday 2026-10-22, 02:00 with a 04:00 start belongs to Monday
+        // 2026-10-19, whose logical day starts at 04:00.
+        let settings = ClockSettings::with_start_of_day(
+            NaiveTime::from_hms_opt(4, 0, 0).unwrap(),
+            chrono_tz::UTC,
+        );
+        let thursday_2am = Utc.with_ymd_and_hms(2026, 10, 22, 2, 0, 0).unwrap();
+        let p = week_period(thursday_2am, &settings);
+        assert_eq!(
+            p.start,
+            Utc.with_ymd_and_hms(2026, 10, 19, 4, 0, 0).unwrap()
+        );
+        assert_eq!(p.end, Utc.with_ymd_and_hms(2026, 10, 26, 4, 0, 0).unwrap());
+        assert!(p.contains(thursday_2am));
+    }
+
+    #[test]
+    fn week_period_survives_a_dst_change() {
+        let settings = ClockSettings::midnight_in(New_York);
+        let now = local(New_York, 2026, 10, 28, 12, 0, 0);
+        let p = week_period(now, &settings);
+        // The week containing 2026-11-01 has 169 hours (fall back).
+        assert_eq!(p.duration(), TimeDelta::hours(169));
+    }
+
+    #[test]
+    fn month_period_starts_on_the_first_local_day() {
+        let settings = ClockSettings::with_start_of_day(
+            NaiveTime::from_hms_opt(4, 0, 0).unwrap(),
+            chrono_tz::UTC,
+        );
+        let now = Utc.with_ymd_and_hms(2026, 10, 22, 12, 0, 0).unwrap();
+        let p = month_period(now, &settings);
+        assert_eq!(p.start, Utc.with_ymd_and_hms(2026, 10, 1, 4, 0, 0).unwrap());
+        assert_eq!(p.end, Utc.with_ymd_and_hms(2026, 11, 1, 4, 0, 0).unwrap());
+        assert!(p.contains(now));
+    }
+
+    #[test]
+    fn month_period_crosses_a_year_boundary() {
+        let settings = ClockSettings::midnight_in(chrono_tz::UTC);
+        let now = Utc.with_ymd_and_hms(2026, 12, 31, 23, 0, 0).unwrap();
+        let p = month_period(now, &settings);
+        assert_eq!(p.start, Utc.with_ymd_and_hms(2026, 12, 1, 0, 0, 0).unwrap());
+        assert_eq!(p.end, Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0).unwrap());
     }
 }

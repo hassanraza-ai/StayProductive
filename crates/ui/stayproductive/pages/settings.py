@@ -2,56 +2,16 @@
 
 from __future__ import annotations
 
-import os
-import shutil
 from pathlib import Path
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
+from .. import desktop
+from .. import service
 from .. import widgets as w
 from ..formatting import error_text
 
-GNOME_EXTENSION_UUID = "stayproductive@hassanraza.ai"
-GNOME_SHELL_SCHEMA = "org.gnome.shell"
-
-
-def _extension_source() -> Path | None:
-    candidates = [
-        parent
-        / "integrations"
-        / "gnome"
-        / GNOME_EXTENSION_UUID
-        for parent in Path(__file__).resolve().parents
-    ]
-    candidates.extend(
-        [
-            Path(GLib.get_user_data_dir())
-            / "stayproductive"
-            / "extension-source"
-            / GNOME_EXTENSION_UUID,
-            Path("/usr/share/stayproductive/gnome-extension"),
-        ]
-    )
-    return next(
-        (path for path in candidates if (path / "metadata.json").is_file()), None
-    )
-
-
-def _extension_target() -> Path:
-    return (
-        Path(GLib.get_user_data_dir())
-        / "gnome-shell"
-        / "extensions"
-        / GNOME_EXTENSION_UUID
-    )
-
-
-def _is_gnome() -> bool:
-    desktops = " ".join(
-        os.environ.get(name, "")
-        for name in ("XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP")
-    ).lower()
-    return "gnome" in desktops or "GNOME_DESKTOP_SESSION_ID" in os.environ
+GNOME_EXTENSION_UUID = desktop.GNOME_EXTENSION_UUID
 
 
 class SettingsPage:
@@ -59,6 +19,9 @@ class SettingsPage:
         self.window = window
         self.page = Adw.PreferencesPage()
         self.page.set_vexpand(True)
+        self._updating_autostart = False
+        self._service_refreshed = False
+        self._service_state_path: str | None = None
         self._build()
         self.widget = self.page
 
@@ -92,12 +55,15 @@ class SettingsPage:
         self.enforcement_row.add_suffix(self.enforcement_pill)
         capabilities.add(self.enforcement_row)
 
-        service = Adw.ActionRow(
+        service_row = Adw.ActionRow(
             title="Local state service",
-            subtitle="Connected · decisions and persistence are live",
+            subtitle=(
+                "Connected · runs independently and keeps enforcing after this "
+                "window closes"
+            ),
         )
-        service.add_suffix(w.status_pill("Running", "active"))
-        capabilities.add(service)
+        service_row.add_suffix(w.status_pill("Running", "active"))
+        capabilities.add(service_row)
 
         self.data_row = Adw.ActionRow(title="Data file", subtitle="—")
         copy = w.button(
@@ -118,6 +84,80 @@ class SettingsPage:
         open_folder.connect("activated", lambda _row: self._open_folder())
         capabilities.add(open_folder)
         self.page.add(capabilities)
+
+        backup = Adw.PreferencesGroup(
+            title="Backup",
+            description=(
+                "Export from Stats, restore here. Restoring replaces an empty "
+                "install and merges into an existing one; it never shortens an "
+                "active strict session or resets your clock settings."
+            ),
+        )
+        self.restore_row = Adw.ActionRow(
+            title="Restore from an export",
+            subtitle="Choose a .stayproductive.zip archive",
+        )
+        self.restore_row.add_suffix(
+            w.button(
+                "Restore",
+                css="flat",
+                tooltip="Restore profiles, settings, and commitments",
+                on_click=lambda _button: self._restore(),
+            )
+        )
+        backup.add(self.restore_row)
+        self.page.add(backup)
+
+        reset = Adw.PreferencesGroup(
+            title="Reset",
+            description=(
+                "Start over on this device. An active strict session blocks "
+                "this action until it ends; ended commitments are kept as "
+                "history. Export first if you may want the data again."
+            ),
+        )
+        self.reset_row = Adw.ActionRow(
+            title="Reset all data",
+            subtitle="Delete profiles, schedules, rules, quick blocks, and usage history",
+        )
+        self.reset_row.add_suffix(
+            w.button(
+                "Reset…",
+                css="destructive-action",
+                tooltip="Delete local rules and history",
+                on_click=lambda _button: self._confirm_reset(),
+            )
+        )
+        reset.add(self.reset_row)
+        self.page.add(reset)
+
+        background = Adw.PreferencesGroup(
+            title="Background service",
+            description=(
+                "Blocking is enforced by a local daemon, not by this window. "
+                "Closing StayProductive keeps it running; autostart restores it "
+                "after you log in."
+            ),
+        )
+        self.autostart_row = Adw.SwitchRow(
+            title="Start at login",
+            subtitle="Checking the systemd user service…",
+        )
+        self.autostart_row.connect("notify::active", self._on_autostart_changed)
+        background.add(self.autostart_row)
+
+        self.service_status_row = Adw.ActionRow(
+            title="Daemon independence",
+            subtitle=(
+                "The daemon keeps schedules and blocks running with no window "
+                "open. Stop it with: systemctl --user stop stayproductive.service"
+            ),
+        )
+        self.service_status_row.set_use_markup(False)
+        self.service_status_pill = w.status_pill("Independent", "active")
+        self.service_status_row.add_suffix(self.service_status_pill)
+        background.add(self.service_status_row)
+        self.page.add(background)
 
         integration = Adw.PreferencesGroup(
             title="Desktop integration",
@@ -172,6 +212,37 @@ class SettingsPage:
         integration.add(self.extension_note)
         self.page.add(integration)
 
+        help_group = Adw.PreferencesGroup(
+            title="Help",
+            description="Revisit the setup steps at any time. Nothing is reset.",
+        )
+        onboarding_row = Adw.ActionRow(
+            title="Run onboarding again",
+            subtitle=(
+                "Review the purpose, choose another goal, and create a starter "
+                "profile. Existing profiles and commitments are left alone."
+            ),
+        )
+        onboarding_row.add_suffix(
+            w.button(
+                "Start",
+                css="flat",
+                tooltip="Open the first-run wizard again",
+                on_click=lambda _button: self.window.show_onboarding(first_run=False),
+            )
+        )
+        help_group.add(onboarding_row)
+        help_group.add(
+            Adw.ActionRow(
+                title="Not a parental-control tool",
+                subtitle=(
+                    "You decide every rule. There is no account, purchase, "
+                    "telemetry, or hidden exit."
+                ),
+            )
+        )
+        self.page.add(help_group)
+
         about = Adw.PreferencesGroup(title="About")
         version = Adw.ActionRow(
             title="StayProductive",
@@ -220,18 +291,84 @@ class SettingsPage:
             "active" if active else "warning",
         )
         self.policy_row.set_subtitle(enforcement.get("policy_path", "—"))
-        self._refresh_extension(active)
+        self._refresh_extension(active, enforcement.get("adapter"))
+        self._maybe_refresh_service(snapshot.get("state_path", ""))
 
-    def _refresh_extension(self, enforcement_active: bool) -> None:
-        installed = (_extension_target() / "metadata.json").is_file()
-        enabled = self._extension_enabled() if installed else False
+    def _maybe_refresh_service(self, state_path: str) -> None:
+        if self._service_refreshed and self._service_state_path == state_path:
+            return
+        self._service_state_path = state_path
+        self._service_refreshed = True
+        self._refresh_service(state_path)
 
-        if not _is_gnome():
-            self.extension_row.set_subtitle(
-                "This session is not GNOME. The extension is not used here, and "
-                "no other desktop adapter is installed in this build."
+    def _refresh_service(self, state_path: str) -> None:
+        state = service.service_state(state_path or None)
+        self._updating_autostart = True
+        self.autostart_row.set_active(state == "enabled")
+        self._updating_autostart = False
+        if state == "unavailable":
+            self.autostart_row.set_sensitive(False)
+            self.autostart_row.set_subtitle(
+                "systemd user services are not available in this session. The "
+                "daemon still runs independently of this window."
             )
-            self.extension_button.set_label("Unavailable")
+        elif state == "custom-state":
+            self.autostart_row.set_sensitive(False)
+            self.autostart_row.set_subtitle(
+                "Autostart is only offered for the default data file. This "
+                "session uses a custom one."
+            )
+        elif state == "enabled":
+            self.autostart_row.set_sensitive(True)
+            self.autostart_row.set_subtitle(
+                "On · systemd starts the daemon at login and restarts it if it "
+                "is killed."
+            )
+        else:
+            self.autostart_row.set_sensitive(True)
+            self.autostart_row.set_subtitle(
+                "Off · the daemon runs for this session; enabling this keeps it "
+                "after you log out."
+            )
+
+    def _on_autostart_changed(self, row: Adw.SwitchRow, _pspec) -> None:
+        if self._updating_autostart:
+            return
+        state_path = self.window.snapshot.get("state_path", "")
+        try:
+            if row.get_active():
+                service.enable(self.window.engine, state_path or None)
+                self.window.toast("Autostart enabled · the daemon starts at login")
+            else:
+                service.disable()
+                self.window.toast(
+                    "Autostart disabled · blocking continues until you log out"
+                )
+        except service.ServiceError as error:
+            self.window.show_error("Could not change autostart", str(error))
+        self._service_refreshed = False
+        self._refresh_service(state_path)
+        self.window.refresh()
+
+    def _refresh_extension(
+        self, enforcement_active: bool, adapter: str | None = None
+    ) -> None:
+        installed = desktop.extension_installed()
+        enabled = desktop.extension_enabled() if installed else False
+
+        if not desktop.is_gnome():
+            if enforcement_active and adapter == "x11":
+                self.extension_row.set_subtitle(
+                    "Not used in this session. The daemon's X11 adapter is "
+                    "enforcing app blocks now."
+                )
+                self.extension_button.set_label("Not needed")
+            else:
+                self.extension_row.set_subtitle(
+                    "This session is not GNOME. The extension is not used here; "
+                    "the daemon uses the X11 adapter when a display is available."
+                )
+                self.extension_button.set_label("Unavailable")
             self.extension_button.set_sensitive(False)
             return
 
@@ -260,15 +397,7 @@ class SettingsPage:
             self.extension_button.set_label("Reinstall")
 
     def _extension_enabled(self) -> bool:
-        if not _is_gnome():
-            return False
-        try:
-            shell = Gio.Settings.new(GNOME_SHELL_SCHEMA)
-            if shell.get_boolean("disable-user-extensions"):
-                return False
-            return GNOME_EXTENSION_UUID in shell.get_strv("enabled-extensions")
-        except Exception:  # noqa: BLE001 - schema or dconf can be unavailable
-            return False
+        return desktop.extension_enabled()
 
     def _set_pill(self, pill: Gtk.Label, text: str, kind: str) -> None:
         for value in ("active", "warning", "neutral", "accent", "idle"):
@@ -277,36 +406,21 @@ class SettingsPage:
         pill.set_label(text.upper())
 
     def _install_or_enable_extension(self) -> None:
-        source = _extension_source()
-        if source is None:
-            self.window.show_error(
-                "Extension files are missing",
-                "This build does not contain the GNOME integration files. "
-                "Reinstall StayProductive or point the package at "
-                "integrations/gnome/stayproductive@hassanraza.ai.",
-            )
-            return
-
-        target = _extension_target()
-        installed = (target / "metadata.json").is_file()
-        enabled = self._extension_enabled() if installed else False
         try:
-            target.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(source, target, dirs_exist_ok=True)
-        except OSError as error:
-            self.window.show_error("Could not install the extension", error)
+            desktop.copy_extension()
+        except desktop.DesktopError as error:
+            heading = (
+                "Extension files are missing"
+                if desktop.extension_source() is None
+                else "Could not install the extension"
+            )
+            self.window.show_error(heading, str(error))
             return
 
-        if not enabled:
+        if not desktop.extension_enabled():
             try:
-                shell = Gio.Settings.new(GNOME_SHELL_SCHEMA)
-                if shell.get_boolean("disable-user-extensions"):
-                    raise RuntimeError("user extensions are disabled by policy")
-                enabled_extensions = shell.get_strv("enabled-extensions")
-                if GNOME_EXTENSION_UUID not in enabled_extensions:
-                    enabled_extensions.append(GNOME_EXTENSION_UUID)
-                    shell.set_strv("enabled-extensions", enabled_extensions)
-            except Exception as error:  # noqa: BLE001
+                desktop.enable_extension()
+            except desktop.DesktopError as error:
                 self.window.show_error(
                     "Extension installed; enable it manually",
                     "Open Extensions or run: gnome-extensions enable "
@@ -349,6 +463,30 @@ class SettingsPage:
             display.get_clipboard().set(path)
             self.window.toast("Data path copied")
 
+    def _confirm_reset(self) -> None:
+        w.confirm(
+            self.window,
+            "Reset all data?",
+            "This deletes every profile, schedule, rule, quick block, and usage "
+            "record. Settings return to their defaults. An active strict session "
+            "refuses the reset, and ended commitments stay in history. There is "
+            "no undo, so export first if you want a copy.",
+            "Reset everything",
+            self._reset_all,
+            destructive=True,
+        )
+
+    def _reset_all(self) -> None:
+        try:
+            result = self.window.engine.reset_all()
+        except Exception as error:  # noqa: BLE001
+            self.window.show_error("Could not reset data", error_text(error))
+            return
+        removed = result.get("removed", {})
+        count = sum(int(removed.get(key, 0) or 0) for key in removed)
+        self.window.refresh()
+        self.window.toast(f"Reset {count} local records")
+
     def _open_folder(self) -> None:
         path = self.window.snapshot.get("state_path")
         if not path:
@@ -360,3 +498,40 @@ class SettingsPage:
             )
         except Exception as error:  # noqa: BLE001
             self.window.show_error("Could not open the data folder", error_text(error))
+
+    def _restore(self) -> None:
+        dialog = Gtk.FileDialog(title="Restore from an export")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        archive = Gtk.FileFilter()
+        archive.set_name("StayProductive export")
+        archive.add_pattern("*.zip")
+        filters.append(archive)
+        dialog.set_filters(filters)
+        dialog.open(self.window, None, self._restore_chosen, None)
+
+    def _restore_chosen(self, dialog: Gtk.FileDialog, result, _data) -> None:
+        try:
+            file = dialog.open_finish(result)
+        except GLib.Error:
+            return  # the user closed the picker
+        path = file.get_path() if file is not None else None
+        if not path:
+            return
+        try:
+            restored = self.window.engine.import_data(path)
+        except Exception as error:  # noqa: BLE001
+            self.window.show_error("Could not restore the export", error_text(error))
+            return
+        self.window.refresh()
+        lines = [f"Profiles added: {restored.get('profiles_added', 0)}"]
+        skipped = restored.get("profiles_skipped", 0)
+        if skipped:
+            lines.append(f"Profiles skipped (already present): {skipped}")
+        lines.append(f"Commitments restored: {restored.get('commitments_added', 0)}")
+        if restored.get("commitments_skipped"):
+            lines.append(
+                "Commitments skipped: an active session already protects this install."
+            )
+        if not restored.get("usage_imported"):
+            lines.append("Usage history is not re-imported; it stays in the archive.")
+        w.alert(self.window, "Restore complete", "\n".join(lines))

@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .engine import EngineError
 
+_APP_NAMES: dict[str, str] | None = None
+
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 ACTIVATION_LABELS = {
     "manual": "Manual",
@@ -39,6 +41,28 @@ def parse_time(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def app_name(key: str) -> str:
+    """A human display name for an application rule key.
+
+    Profiles identify apps by a stable key; normal users should see the desktop
+    name in stats. The map is built once and accepts the desktop id, the rule
+    key, and their trailing component so aliases resolve.
+    """
+
+    global _APP_NAMES
+    if _APP_NAMES is None:
+        from .apps import installed_apps
+
+        names: dict[str, str] = {}
+        for app in installed_apps():
+            names[app.key.lower()] = app.name
+            names[app.desktop_id.lower()] = app.name
+            tail = app.desktop_id.rsplit(".", 1)[-1]
+            names.setdefault(tail.lower(), app.name)
+        _APP_NAMES = names
+    return _APP_NAMES.get(key.lower(), key)
 
 
 def timezone_for(name: str) -> ZoneInfo:
@@ -100,6 +124,16 @@ def countdown(seconds: int) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{seconds:02d}"
     return f"{minutes}:{seconds:02d}"
+
+
+def duration_text(seconds: int) -> str:
+    minutes = max(0, int(seconds)) // 60
+    if minutes < 1:
+        return "less than a minute"
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} h {minutes:02d} min" if minutes else f"{hours} h"
+    return f"{minutes} min"
 
 
 def schedule_summary(schedule: dict | None) -> str:

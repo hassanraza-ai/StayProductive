@@ -1,10 +1,11 @@
 # Core engine implementation notes
 
-Status: **M0 core implemented; runnable local UI and state service.** The pure
-engine, scheduler, period calculator, usage ledger, and domain model live in
-`crates/core`. `crates/daemon` owns state and persists it atomically as JSON.
-`crates/ui` is a GTK 4 + libadwaita front end. Desktop adapters, SQLite, and
-D-Bus are not implemented yet; those are tracked in the parity matrix.
+Status: **M0 core implemented; runnable local UI and autonomous state service.**
+The pure engine, scheduler, period calculator, usage ledger, and domain model
+live in `crates/core`. `crates/daemon` owns state, persists it in SQLite, and
+runs behind a same-user Unix socket under a systemd user unit. `crates/ui` is a
+GTK 4 + libadwaita front end. Desktop adapters beyond GNOME and D-Bus are not
+implemented yet; those are tracked in the parity matrix.
 
 These notes record decisions the existing specs left implicit. Anything marked
 **TODO(spec)** is deliberately unfinished and must not be read as implemented.
@@ -25,7 +26,9 @@ These notes record decisions the existing specs left implicit. Anything marked
 
 Unit tests additionally cover DST day lengths, the local-date period
 calculator, schedule gap/merge behaviour, keyword folding, and ledger
-attribution. The suite currently has 32 acceptance tests.
+attribution. The suite currently has 32 acceptance tests. The UI test suite
+(`crates/ui/tests`) adds display-free tests for application discovery, onboarding
+(`A-UX-01`), the socket client, and the systemd unit (`F-PLAT-01`).
 
 ## Decisions made in code
 
@@ -82,41 +85,296 @@ profile's targets. The next decision after the limit is reached reports
 ### Local state service
 
 `crates/daemon` is the first implementation of the daemon boundary. It owns the
-only mutable `State`, exposes one command per line of JSON on stdin, and writes
-one response per line on stdout. The greeting is
-`{"event":"ready","state_path":...}`; every request carries an `id`, so a caller
-can match replies. The UI starts the process, waits for the greeting, and sends
-`shutdown` on exit.
+only mutable `State` and speaks one JSON request/response per line. The greeting
+is `{"event":"ready","state_path":...}`; every request carries an `id`, so a
+caller can match replies.
 
-Persistence is deliberately simpler than the target SQLite store:
+Two transports share that protocol:
 
-- `$STAYPRODUCTIVE_STATE`, then
-  `$XDG_DATA_HOME/stayproductive/state.json`, then
-  `$HOME/.local/share/stayproductive/state.json`;
-- `{"version":1,"state":{...}}` wrapper;
-- write to a sibling `json.tmp`, set mode `0600`, then rename over the target;
-- parent directory created and set to `0700` on Unix;
-- a newer or unreadable wrapper is renamed to `state.invalid-<timestamp>.json`
-  and a fresh state starts. This preserves the bytes but is not yet a user-facing
-  migration/repair flow, so it remains a TODO.
+- `--socket [PATH]` is the desktop transport. The daemon binds a same-user Unix
+  socket (mode `0600`, parent directory `0700`) at
+  `$XDG_RUNTIME_DIR/stayproductive/daemon.sock`, or at the path from
+  `--socket`/`$STAYPRODUCTIVE_SOCKET`. A non-default `$STAYPRODUCTIVE_STATE`
+  hashes to a distinct `daemon-<fnv1a64>.sock` so test and portable instances
+  never share the login daemon. A second instance detects the live socket and
+  exits successfully instead of taking over; a stale socket file is removed.
+- stdio (the default) remains for the protocol tests and one-shot tooling. Each
+  process exits with its input.
+
+The UI connects to the socket and never owns the daemon's lifetime: closing or
+killing the window leaves enforcement running, and relaunching reconnects to the
+same process. If no daemon is reachable, the UI starts `stayproductive.service`
+through systemd when that is manageable, otherwise it spawns a detached session
+(`start_new_session=True`) and logs to `<state dir>/daemon.log`. Explicit stop is
+`systemctl --user stop stayproductive.service` or a `shutdown` request; the
+daemon removes its socket on exit.
+
+### Persistence and migrations (`F-DATA-01`)
+
+`state.db` lives beside the historical `state.json`, under
+`$XDG_DATA_HOME/stayproductive` unless `$STAYPRODUCTIVE_STATE` points at a
+different file. `$STAYPRODUCTIVE_DB` can override the database path for tests
+and portable instances. The database runs in WAL mode with `synchronous=FULL`
+and foreign keys on; the file is `0600` and its directory `0700` on Unix.
+
+Schema 1 has `schema_version`, `settings`, `profiles`, `rules`, `schedules`,
+`commitments`, `quick_blocks`, `extensions`, `usage_events`, `usage_launches`,
+`usage_pickups`, `usage_blocks`, `usage_meta`, `meta`, and `audit_log`.
+Profiles and commitments are stored as their serialized domain value so a round
+trip cannot drop a field. `rules`, `schedules`, and the usage tables are written
+in the same transaction as projections; the engine still reads the serialized
+value. The separate `challenges`, `saved_qr`, `pauses`, `breaks`, and
+`usage_hourly` tables from the target schema are not created until the features
+that fill them exist. A clean-shutdown `state.json` recovery snapshot is also
+still missing; the database is the only persisted copy.
+
+Every save deletes and rewrites the projections in one transaction, so a
+constraint failure leaves the previous state intact. Migrations are
+forward-only. Before an upgrade the database file is copied to
+`state.v<old>-<timestamp>.backup`; a database whose `schema_version` is newer
+than the build is refused rather than opened with unknown columns, and the
+daemon exits instead of starting empty.
+
+The previous build wrote `{"version":1,"state":{...}}` to `state.json`. On the
+first SQLite start the daemon imports it in the same transaction that creates
+the schema, records the step in `audit_log`, and renames the JSON to
+`state.migrated-<timestamp>.json` so it can never be imported twice. An
+unreadable legacy file is left in place for manual recovery and a fresh state
+starts.
 
 The service has no network listener, no root privileges, and no D-Bus name yet.
 Those belong to M1. Keeping the transport narrow makes the transition to D-Bus a
 replacement rather than a rewrite of the decision path.
 
+### Data export and deletion
+
+`export_data` writes a versioned archive to
+`<state dir>/exports/stayproductive-export-YYYYMMDD-HHMMSS.stayproductive.zip`
+or to a `path` the caller supplies. The zip uses stored (uncompressed) entries
+and a fixed header date, so the same state and clock produce the same bytes, and
+the daemon needs no compression dependency. Entries follow
+`docs/spec/domain-model.md` §13: `manifest.json` (`format`, `version`,
+`exported_at`, `app_version`, `usage_included`), `profiles.json` (profiles with
+rules and schedules, the manual activation, quick blocks, and schedule
+extensions), `settings.json`, `commitments.json`, and — when the user keeps the
+default — `usage/YYYY-MM.json`, one file per month with foreground intervals,
+launches, pickups, and block reasons. The open foreground interval is exported
+with `end = now`, because dropping it would hide the session in progress. History
+is opt-in for callers (`include_usage:false`); the UI exports it by default
+because the user is asking for a copy of their data.
+
+`delete_history` requires `confirm:true`. It resets the usage ledger — closed and
+open intervals, launches, pickups, block records, and the last heartbeat — and
+persists the empty ledger, while profiles, schedules, quick blocks, settings, and
+commitments are untouched: deleting history never weakens an active block or
+ends a strict session. Both commands are also available from the Stats page,
+which states the scope in the confirmation and keeps no copy.
+
+An export is a privacy feature, so it is written with mode `0600` like the state
+file. The archive is not encrypted and has no signature; encrypting it is left to
+the user's filesystem or archive tool.
+
+`import_data` accepts the path of such an archive and validates the manifest
+before touching anything: an unknown `format`, a version newer than this build,
+a non-zip file, a compressed entry, or a bad checksum is refused with a message
+and no state change. On an empty state it restores profiles with their rules and
+schedules, the manual activation, quick blocks, schedule extensions, clock
+settings, and commitments — the `A-UX-12` clean-install case. On a state that
+already has profiles or commitments it merges additively: a profile whose id or
+name is already present is skipped, clock settings and quick blocks are left
+alone, and imported commitments are only added when no commitment is enforcing
+right now. An import can therefore add strict time but can never shorten or
+remove an active session. An active commitment also blocks imports, like any
+other rule edit.
+
+Usage history is **not** re-imported. The monthly files are validated for
+structure, but `UsageLedger` has no restore path for launches and pickups yet, and
+a silently partial history would be misleading. The response reports
+`usage_imported:false` and the UI says so after a restore. `F-UX-12` therefore
+stays `wip` until counters can be restored too.
+
+### IPC versioning and full reset (`F-DATA-03`, `F-DATA-04`)
+
+The socket envelope carries `schema_version` on requests and `protocol_version`
+on the greeting and every reply. Version 1 is the current shape. The daemon
+accepts older peers that omit the field, refuses a strictly newer version with a
+message that names both versions and states that blocking continues, and echoes
+the refused request's id. Refusing happens before any state mutation, so a
+mismatched client cannot weaken an active block. The Python client attaches the
+field to every request and raises an `EngineError` with an update instruction if
+a greeting or reply reports a newer version; it does not close the socket on the
+reply path, because the daemon behind it is still enforcing. `A-DATA-03` is
+proven by driving the real binary: an active site block still returns `R-SITE`
+after a version-99 refusal, while version-1 and version-less snapshots succeed.
+
+`reset_all` is a separate, destructive command with the same explicit
+`confirm:true` gate as `delete_history`. It clears profiles, their schedules and
+rules, the manual activation, quick blocks, schedule extensions, the entire usage
+ledger, and restores the default clock settings (midnight, system timezone).
+Commitments are **excluded**: an active commitment refuses the reset through the
+same `edits_blocked` check that guards rule edits, and ended commitments are
+carried across as history. The operation builds a fresh `State` in memory and
+persists it through the normal transaction, so a restart sees the clean state.
+The Settings page places the action behind a destructive confirmation that says
+what is deleted and when the action is refused. The daemon protocol tests cover
+the confirmation gate, the commitment refusal, the cleared counts and settings,
+and restart durability.
+
+These two rows are `done`, but the reset does not remove the onboarding marker or
+browser host registrations: those live outside the app state, so the wizard does
+not reappear and the native host stays installed. That is deliberate — a reset of
+app data should not silently change browser permissions. Export first if any of
+it matters; there is no undo.
+
+### Usage tracking
+
+Each adapter heartbeat is also a foreground observer. Besides the liveness
+fields it carries `focus` (normalized app ids of the focused window, or `null`)
+and `focus_since` (when that window became foreground). The GNOME extension and
+the X11 adapter report the same shape; when both are fresh the extension wins
+because an X11 GNOME session hands enforcement to it. On every command, and on
+the daemon's own five-second pulse, the newest observer feeds the core
+`UsageLedger`:
+
+- a fresh heartbeat with an attributable focus opens or continues a foreground
+  interval for the profile's own app key (both trailing-component alias
+  directions are matched, `org.mozilla.firefox` ↔ `firefox`);
+- a stale or missing heartbeat, a block overlay (`blocked: true`), or
+  `focus: null` closes the open interval: no usage accrues without an observer
+  or behind a block screen;
+- an interval never starts before the last observation, so time the daemon
+  already closed (a finished block, a lost observer) cannot be re-attributed
+  from an older `focus_since`. With no prior observation the observer's
+  `focus_since` is trusted;
+- only apps a profile rules over are tracked. Unconfigured apps produce no
+  intervals, which keeps the ledger bounded and the observation minimal.
+
+Sampling follows the UI's five-second poll and the daemon's own five-second
+pulse when no client is attached, so usage keeps accruing while the GTK window
+is closed. It is under-counted by at most one sampling interval and never
+over-counted; the engine additionally counts the open interval up to `now`, so
+a limit decision at the boundary does not lag. The ledger's in-memory event log
+is capped (`EVENT_LOG_CAP`) and not persisted; intervals, launches, pickups,
+blocks, and the last heartbeat are.
+
+Because the ledger feeds `decide`, daily and hourly application limits now
+produce real policy entries (`R-LIMIT-DAILY`/`R-LIMIT-HOURLY`) once usage
+reaches the limit. Blocks that newly engage are recorded in the usage history
+with their reason and end time; the first policy after a daemon start only
+seeds the comparison so a restart does not duplicate records. The snapshot
+exposes `usage_today` (seconds per app for the current logical day), which the
+Stats page and the dashboard render.
+
 After every successful command the service also publishes
 `enforcement.json` beside the state file. It contains only applications the
 engine would block at that instant: the app key, `R-*` reason, optional end
 time, profile name, and a `valid_until` 30 seconds in the future. The file is
-atomic and mode `0600`. Expiry is intentional: if the app stops refreshing the
-policy, a consumer must stop enforcing rather than preserve a stale block.
+atomic and mode `0600`. Expiry is intentional: if the daemon stops refreshing
+the policy, a consumer must stop enforcing rather than preserve a stale block.
 
-The service reports enforcement as `active` only while
-`$XDG_RUNTIME_DIR/stayproductive/gnome-extension.json` says `active:true` and
-`policy_loaded:true`, and has a `checked_at` no more than five seconds old. The
-extension writes that heartbeat every two seconds. Without a fresh heartbeat the snapshot says
-`unavailable` and names the missing adapter. This keeps “active” an observation,
-not a configuration claim.
+In socket mode the daemon refreshes that policy itself every five seconds, not
+only after a client command. Schedule starts, ends, and committed blocks
+therefore keep working with no window open.
+
+The service reports enforcement as `active` only from a fresh adapter
+heartbeat under `$XDG_RUNTIME_DIR/stayproductive/`. It reads
+`x11-adapter.json` first and then `gnome-extension.json`; the file must declare
+the expected `adapter`, say `active:true` and `policy_loaded:true`, and have a
+`checked_at` no more than five seconds old. The X11 entry wins so an X11 session
+reports the adapter that is actually operating. Without a fresh heartbeat the
+snapshot says `unavailable` and names the adapter expected for the session. This
+keeps “active” an observation, not a configuration claim.
+
+### Statistics (`F-STA-02`, `F-STA-03`, `F-STA-05`, `F-STA-07`)
+
+The snapshot carries `stats.today`, `stats.week`, and `stats.month`. Each range
+has its half-open `start`/`end`, total foreground `seconds`, `blocks`, `pickups`,
+`launches`, and a ranked `apps` list. The range boundaries use the same
+start-of-day and IANA timezone as the engine: weeks start on Monday, months on
+the first local day, and a clock change can make a week 167 or 169 hours long.
+The per-app `previous_seconds` comes from the immediately preceding period of
+equal length, so the UI can show a trend without a separate report.
+
+`UsageLedger::usage_ranking` orders by duration and breaks ties by application
+key, so the ranking does not jump between polls when two apps are equal. The
+range total is the sum of the per-app integer seconds, which keeps the headline
+and the rows consistent at sub-second boundaries.
+
+The GTK **Stats** page replaces the old Activity page. It offers Today / Week /
+Month, four summary metrics, the ranked apps with share and trend, active quick
+blocks, block history (target, `R-*` reason, timestamp, no window titles), and
+the export/delete controls. The dashboard shows today's total, block count, and
+top three distractions with a link to Stats.
+
+Limits: there is no timeline chart or per-hour/per-day bar (`F-STA-04`), and the
+seven-day report is the week range with a trend rather than a separate printable
+report (`F-STA-06` stays `wip`). Site usage is not recorded because no adapter
+reports site intervals. The X11 heartbeat includes `locked`. The daemon records
+one pickup when that bit falls, and a reached limit is an `R-PICKUP` policy
+entry (`F-STA-05`, `F-LIM-04`). The GNOME extension does not send `locked` yet,
+so a GNOME-only session still records no pickups.
+Evidence: the core acceptance tests cover range boundaries, DST-length weeks,
+ranking ties, and one launch per foreground entry; the daemon protocol test
+seeds a real state file and checks the computed snapshot; the Stats page is
+built in the accessibility test.
+
+### Daemon autonomy and autostart (`F-PLAT-01`)
+
+`crates/ui/stayproductive/service.py` owns the systemd user unit
+`stayproductive.service`:
+
+- `ExecStart="<daemon>" --socket`, `Restart=always`, `RestartSec=2`,
+  `NoNewPrivileges=yes`, `PassEnvironment=DISPLAY XAUTHORITY WAYLAND_DISPLAY
+  XDG_SESSION_TYPE`, `WantedBy=default.target`, and an explicit
+  `Documentation=` line;
+- `start()` writes the unit, reloads systemd, imports the graphical-session
+  variables into the user manager, and starts it for this session;
+- `enable()` is the autostart grant: it stops a directly spawned daemon first so
+  the unit wins the single-instance socket check, then `enable`s and `start`s;
+- `disable()` runs `systemctl --user disable` and leaves this session's daemon
+  running; blocking continues until logout or an explicit stop.
+
+Autostart is offered only when a systemd user manager answers and the session
+uses the default data file. `service_state()` reports `unavailable`,
+`custom-state`, `enabled`, `installed`, or `off`, and both Settings and the
+onboarding capability step render that state rather than assuming success.
+Nothing is enabled silently: the switch and the “Set up” button are explicit
+user actions.
+
+Settings → Background service also states that the daemon is independent of the
+window and names the stop command. `Engine.close()` only detaches;
+`Engine.shutdown_service()` is reserved for the systemd handover. Engine writes
+are not retried automatically, but `snapshot()` retries once after a connection
+failure so a daemon restart does not force the user to reopen the window.
+
+Evidence:
+
+- `crates/daemon/tests/protocol.rs` — socket privacy and mode, single instance,
+  stale-socket takeover avoidance, and a policy refreshed with no client.
+  `export_and_delete_usage_data` builds a real archive, parses its central
+  directory, checks the manifest, profile, settings, and monthly usage entries,
+  refuses an unconfirmed delete, and verifies the deletion survives a restart.
+  The zip was also opened with Python's `zipfile` (`testzip()` clean).
+  `a_clean_install_restores_an_export` drives export from one daemon into a
+  second clean daemon, checks the restored profile, clock settings, and active
+  strict session, rejects a non-archive with no state change, and proves the
+  restore persists; unit tests refuse a newer manifest version and keep the
+  longer commitment when merging into a used install.
+- `crates/ui/tests/test_engine.py` — round trip, disconnect on close, reconnect
+  after restart, mismatched state-file refusal, and the explicit
+  `include_usage`/`path`/`confirm` intent of export and delete.
+- `crates/ui/tests/test_service.py` — unit text, quoting, socket naming, service
+  states, and the systemd handover order.
+- Manual end-to-end under Xvfb: UI spawned a detached daemon; `SIGKILL`ing the
+  UI left it alive and the policy timestamp advanced; relaunching reused the same
+  daemon PID; an explicit shutdown removed process and socket.
+- Manual restart on a transient systemd unit: `kill -9` of `MainPID` produced a
+  new PID and the unit stayed active.
+
+Remaining limitation: the Settings toggle has not been exercised with a real
+`systemctl --user enable` against an installed unit; that needs a real login
+session. There is no D-Bus name yet, and the unit is not installed by any
+package manager.
 
 ### GNOME enforcement adapter
 
@@ -133,14 +391,17 @@ extension. It is a user-level extension, not a privileged component:
   stage, with the reason, blocked app title, end time, and local-only copy;
 - the overlay takes key focus and stops button/key events; switching to an
   allowed window hides it, and returning to the blocked window shows it again;
-- the heartbeat reports `policy_loaded`, `blocked`, and the Shell version. It
-  contains no window titles or per-app history.
+- the heartbeat reports `policy_loaded`, `blocked`, the Shell version, and the
+  focused app ids with `focus_since` for usage tracking. It contains no window
+  titles or per-app history.
 
-The extension only covers application windows. It cannot stop a process that
-runs in the background, cannot read browser tabs, and cannot enforce site,
-keyword, or usage-limit decisions. Those remain separate adapters. Because the
-policy is refreshed by the running app and expires after 30 seconds, closing
-StayProductive ends desktop enforcement; the daemon is not yet autonomous.
+The extension covers application windows and reports focus for application
+usage limits. It cannot stop a process that runs in the background, cannot read
+browser tabs, and cannot enforce site, keyword, site-limit, launch-limit, or
+pickup decisions. Those remain separate adapters. The socket daemon refreshes
+the policy independently, so closing the window no longer ends gentle
+enforcement or usage tracking; killing the daemon still stops it, and
+autostart/restart is the systemd unit described below.
 
 Extension loading, policy parsing, heartbeat writes, and expiry were checked
 in a headless GNOME Shell 49 session. The headless compositor has no seat, so
@@ -155,6 +416,200 @@ The Settings page copies the extension into
 `org.gnome.shell enabled-extensions`, and explains that a first-time install
 needs one log out / log in. It does not silently restart the Shell.
 
+### X11 enforcement adapter (`F-PLAT-02`)
+
+`crates/ui/stayproductive/x11_adapter.py` is a standalone process started and
+supervised by the daemon in an X11 session (`DISPLAY` set, no
+`WAYLAND_DISPLAY`, `XDG_SESSION_TYPE` not `wayland`). The
+`STAYPRODUCTIVE_X11_ADAPTER` environment variable is both an override and an
+adapter path; `0`/`off` disables the adapter. GTK 4 draws the overlay and a
+small `ctypes` libX11 binding (`x11.py`) performs window operations. There is no
+Python Xlib or libwnck dependency, so the adapter shares GTK 4 with the front
+end.
+
+- **Focus** — `_NET_ACTIVE_WINDOW`, falling back to `XGetInputFocus` plus a
+  `XQueryTree` walk to the toplevel when no EWMH window manager is present.
+- **Identity** — `WM_CLASS` name and class, `_GTK_APPLICATION_ID`,
+  `_GTK_APP_ID`, `_BAMF_DESKTOP_FILE_HINT`, `_NET_WM_DESKTOP_FILE`, and the
+  PID's `comm`, executable basename, and first `cmdline` basename. A rule key
+  is normalized (lower-case, `.desktop` removed) and the last dotted and
+  underscored component are added as aliases, matching the GNOME helper.
+- **Decision order** — `x11_policy.py` is display-free. `Planner` emits
+  `hide_window` then `show_overlay`; repeated focus is a no-op; switching to an
+  allowed window hides the overlay; Back focuses the previous allowed window
+  and then hides; a policy refresh updates the copy without re-hiding. When the
+  policy expires or disappears, `clear()` hides the overlay and maps/focuses
+  the blocked window so enforcement cannot leave a window unreachable. Dock,
+  panel, menu, notification, and other non-application window types are
+  ignored, and the last known block is kept while they have focus.
+- **Overlay** — one override-redirect GTK window per `Gdk.Monitor`, positioned
+  and raised through Xlib and given keyboard focus. Every monitor is covered;
+  the explanation card is only shown on the monitor that shares the most area
+  with the blocked window (`preferred_monitor`), and keyboard focus goes to
+  that window so the Back button is where the user is looking. A window with
+  no known geometry or one entirely off screen falls back to the first
+  monitor, so enforcement never weakens. The card names the app, the reason
+  from the `R-*` code, the end time, a Back action, and local-only copy. The
+  overlay is created before it is mapped so the window manager does not
+  decorate or reposition it.
+- **Lock and suspend** — `session.py` watches systemd-logind over the system
+  bus: `Manager.PrepareForSleep`, `Session.Lock`/`Unlock`, and a throttled
+  (two-second) `LockedHint` property read as a fallback when a signal is
+  missed. While locked or suspended the planner is paused: the overlay is
+  released so it never covers a lock screen or a security prompt, focus
+  changes are ignored so the lock screen cannot be mistaken for an allowed
+  application, and the blocked window stays hidden. Unlocking resumes the
+  planner, and the next focus event re-blocks the still-hidden window; a
+  policy that expired during the pause is cleared on resume, which restores
+  the window. Focus reporting is cleared too, so a locked or suspended session
+  never accrues app usage. When logind is unreachable the adapter reports
+  `session_aware:false` and keeps enforcing without pausing.
+- **Hide** — ICCCM `WM_CHANGE_STATE` `IconicState` when
+  `_NET_SUPPORTING_WM_CHECK` exists; a direct `XUnmapWindow` when there is no
+  window manager (headless/Xvfb).
+- **Heartbeat** — `$XDG_RUNTIME_DIR/stayproductive/x11-adapter.json` is written
+  after every action and at least once a second. It contains `adapter:"x11"`,
+  `active`, `policy_loaded`, `blocked`, `overlay_visible`, `blocks`, `focus`
+  (normalized aliases of the focused application window, empty behind the
+  overlay or while paused), `focus_since`, `monitors`, `card_monitor`,
+  `locked`, `suspended`, `session_aware`, `display`, and `checked_at`; no
+  window titles or per-app history are recorded.
+- **Supervision** — the daemon finds the launcher from an explicit
+  `STAYPRODUCTIVE_X11_ADAPTER`, `stayproductive-x11` on `PATH`, or the checkout
+  next to the binary, then starts it with `--state`, `--heartbeat`, and
+  `--parent-pid`. Output goes to
+  `$XDG_RUNTIME_DIR/stayproductive/x11-adapter.log`. Every second the daemon
+  polls the child, removes a dead adapter's heartbeat immediately so the
+  snapshot stops claiming enforcement, and restarts it after a two-second
+  backoff. The adapter also exits when its parent PID disappears. A fresh GNOME
+  extension heartbeat takes precedence and stops the X11 adapter; if the
+  extension goes stale the daemon starts the X11 adapter again.
+- **systemd** — the user unit passes `DISPLAY`, `XAUTHORITY`, `WAYLAND_DISPLAY`,
+  and `XDG_SESSION_TYPE` through `PassEnvironment`; `start()` and `enable()`
+  import the same variables into the systemd user manager first, so a unit
+  started before the desktop session still knows it can run the adapter.
+
+Evidence:
+
+- `crates/ui/tests/test_x11_policy.py` — aliases, policy expiry, hide/overlay
+  ordering, dedupe, re-block, allowed-window hide, and Back with and without a
+  previous window. `PreferredMonitorTest` covers single-monitor, left/right
+  monitor, spanning-window majority, off-screen and missing geometry, and no
+  monitors; `PlannerPauseTest` covers pause hiding the overlay, updates and
+  Back being ignored while paused, resume re-blocking the still-hidden window,
+  and a policy that expires during the pause being restored on resume;
+  `FocusReporterTest` covers the reported aliases, a stable `focus_since` for
+  an unchanged window, a restart on focus change, and no focus while blocked or
+  paused.
+- `crates/daemon/tests/protocol.rs::x11_focus_reports_feed_usage_limits` — an
+  X11 heartbeat is the only observer: reported focus crosses a daily limit,
+  produces `R-LIMIT-DAILY`, and stops accruing while the overlay is up.
+  `socket_service_tracks_usage_without_a_client` checks the same attribution
+  through the daemon's own five-second pulse.
+- `crates/daemon/tests/protocol.rs::socket_service_supervises_the_x11_adapter`
+  — a fake adapter writes a heartbeat, is `SIGKILL`ed, and is restarted; the
+  snapshot reports `active`/`x11`, and shutdown leaves no orphan.
+- `crates/ui/tests/test_x11_live.py` (opt in with
+  `STAYPRODUCTIVE_X11_LIVE=1`) — Xvfb end-to-end: a focused blocked window is
+  unmapped, switching to an allowed window lowers the block, refocusing
+  re-blocks and increments `blocks`, an expiring policy maps the window again,
+  and the heartbeat reports `monitors`, `card_monitor`, `locked`,
+  `suspended`, `session_aware`, `focus`, and `focus_since` (empty behind the
+  overlay, the allowed window otherwise).
+- Manual Xvfb end-to-end with the real daemon and real adapter: an active
+  profile produced the policy, the adapter blocked the focused window, and the
+  snapshot reported `active`/`x11`.
+
+Limitations: Xvfb has no window manager, so the measured run exercised the
+`XUnmapWindow` fallback rather than WM iconification, real decorations, or a
+compositor's focus rules. Xvfb also cannot present two RandR monitors to GDK,
+so the multi-monitor card choice is covered by display-free unit tests only;
+overlay pixels, the card position, and focus behaviour on a real multi-monitor
+X11 session still need a logged-in desktop. The logind wiring is exercised
+against the live system bus in the heartbeat (`session_aware`), but locking a
+real session to watch the release/resume handshake has not been done and is
+left to a manual check. When logind is unreachable the adapter keeps the
+block active and may cover a lock screen, which is the documented trade-off
+between enforcement and recovery. Dynamic workspaces and compositors that
+refuse override-redirect focus remain open (`A-PLAT-09`, `A-PLAT-10`).
+Autostart at login relies on the graphical session
+exporting `DISPLAY`/`XAUTHORITY` into the systemd user manager; importing them
+when autostart is enabled covers the current manager, but a session that never
+exports them will start the daemon without an adapter and report `unavailable`.
+The adapter covers application windows only; sites and keywords still need the
+browser extension. Launch limits are tracked from foreground entries. Pickup
+limits use the heartbeat `locked` bit, which the X11 adapter writes and the
+GNOME extension does not. Usage limits and the Stats totals are recorded per
+application.
+
+### Browser extension (`F-PLAT-08`, `F-RULE-02`, `F-RULE-03`, `F-CON-06`)
+
+`integrations/browser-extension` is a Manifest V3 companion for Chrome/Chromium,
+Brave, Edge, and Firefox. It is not a second rule engine: the extension asks the
+Rust daemon, and the daemon's answer is final. Two daemon commands serve it and
+both are pure reads (`browser_decision`, `browser_policy`), so neither writes a
+state file or counts as a rule edit under strict mode.
+
+**Layers.** `browser_policy` returns active-profile host blocks (with a
+`suffix` flag), quick site blocks, allowlist hosts, and keyword rules, plus
+`limitations: ["site_limits", "surface_rules"]`. `background.js` turns the host
+entries into dynamic `declarativeNetRequest` rules: allow rules at priority 20,
+block rules at 50, quick blocks at 90, main-frame blocks redirect to
+`blocked.html?reason=…&target=…`, and subframe blocks are dropped without a page.
+Rules refresh on install/startup, once a minute by alarm, and opportunistically
+at most every 30 s after a navigation. If the daemon is unreachable the last
+rules stay applied and the toolbar badge shows `!` — dropping them would weaken
+an active block, so the failure is visible instead.
+
+`content.js` sends every committed navigation and same-document URL change to
+`browser_decision` and, on a block, mounts an overlay with the daemon's reason,
+target, and end time in a **closed** shadow root. It never rewrites or replaces
+the address bar, so the user can see which site was blocked. The overlay has a
+Back button and a countdown; `lib/blockpage.js` is shared with the redirect page
+so both use the same wording.
+
+**Native host.** `native/stayproductive_native.py` speaks the browser's
+native-messaging framing: a 32-bit native-endian length followed by UTF-8 JSON.
+It accepts only `browser_policy` and `browser_decision`, forwards a fixed set of
+arguments to the existing Unix socket, and returns a JSON reply. It cannot read
+files, spawn processes, or open network connections for the extension. Frames
+over 1 MiB, malformed JSON, unknown commands, and non-object arguments end the
+port. It selects the same socket name as the UI client (`$XDG_RUNTIME_DIR` or
+`/tmp` fallback), and never writes URLs to disk. `install.py` writes the host
+manifest and the browser's `NativeMessagingHosts` entry per user (no root); for
+Chrome it requires the exact unpacked-extension ID in `allowed_origins`. Moving
+the repository changes an unpacked Chrome ID, so the installer must be rerun.
+
+**The keyword timing conflict (`A-RULE-03`).** `A-RULE-03` asks for a keyword
+block "before paint where observable". `declarativeNetRequest` matches URL
+patterns, not arbitrary substrings, and has no keyword filter, so a keyword can
+only be detected after the navigation commits. The content script replaces the
+page immediately, but a frame may paint first. This is a platform limitation,
+not an unfinished handler: the extension does not claim pre-paint keyword
+coverage, and the matrix records the scenario as partially met. Host rules do
+block before the request through DNR, which is the stronger guarantee available.
+
+**Privacy and limits.** URLs and titles exist only for the duration of one
+`browser_decision` call; the extension, host, and daemon do not persist them for
+that command. `storage.local` holds counts, the last check time, and a degraded
+message. Incognito windows are covered only if the user grants access. Site
+time limits and in-page surfaces (Shorts/Reels/Stories, adult filtering) are not
+implemented and are reported as limitations by `browser_policy`; the extension
+does not approximate them. A user who disables the extension, edits its files,
+or uses a browser without it is not blocked. Strict-mode tamper resistance stays
+with the daemon's commitments, as `docs/legal/clean-room.md` and the threat model
+require.
+
+**Evidence.** Node tests cover host matching, priorities, redirect parameters,
+subframe blocking, and block-page text. Python tests cover framing, the command
+allowlist, malformed/oversized frames, socket parity, and the installer in a
+temporary `HOME`. The daemon protocol suite covers `browser_decision` and
+`browser_policy` against the real binary. A live Chrome 157 run under a
+throwaway `/tmp/opencode` profile loaded the unpacked extension, connected the
+native host, applied dynamic rules, redirected `bad.example.com` with
+`reason=R-SITE`, and overlaid a keyword page without changing its URL. Firefox
+is manifest-reviewed only; it has not been loaded.
+
 ### GTK frontend
 
 `crates/ui` is GTK 4 + libadwaita through PyGObject. It contains no blocking
@@ -162,7 +617,8 @@ decision logic; every mutation is a command to the service, and every screen is
 rendered from the returned snapshot. Pages:
 
 - **Dashboard** — active profiles, next boundary, rule count, commitment,
-  honest enforcement state, quick block form, recent decisions.
+  honest enforcement state, today's screen time with the top three
+  distractions, quick block form, and recent decisions.
 - **Profiles** — CRUD, manual activation, pause/resume, delete confirmation,
   and three newly written starter profiles (Work hours, Evening wind-down,
   Deep work).
@@ -174,15 +630,88 @@ rendered from the returned snapshot. Pages:
 - **Schedules** — schedule summary and active/waiting/next-start state.
 - **Strict session** — start, visible commitment, request early exit, cool-down
   countdown, and end when the cool-down is ready.
-- **Activity** — active quick blocks and recorded block decisions.
+- **Stats** — Today / Week / Month totals, ranked top distractions with share
+  and trend, active quick blocks, recorded block decisions, and export/delete.
 - **Settings** — start of day, IANA timezone, desktop integration install and
-  status, policy path, capability status, data path, copy path, open folder, and
-  About dialog.
+  status, policy path, capability status, data path, copy path, open folder, a
+  Help group that re-runs onboarding, and About dialog.
 
 The front end refreshes from the service every five seconds and after each
-mutation. It shows “Enforcement active” only when the extension heartbeat is
-fresh and reports a loaded policy; otherwise it shows “Enforcement offline” and
-explains how to install or load the adapter.
+mutation. It shows “Enforcement active” only when an adapter heartbeat is fresh
+and reports a loaded policy; otherwise it shows “Enforcement offline” and
+explains which adapter is missing. The sidebar and enforcement card name the
+reporting adapter (X11 or GNOME).
+
+### Keyboard navigation and screen readers (`F-UX-10`)
+
+Every control is built so a keyboard and a screen reader can reach it, and GTK's
+focus order follows the visual order:
+
+- `widgets.accessible()` sets `Gtk.AccessibleProperty.LABEL`/`DESCRIPTION`
+  explicitly. `widgets.button()` derives an icon-only button's name from its
+  tooltip and **raises** when neither a tooltip nor `accessible_label` is given,
+  so an unlabelled icon fails at construction instead of shipping. Text+icon
+  buttons use a custom child, where GTK cannot derive a name either, so they set
+  one too.
+- Sidebar rows carry the page title as their accessible name and the page's
+  purpose as the description, and the nav icon is `PRESENTATION`. Selecting a
+  row is what switches pages, so arrow keys move between pages directly.
+- The enforcement dot is a decorative `●` label marked `PRESENTATION`; the
+  adjacent text ("Enforcement active/offline") carries the meaning.
+- `Gtk.MenuButton` is not focusable by default in GTK 4, so the main menu and
+  every compact overflow menu opt back into the tab chain.
+- Window actions live in a `nav` action group: `<Control>1`…`<Control>6` switch
+  pages in sidebar order, `<Control>n` creates a profile, `<Control>question`
+  opens the shortcut list (also in the main menu). The help text is generated
+  from the same `SHORTCUTS` table that documents the bindings.
+- With `gtk-enable-animations` off, the page transition duration is zero, so
+  reduced motion is honoured without a second setting.
+
+Evidence: `crates/ui/tests/test_accessibility.py` starts its own Xvfb, builds
+the real `MainWindow`, profile editor, and onboarding dialog against a fake
+engine, and walks the widget tree. It asserts every control we place has an
+explicit or native accessible label and is focusable, that all six sidebar rows
+are labelled and described, that the accelerators match the sidebar order and
+actually switch the stack, that the status dot stays `PRESENTATION`, and that
+reduced motion removes the transition. Standard controls that GTK builds inside
+itself (spin buttons, an entry row's apply button, menu-button internals,
+drop-down arrows) are named by GTK and are excluded from the audit.
+
+Limits: this checks GTK's accessible properties and the action wiring, not a
+running screen reader. No Orca run, real Tab/Space key injection, or
+high-contrast theme check was performed here; those remain manual verification.
+Chart text summaries are still pending with the Week/Month statistics views
+(`F-STA-02`, `F-STA-03`).
+
+### First-run onboarding
+
+`crates/ui/stayproductive/onboarding.py` implements `F-UX-01` as an
+`Adw.Dialog` with five steps: welcome and purpose, goal, capabilities, review,
+and done. Goal logic is pure: `Goal` definitions, alias-based app matching,
+`apps_for_goal`, and `starter_profile` are testable without a display.
+
+- Goals preselect at most `MAX_STARTER_APPS` (6) installed applications in hint
+  order. The selection is editable in step 4; applications are shown by display
+  name and raw IDs stay out of the main flow.
+- Step 3 lists foreground app visibility (with the real adapter state), offers
+  “Set up” for autostart when systemd can manage it, and continues to name
+  notifications and the DNS helper as unavailable. Autostart is only enabled by
+  that explicit button; nothing is granted by clicking through the wizard.
+- `StarterProfileCreator` creates at most one profile per wizard run and writes
+  `onboarding.json` next to `state.json` only after the daemon accepts the
+  profile. A rejected create leaves the guard open so the user can fix the name
+  and retry.
+- The wizard auto-opens only when there is no commitment, no profile, and no
+  marker. Settings → Help re-runs it without resetting anything.
+- The dashboard's missing-enforcement banner has a session-scoped dismiss
+  button, as `ux-flows.md` §2 requires; the banner returns next launch.
+
+Known limits: notifications and the DNS helper cannot be granted from the
+capability step because those integrations do not exist yet, so `F-UX-01` stays
+`wip`. Autostart is real, but it is offered only for the default data file and a
+running systemd user manager. The wizard's GTK flow is smoke-tested under Xvfb
+(construction, step navigation, app add/remove, profile creation), but not
+automated in CI as a UI test.
 
 ### Strict commitments and cool-down
 
@@ -215,18 +744,56 @@ Known gaps in this first strict implementation:
   editable by the same local user; permissions keep out other accounts, not the
   owner. Package removal or root access ends every commitment.
 
-`crates/daemon/tests/protocol.rs` drives the real service binary over stdio. It
-covers locked profile mutations, rejected pause, refused early finish, restart
-persistence, and the private state-file mode.
+`crates/daemon/tests/protocol.rs` drives the real service binary over stdio and
+over the Unix socket. It covers locked profile mutations, rejected pause, refused
+early finish, restart persistence, the private state-file mode, socket privacy
+and single-instance behaviour, and a policy refreshed with no client.
+
+### Packaging and install layout (`F-PLAT-12`)
+
+`packaging/` installs a relocatable tree with `make install DESTDIR=… PREFIX=…`.
+The installed launchers bake in `$(PREFIX)/lib/stayproductive`; the daemon and
+the X11 adapter are found through `PATH`, exactly as in the source checkout.
+The systemd user unit is installed but never enabled by the package: autostart
+remains the explicit Settings action, which rewrites the same unit with the
+resolved binary path. The app also ships the GNOME extension under
+`/usr/share/stayproductive/gnome-extension` and the WebExtension plus native
+host under `/usr/share/stayproductive/browser-extension`, so a packaged install
+does not need the repository checkout.
+
+`packaging/deb/build.sh` assembles a staging tree and calls `dpkg-deb`; the
+result declares Python 3.10+, PyGObject, GTK 4, libadwaita, and systemd, and
+recommends (does not require) GNOME Shell. The RPM spec and Arch `PKGBUILD`
+invoke the same `make install`, so their file lists cannot drift from the deb.
+The Flatpak manifest targets `org.gnome.Platform//49` with the Rust SDK
+extension and narrow finish arguments; it is a documented starting point, not a
+tested artifact. A Flatpak cannot hand a native-messaging host to a browser
+outside its sandbox and cannot install the host GNOME extension itself, so the
+deb/rpm/Arch builds remain the full-coverage installs.
+
+Known limits: only the Debian package was built on this machine; RPM, Arch, and
+Flatpak need `rpmbuild`, `makepkg`, and `flatpak-builder`, which are absent.
+The package does not run `update-desktop-database`, `gtk-update-icon-cache`, or
+`systemctl --user daemon-reload` from a maintainer script, because those act on
+the system and a per-user service rather than package contents; desktop
+environments regenerate their caches on the next login. Package removal leaves
+`state.db`, exports, and browser host files alone.
 
 ### What is still inert
 
 The engine stores and explains site daily limits, but does not yet decrement
-them because there is no per-site interval tracker. Pickup limits likewise need
-the logind/tracker adapter. The UI labels both as configuration rather than
-claiming they are enforced. The GNOME adapter now enforces app windows, but the
-browser extension, other compositors, and the usage tracker remain the largest
-missing pieces.
+them because there is no per-site interval tracker (the browser extension must
+first report site visits). Launch limits are enforced by the engine once
+launches are counted, but the extension does not yet report background
+launches, only foreground entries. A fresh heartbeat whose `locked` bit falls
+records one pickup, and a reached pickup limit is written into the enforcement
+policy as `R-PICKUP`. Application daily and hourly limits are now enforced
+end-to-end through the GNOME extension or the X11 adapter observer. The UI
+labels the rest as configuration rather than claiming they are enforced. Site
+time limits need a per-site interval tracker, in-page surfaces need a content
+layer, and other compositors plus launch/pickup tracking remain the largest
+missing pieces; the browser extension covers host rules and keyword replacement
+only.
 
 ## Not implemented yet
 
@@ -236,22 +803,37 @@ missing pieces.
 - **`A-PROF-04` templates** — the UI ships three ordinary starter profiles, but
   the reference template set and acceptance scenario are not yet specified.
   TODO(spec).
-- **Site time limits** — the extension must first record per-site intervals;
+- **Site time limits** — the extension does not record per-site intervals yet;
   `SiteAction::Limit` is stored and explained but inert rather than guessed at.
   TODO(spec).
 - **Content surfaces** (`A-CON-01`…`A-CON-05`) — the engine has no surface rule
   set or surface matching yet.
-- **SQLite persistence, migrations, and history** (`F-DATA-01`) — the current
-  store is versioned JSON with atomic replace; it has no queryable ledger yet.
-- **Desktop enforcement beyond GNOME app windows** — the GNOME extension covers
-  application windows only; X11 standalone (EWMH), sway/i3, Hyprland, KWin,
-  website, keyword, and limit enforcement still need adapters. The UI labels the
-  adapter and its scope.
-- **D-Bus, systemd user unit, tray, CLI** — the current boundary is stdio JSON
-  and the UI launches the service itself.
-- **Usage statistics, notifications, onboarding, export/delete, backup/restore,
-  localisation catalogs, full accessibility audit**.
+- **Remaining SQLite target tables** — `challenges`, `saved_qr`, `pauses`,
+  `breaks`, and `usage_hourly` are not separate tables yet, and a clean-shutdown
+  `state.json` checksum snapshot is not written. The ledger itself is queryable
+  in `usage_events`, `usage_launches`, `usage_pickups`, and `usage_blocks`.
+- **Desktop enforcement beyond X11 and GNOME** — the supervised X11 adapter and
+  the GNOME extension cover application windows only; sway/i3, Hyprland, and KWin
+  still need adapters. The browser extension covers host blocks and post-commit
+  keyword replacement in Chrome/Chromium and Firefox, not site time limits or
+  in-page surfaces. The UI labels the adapter and its scope.
+- **D-Bus name and tray/CLI** — the boundary is newline JSON over a Unix socket;
+  systemd can own the daemon, but there is no `org.stayproductive.Daemon1` name,
+  tray, or CLI yet.
+- **Usage timeline charts, notifications, full backup/restore of
+  counters, localisation catalogs, manual screen-reader and high-contrast
+  verification**. Export and history deletion exist, and profiles, settings, and
+  commitments can be restored from an export (see *Data export and deletion*);
+  usage counters are exported but not re-imported. Today/week/month totals, top
+  distractions, launch counts, pickup counts, and block history are in Stats;
+  the timeline and a separate seven-day report do not exist, and site usage is
+  not tracked. Pickups are counted from a heartbeat `locked` edge. Keyboard navigation and explicit
+  accessible names are in place (see *Keyboard navigation and screen readers*);
+  an Orca pass, real key injection, and contrast-theme review are still manual.
 - **Low-time alerts** (`A-LIM-07` / `A-PLAT-11`).
+- **Optional onboarding capabilities** — notifications and the DNS helper are
+  explained in the wizard but not implemented. Autostart is implemented as the
+  systemd user unit above.
 
 ## Test commands
 
@@ -260,12 +842,18 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 gjs -m integrations/gnome/tests/matching.test.js
+node --test integrations/browser-extension/tests/*.test.mjs
+python3 -m unittest discover -s integrations/browser-extension/tests -v
+python3 -m unittest discover -s packaging/tests -v
+make -C packaging check
+PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests
 gnome-extensions pack integrations/gnome/stayproductive@hassanraza.ai --out-dir /tmp
 cargo build --release -p stayproductive-daemon
 ./stayproductive
 ```
 
-The Python frontend has no separate test runner yet; UI verification currently
-uses a harness that starts the real app, exercises the state service through the
-same calls the buttons use, and inspects persisted state. Turning those checks
-into an automated UI suite is tracked in the parity matrix.
+The Python suite (`crates/ui/tests`) covers installed-app discovery and the
+onboarding goal, alias matching, starter-profile construction, marker handling,
+and the one-profile-per-run guard. It needs no display. The GTK wizard is
+additionally construction-smoke-tested under Xvfb; that check is manual, not
+part of the suite.

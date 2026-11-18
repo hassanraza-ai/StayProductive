@@ -10,19 +10,23 @@ It is optional. The rest of StayProductive works without it.
 
 - Application `block` rules in an active profile.
 - Application quick blocks created from the dashboard.
+- Daily and hourly application usage limits: the extension reports which app is
+  focused, the daemon accumulates foreground time, and a limit that is reached
+  produces a policy entry like any other block.
 - The same allowlist and precedence decisions the Rust engine already makes;
   the extension only receives the result.
 - Strict mode indirectly: if a strict commitment is keeping a profile active,
   that profile's app blocks are published like any other active profile.
 
-It does **not** enforce websites, keywords, daily/hourly usage limits, launch
-limits, or pickup limits yet. Those need the browser extension and the usage
-tracker. The UI says so instead of pretending.
+It does **not** enforce websites, keywords, launch limits, pickup limits, or
+site time limits yet. Those need the browser extension and a logind hookup.
+The UI says so instead of pretending.
 
 ## Requirements
 
 - GNOME Shell 45–49 on Wayland or X11.
-- StayProductive is running so it can refresh the policy and state service.
+- The StayProductive daemon is running (normally started at login by the user
+  unit), so it can refresh the policy and state service. The window may be closed.
 - One log out / log in after the first installation. GNOME Shell does not load a
   newly copied extension until the Shell restarts.
 
@@ -50,12 +54,13 @@ gnome-extensions info stayproductive@hassanraza.ai
 
 ## How it works
 
-1. The daemon writes `enforcement.json` beside `state.json` after every command.
-   The file contains only applications that the engine would block right now,
-   the reason code, the optional end time, and a `valid_until` timestamp
-   (30 seconds after generation).
+1. The daemon writes `enforcement.json` beside `state.json` after every command
+   and every five seconds on its own. The file contains only applications that
+   the engine would block right now, the reason code, the optional end time, and
+   a `valid_until` timestamp (30 seconds after generation).
 2. The extension reads the policy every second. An expired policy is ignored,
-   so closing StayProductive stops enforcement instead of leaving stale blocks.
+   so a stopped or crashed daemon stops enforcement instead of leaving stale
+   blocks; closing only the window does not, because the daemon keeps running.
 3. For each focused window it collects the Wayland/XWayland app id,
    `WM_CLASS`, and GApplication id, normalizes them, and looks for a policy entry.
 4. On a match it shows an overlay on every monitor with the reason and end time,
@@ -63,8 +68,14 @@ gnome-extensions info stayproductive@hassanraza.ai
 5. Every two seconds it writes
    `$XDG_RUNTIME_DIR/stayproductive/gnome-extension.json`. The daemon treats that
    heartbeat as fresh for five seconds, and the heartbeat must say it loaded a
-   valid policy, before the daemon reports enforcement as active. A disabled,
-   crashed, or policy-less extension cannot keep claiming enforcement.
+   valid policy and identify itself as `gnome-extension`, before the daemon
+   reports enforcement as active. A disabled, crashed, or policy-less extension
+   cannot keep claiming enforcement.
+6. The heartbeat also names the focused app (`focus`, a list of normalized app
+   ids, and `focus_since`, when that window became foreground) so the daemon can
+   attribute foreground time to usage limits. While the session is locked, the
+   overview is open, no window is focused, or the block overlay is showing,
+   `focus` is `null` and no usage accrues.
 
 The overlay can be left with `Super`/window switching, but the blocked window is
 covered again when it regains focus.
@@ -76,7 +87,9 @@ covered again when it regains focus.
   runtime directory.
 - The extension reads app identity only. It does not read window contents,
   keystrokes, URLs, or clipboard data.
-- The heartbeat contains no window titles or per-app history.
+- The heartbeat names the focused app id for usage tracking; it contains no
+  window titles, URLs, or per-app history. Apps no profile has rules for are
+  not tracked at all.
 
 ## Emergency unblock
 

@@ -57,6 +57,9 @@ pub enum Error {
     CommitmentNotReady,
     #[error("this commitment method is not supported yet")]
     UnsupportedCommitmentMethod,
+
+    #[error("storage error: {0}")]
+    Storage(String),
 }
 
 /// Convenient result alias.

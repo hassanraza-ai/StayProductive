@@ -15,6 +15,7 @@ pub mod ids;
 pub mod period;
 pub mod reason;
 pub mod schedule;
+pub mod store;
 pub mod time;
 pub mod usage;
 
@@ -27,11 +28,14 @@ pub use domain::{
 pub use engine::{Decision, Event, MessageKey, State, Verdict, decide};
 pub use error::{Error, Result};
 pub use ids::{CommitmentId, ProfileId, RuleId, SessionId, Ulid};
-pub use period::{ClockSettings, Period, day_period, hour_period, logical_date};
+pub use period::{
+    ClockSettings, Period, day_period, hour_period, logical_date, month_period, week_period,
+};
 pub use reason::ReasonCode;
 pub use schedule::{
     DateRange, DayPattern, HourlyPattern, Schedule, ScheduleKind, ScheduleStatus, Window,
 };
+pub use store::{Opened, SCHEMA_VERSION, Store};
 pub use time::Timestamp;
 pub use usage::{
     BlockRecord, EventSource, LaunchRecord, UsageEvent, UsageInterval, UsageKind, UsageLedger,

@@ -13,19 +13,29 @@ implemented), `decision` (blocked on a product/architecture decision).
 one required layer or automated acceptance evidence is still outstanding. See
 [`../spec/implementation-notes.md`](../spec/implementation-notes.md).
 
-The runnable build (October 2026) has the core engine, a local JSON state
-service, and a GTK 4 + libadwaita UI. It includes an opt-in GNOME Shell
-extension that enforces application `block` rules and application quick blocks
-on real windows. It does **not** yet enforce websites, keywords, usage limits,
-or other compositors. Every row whose user-visible result depends on those
-missing layers remains `wip` or `todo`. The app reports enforcement as active
-only when the extension heartbeat is fresh and has loaded a valid policy.
+The runnable build (November 2026) has the core engine, an autonomous local JSON
+state service behind a same-user Unix socket and an opt-in systemd user unit, a
+GTK 4 + libadwaita UI, and a five-step first-run onboarding wizard. A supervised
+X11 adapter enforces application `block` rules, application quick blocks, and
+daily/hourly application usage limits on real windows; an opt-in GNOME Shell
+extension does the same for native Wayland and XWayland. The observer reports
+the focused app, the daemon attributes foreground intervals to the engine's
+usage ledger, and a reached limit produces a policy entry like any other block.
+It does **not** yet enforce sites system-wide, site time limits, in-page
+surfaces, or other compositors. Pickup limits are enforced when a heartbeat
+reports the screen unlocking; the GNOME extension does not yet send that bit. A Manifest V3 browser
+extension is implemented for Chrome/Chromium and Firefox (reviewed, not yet
+loaded there): it applies host rules before the request through
+`declarativeNetRequest`, asks the daemon for every navigation, and replaces a
+keyword-blocked page after commit. Every row whose user-visible result depends
+on those missing layers remains `wip` or `todo`. The app reports enforcement as
+active only when an adapter heartbeat is fresh and has loaded a valid policy.
 
 ## 1. Profiles and rules
 
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-PROF-01 | Create, rename, duplicate, delete profiles | P0 | core + SQLite | domain §3 | A-PROF-01 | wip |
+| F-PROF-01 | Create, rename, duplicate, delete profiles | P0 | core + SQLite | domain §3 | A-PROF-01 | done |
 | F-PROF-02 | Activate a profile manually; deactivate it | P0 | D-Bus + UI | sched §6 | A-PROF-02 | wip |
 | F-PROF-03 | Only one manually activated profile at a time | P0 | engine invariant | domain §4 | A-PROF-03 | wip |
 | F-PROF-04 | Profile templates (Focus, Sleep, Detox, Exam, …) | P1 | bundled presets | sched §7 | A-PROF-04 | wip |
@@ -33,8 +43,8 @@ only when the extension heartbeat is fresh and has loaded a valid policy.
 | F-PROF-06 | Mark profile as strict-mode eligible | P1 | engine | strict §3 | A-PROF-06 | wip |
 | F-RULE-01 | Block selected apps | P0 | compositor adapter | block §5 | A-RULE-01 | wip |
 | F-RULE-02 | Block selected websites | P0 | DNS + extension | content §2 | A-RULE-02 | wip |
-| F-RULE-03 | Block selected keywords | P1 | extension + URL pipe | content §3 | A-RULE-03 | wip |
-| F-RULE-04 | Allowlist apps (override non-strict rules) | P0 | engine | block §4 | A-RULE-04 | wip |
+| F-RULE-03 | Block selected keywords | P1 | extension + URL pipe (after commit) | content §3 | A-RULE-03 | wip |
+| F-RULE-04 | Allowlist apps (override non-strict rules) | P0 | engine | block §4 | A-RULE-04 | done |
 | F-RULE-05 | Allowlist websites | P1 | engine + resolver | content §2 | A-RULE-05 | wip |
 | F-RULE-06 | Goal-based unlock (spend time to earn access) | P1 | engine counters | block §6 | A-RULE-06 | todo |
 | F-RULE-07 | Wait timer after usage | P1 | engine timer | block §6 | A-RULE-07 | wip |
@@ -46,8 +56,8 @@ only when the extension heartbeat is fresh and has loaded a valid policy.
 | --- | --- | --- | --- | --- | --- | --- |
 | F-LIM-01 | Daily usage limit per app | P0 | event log + counters | block §4 | A-LIM-01 | wip |
 | F-LIM-02 | Hourly usage limit per app | P0 | event log + counters | block §4 | A-LIM-02 | wip |
-| F-LIM-03 | Daily/hourly launch limits | P1 | tracker | block §4 | A-LIM-03 | wip |
-| F-LIM-04 | Daily/hourly pickup (unlock) limits | P1 | logind | block §4 | A-LIM-04 | wip |
+| F-LIM-03 | Daily/hourly launch limits | P1 | tracker | block §4 | A-LIM-03 | done |
+| F-LIM-04 | Daily/hourly pickup (unlock) limits | P1 | logind | block §4 | A-LIM-04 | done |
 | F-LIM-05 | Limits survive restart and crash | P0 | persisted events | block §7 | A-LIM-05 | wip |
 | F-LIM-06 | Counter day boundary honours start-of-day | P0 | period calculator | sched §2 | A-LIM-06 | wip |
 | F-LIM-07 | Low-time alerts at thresholds | P1 | notifications | block §8 | A-LIM-07 | todo |
@@ -62,8 +72,8 @@ only when the extension heartbeat is fresh and has loaded a valid policy.
 | F-SCH-04 | Full-day and one-time/custom windows | P1 | scheduler | sched §3 | A-SCH-04 | wip |
 | F-SCH-05 | Hourly pattern | P1 | scheduler | sched §3 | A-SCH-05 | wip |
 | F-SCH-06 | Start-of-day offset | P0 | period calculator | sched §2 | A-SCH-06 | wip |
-| F-SCH-07 | Pause profile for 1/5/10/15/30 min, 1 h, today | P0 | engine state | sched §5 | A-SCH-07 | wip |
-| F-SCH-08 | Indefinite pause (no duration) | P1 | engine state | sched §5 | A-SCH-08 | wip |
+| F-SCH-07 | Pause profile for 1/5/10/15/30 min, 1 h, today | P0 | engine state | sched §5 | A-SCH-07 | done |
+| F-SCH-08 | Indefinite pause (no duration) | P1 | engine state | sched §5 | A-SCH-08 | done |
 | F-SCH-09 | Extend an active block | P1 | engine state | sched §5 | A-SCH-09 | wip |
 | F-SCH-10 | Schedule change detection (no restart needed) | P0 | scheduler invalidation | sched §4 | A-SCH-10 | wip |
 | F-SCH-11 | Location activation | P2 | GeoClue2 | sched §6 | A-SCH-11 | decision |
@@ -95,7 +105,7 @@ only when the extension heartbeat is fresh and has loaded a valid policy.
 | F-CON-03 | Per-surface toggles (Shorts, Reels, Stories, …) | P1 | settings | content §4 | A-CON-03 | todo |
 | F-CON-04 | Adult-domain filtering | P1 | DNS lists | content §5 | A-CON-04 | todo |
 | F-CON-05 | Block unsupported browsers (policy) | P2 | engine | content §6 | A-CON-05 | todo |
-| F-CON-06 | Keyword matching is case-insensitive | P0 | engine | content §3 | A-CON-06 | wip |
+| F-CON-06 | Keyword matching is case-insensitive | P0 | engine | content §3 | A-CON-06 | done |
 | F-CON-07 | Native mobile surfaces | — | not reproducible | content §7 | — | gap |
 | F-CON-08 | In-app browser webviews | — | not inspectable | content §7 | — | gap |
 
@@ -103,20 +113,20 @@ only when the extension heartbeat is fresh and has loaded a valid policy.
 
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-STA-01 | Record foreground intervals per app/site | P0 | tracker + SQLite | block §7 | A-STA-01 | todo |
-| F-STA-02 | Today / week / month totals | P1 | queries | ux §7 | A-STA-02 | todo |
-| F-STA-03 | Top distractions ranking | P1 | queries | ux §7 | A-STA-03 | todo |
+| F-STA-01 | Record foreground intervals per app/site | P0 | tracker + SQLite | block §7 | A-STA-01 | wip |
+| F-STA-02 | Today / week / month totals | P1 | queries | ux §7 | A-STA-02 | done |
+| F-STA-03 | Top distractions ranking | P1 | queries | ux §7 | A-STA-03 | done |
 | F-STA-04 | Usage timeline | P2 | queries + chart | ux §7 | A-STA-04 | todo |
-| F-STA-05 | Pickup and launch counts | P1 | logind/tracker | ux §7 | A-STA-05 | todo |
-| F-STA-06 | Seven-day report and comparison | P2 | report view | ux §7 | A-STA-06 | todo |
-| F-STA-07 | Block/deny history with reasons | P1 | event log | block §7 | A-STA-07 | todo |
-| F-STA-08 | Export and delete usage data | P0 | store | ux §8 | A-STA-08 | todo |
+| F-STA-05 | Pickup and launch counts | P1 | logind/tracker | ux §7 | A-STA-05 | done |
+| F-STA-06 | Seven-day report and comparison | P2 | report view | ux §7 | A-STA-06 | wip |
+| F-STA-07 | Block/deny history with reasons | P1 | event log | block §7 | A-STA-07 | done |
+| F-STA-08 | Export and delete usage data | P0 | store | ux §8 | A-STA-08 | done |
 
 ## 7. UX, onboarding, settings
 
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-UX-01 | Onboarding: purpose, permissions, first profile | P0 | GTK wizard | ux §2 | A-UX-01 | todo |
+| F-UX-01 | Onboarding: purpose, permissions, first profile | P0 | GTK wizard | ux §2 | A-UX-01 | wip |
 | F-UX-02 | Dashboard: status, profile, remaining time, quick actions | P0 | GTK | ux §3 | A-UX-02 | wip |
 | F-UX-03 | Block screen explains reason and end time | P0 | GNOME overlay | ux §5 | A-UX-03 | wip |
 | F-UX-04 | Break countdown screen | P1 | overlay | ux §5 | A-UX-04 | todo |
@@ -125,54 +135,90 @@ only when the extension heartbeat is fresh and has loaded a valid policy.
 | F-UX-07 | Strict-mode setup and deactivation flows | P1 | GTK | ux §6 | A-UX-07 | wip |
 | F-UX-08 | Settings: start of day, notifications, autostart, theme | P1 | GTK | ux §8 | A-UX-08 | wip |
 | F-UX-09 | Tray icon with pause/resume/quick block | P1 | StatusNotifier | ux §9 | A-UX-09 | todo |
-| F-UX-10 | Keyboard-first navigation and screen-reader labels | P0 | GTK/a11y | ux §10 | A-UX-10 | todo |
-| F-UX-11 | Localisation-ready strings | P1 | gettext | ux §10 | A-UX-11 | todo |
-| F-UX-12 | Backup/restore of all state | P1 | JSON archive | ux §8 | A-UX-12 | todo |
+| F-UX-10 | Keyboard-first navigation and screen-reader labels | P0 | GTK/a11y | ux §12 | A-UX-10 | done |
+| F-UX-11 | Localisation-ready strings | P1 | gettext | ux §12 | A-UX-11 | todo |
+| F-UX-12 | Backup/restore of all state | P1 | JSON archive | ux §8 | A-UX-12 | wip |
 
 ## 8. Platform integration
 
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-PLAT-01 | Daemon autostart and restart | P0 | systemd user unit | arch §5 | A-PLAT-01 | todo |
-| F-PLAT-02 | X11 foreground detection and enforcement | P0 | EWMH | arch §4 | A-PLAT-02 | todo |
+| F-PLAT-01 | Daemon autostart and restart | P0 | systemd user unit | arch §5 | A-PLAT-01 | wip |
+| F-PLAT-02 | X11 foreground detection and enforcement | P0 | EWMH | arch §4 | A-PLAT-02 | wip |
 | F-PLAT-03 | sway/i3 adapter | P1 | IPC | arch §4 | A-PLAT-03 | todo |
 | F-PLAT-04 | Hyprland adapter | P1 | IPC | arch §4 | A-PLAT-04 | todo |
 | F-PLAT-05 | GNOME Shell adapter | P2 | extension + policy file | arch §4 | A-PLAT-05 | wip |
 | F-PLAT-06 | KDE/KWin adapter | P2 | script + D-Bus | arch §4 | A-PLAT-06 | todo |
 | F-PLAT-07 | System-wide DNS filtering (optional helper) | P1 | polkit + resolver | arch §7 | A-PLAT-07 | decision |
-| F-PLAT-08 | Browser extension (URL + DOM signals) | P1 | WebExtension | content §2 | A-PLAT-08 | todo |
-| F-PLAT-09 | Idle/lock/suspend awareness | P0 | logind | arch §4 | A-PLAT-09 | todo |
+| F-PLAT-08 | Browser extension (URL + DOM signals) | P1 | WebExtension + native host | content §2 | A-PLAT-08 | wip |
+| F-PLAT-09 | Idle/lock/suspend awareness | P0 | logind | arch §4 | A-PLAT-09 | wip |
 | F-PLAT-10 | Multi-monitor lock overlay | P0 | compositor adapter | arch §6 | A-PLAT-10 | wip |
 | F-PLAT-11 | Notifications and low-time alerts | P1 | D-Bus | arch §5 | A-PLAT-11 | todo |
+| F-PLAT-12 | Distribution packages (deb, rpm, Arch, Flatpak) | P1 | dpkg-deb, rpmbuild, makepkg, flatpak-builder | arch §6 | packaging tests | wip |
 
 ## 9. Data and lifecycle
 
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-DATA-01 | Atomic migrations; never lose rules/history | P0 | SQLite | domain §6 | A-DATA-01 | todo |
+| F-DATA-01 | Atomic migrations; never lose rules/history | P0 | SQLite | domain §6 | A-DATA-01 | done |
 | F-DATA-02 | Clock change and DST handled without double counting | P0 | monotonic + wall clock | block §7 | A-DATA-02 | wip |
-| F-DATA-03 | Daemon/UI version skew tolerated | P1 | IPC versioning | arch §8 | A-DATA-03 | todo |
-| F-DATA-04 | Full local reset with confirmation | P1 | store | ux §8 | A-DATA-04 | todo |
+| F-DATA-03 | Daemon/UI version skew tolerated | P1 | IPC versioning | arch §8 | A-DATA-03 | done |
+| F-DATA-04 | Full local reset with confirmation | P1 | store | ux §8 | A-DATA-04 | done |
 
-## Current build evidence (October 2026)
+## Current build evidence (November 2026)
 
 | Check | Result |
 | --- | --- |
 | `cargo fmt --check` | pass |
 | `cargo clippy --all-targets -- -D warnings` | pass |
-| `cargo test` | pass, including 32 acceptance tests and the daemon protocol tests |
+| `cargo test` | pass, including 38 acceptance tests and the daemon protocol tests |
 | `cargo build --release -p stayproductive-daemon` | pass |
 | GTK app launch | pass on X11/XWayland with GTK 4 and libadwaita |
-| Dashboard, profiles, schedules, strict, activity, settings | rendered from live daemon state and manually inspected |
+| Dashboard, profiles, schedules, strict, stats, settings | rendered from live daemon state and manually inspected under Xvfb |
 | Profile editor round-trip | created and updated a scheduled profile with apps, site daily limit, keywords, allowlist, and multiple windows; persisted state re-read correctly |
 | Strict cool-down | core test rejects `finish_commitment_end` before the cool-down and accepts it afterwards; locked edits/pauses are rejected |
 | Enforcement policy | daemon protocol test checks active/inactive app entries, policy path, and `0600` mode |
-| Enforcement heartbeat | daemon protocol test checks active only with a fresh `active:true`/`policy_loaded:true` heartbeat and refuses stale, inactive, or policy-less files |
-| GNOME matching helpers | `gjs -m integrations/gnome/tests/matching.test.js` pass |
+| Enforcement heartbeat | daemon protocol test checks active only with a fresh `active:true`/`policy_loaded:true` heartbeat with the expected `adapter`, and refuses stale, inactive, policy-less, or foreign files |
+| Usage tracking → limits | daemon protocol tests drive the real binary: reported focus over a daily limit blocks with `R-LIMIT-DAILY` and records history; the block overlay suspends accrual; counters survive restart (A-LIM-05 seed); the same works from either the GNOME extension or the X11 adapter heartbeat, including the daemon's own five-second pulse with no client attached |
+| Allowlist override (`F-RULE-04`) | `a_rule_04_allowlist_overrides_a_non_strict_rule` proves an app that is both blocked and allowlisted returns `R-ALLOW`; `allowlisted_app_is_never_put_in_the_enforcement_policy` in `crates/daemon/tests/protocol.rs` creates a blocking profile with an app allowlist, activates it, reports the app as focused, and checks the policy stays empty and no block history is recorded |
+| Launch limits (`F-LIM-03`) | `a_lim_03_launch_limit_ignores_quick_switches_and_blocks_the_third_launch` covers the 5 s anti-thrash window and the third launch; `launch_limit_blocks_from_the_persisted_launch_count` seeds two counted launches, starts the real daemon, and checks a `R-LAUNCH` policy entry ending at the end of the hour |
+| Export and delete (`F-STA-08`) | `export_and_delete_usage_data` in `crates/daemon/tests/protocol.rs` exports a versioned zip, parses its central directory (offsets and CRC), checks the manifest version, profiles, settings, and monthly usage entries, refuses an unconfirmed delete, and proves the deletion survives restart; the archive also opens cleanly in Python's `zipfile`; `test_engine.py` checks the client's `include_usage`/`path`/`confirm` intent; the Stats page shows both actions with a destructive confirmation |
+| SQLite migration (`F-DATA-01`) | `a_data_01_sqlite_migration_preserves_profiles_rules_and_history` writes the old JSON wrapper with profiles, app/site/keyword/allowlist rules, a schedule, a commitment, quick blocks, extensions, intervals, launches, a pickup, and a block, then opens the store: every field round-trips, `schema_version` is 1, the `rules`/`schedules`/`usage_events` projections exist, and the JSON is renamed to a backup. `a_data_01_a_failed_write_leaves_the_database_unchanged` pushes a duplicate quick-block target and proves the transaction rolls back. `a_data_01_a_newer_schema_is_refused_instead_of_guessed` inserts schema 99 and proves the open fails |
+| IPC versioning (`F-DATA-03`) | `a_data_03_a_newer_protocol_is_refused_while_enforcement_continues` drives the real daemon with an active site block, sends `schema_version: 99`, and checks a clear refusal naming the supported version and that blocking continues, while the same daemon still answers current and version-less peers. The client attaches `schema_version` to every request and refuses a newer greeting or reply without guessing; `test_engine.py` checks both directions, including reconnection after the version matches again |
+| Full reset (`F-DATA-04`) | `a_data_04_reset_needs_confirmation_and_strict_commitments_refuse_it` proves an unconfirmed reset is refused, an active commitment blocks the confirmed reset, and rules/quick blocks/settings stay intact; `a_data_04_a_confirmed_reset_clears_rules_and_history_but_keeps_commitments` clears every profile, quick block, and ledger count, restores default clock settings, and proves the reset survives a daemon restart. `test_engine.py` checks the client's `confirm` intent; `test_accessibility.py` checks the Settings page wires the action to a destructive confirmation |
+| Stats ranges (`F-STA-02`) | `a_sta_02_day_week_month_totals_use_the_clock_boundaries` checks today/week/month against a 04:00 start-of-day, week and month boundaries, and DST-length weeks; `stats_report_today_week_month_rankings_and_counts` seeds the real daemon state and checks the snapshot totals add up; the Stats page renders all three ranges |
+| Top distractions (`F-STA-03`) | `a_sta_03_ranking_is_by_time_with_stable_ties` proves ranking order and tie stability; the daemon snapshot carries seconds, share, and previous-period seconds; the Stats page shows the ranked list and trend |
+| Pickups and launches (`F-STA-05`) | `a_sta_05_pickups_and_launches_count_once_per_event` proves one pickup per unlock and one launch per foreground entry. `an_unlock_records_one_pickup_and_a_reached_limit_blocks` writes a locked heartbeat and then an unlocked one against the real daemon: the pickup count rises by one, a second unlocked heartbeat does not add another, and a limit of one produces an `R-PICKUP` policy entry. The X11 adapter already writes `locked`; a heartbeat that omits it is treated as unlocked and does not invent a pickup |
+| Block history (`F-STA-07`) | The stats protocol test seeds a `R-LIMIT-DAILY` block and checks the snapshot history keeps the target, reason, and end time and has no title; the Stats page renders target, reason code, and timestamp |
+| Restore (`F-UX-12`) | `a_clean_install_restores_an_export` exports from one daemon and imports into a second clean one, checking the restored profile, clock settings, and active strict session; a non-archive is refused with no state change; the restore survives restart. Unit tests refuse a newer manifest version and keep the longer active commitment when merging into a used install. Usage counters are **not** re-imported, so the row stays `wip` |
+| Keyboard and a11y (`F-UX-10`) | `crates/ui/tests/test_accessibility.py` starts Xvfb, builds the real window, profile editor, and onboarding dialog with a fake engine, and walks the tree: every control we place has an explicit or native accessible label and is focusable; all six sidebar rows are labelled, described, and switch pages through `<Control>1`…`6`; `<Control>N`/`<Control>?` are bound; the status dot is `PRESENTATION`; reduced motion sets a zero transition. An unlabelled icon button raises at construction. GTK-internal composite controls are excluded |
+| X11 adapter matching (`F-PLAT-02`) | `crates/ui/tests/test_x11_policy.py` covers aliases, expiry, hide-then-overlay ordering, dedupe, re-block, allowed-window hide, and Back |
+| X11 adapter supervision (`F-PLAT-02`) | `crates/daemon/tests/protocol.rs` kills a fake adapter and checks that the daemon removes its stale heartbeat, restarts it, and reports `active`/`x11`; shutdown leaves no orphan |
+| X11 adapter live (`F-PLAT-02`) | opt-in `crates/ui/tests/test_x11_live.py` under Xvfb: blocked window unmapped, allowed window lowers the block, refocusing re-blocks, expiring policy restores the window, and the heartbeat carries `monitors`, `card_monitor`, `locked`, `suspended`, and `session_aware` |
+| X11 adapter end-to-end (`F-PLAT-02`) | real daemon + real adapter under Xvfb: active profile produced the policy, the focused window was blocked, snapshot reported `active`/`x11` |
+| X11 card placement (`F-PLAT-10`) | `PreferredMonitorTest` in `crates/ui/tests/test_x11_policy.py` covers single monitor, left/right monitor, a spanning window's majority, off-screen and missing geometry, and no monitors; live Xvfb run asserts one monitor and card on monitor 0 |
+| X11 lock/suspend (`F-PLAT-09`) | `PlannerPauseTest` covers pause hiding the overlay, focus/Back ignored while paused, resume re-blocking the still-hidden window, and restoring a policy that expired during the pause; `SessionMonitor` reads logind `Lock`/`Unlock`/`PrepareForSleep` plus a throttled `LockedHint` fallback and reports `session_aware` |
+| X11 multi-monitor visuals (`F-PLAT-10`) | **not measured**: Xvfb rejects RandR monitor objects, so GDK always sees one monitor; card position and focus on a real two-monitor X11 session still need a logged-in desktop |
+| X11 real lock/suspend (`F-PLAT-09`) | **not measured** by locking a live session; logind wiring is exercised against the system bus in the heartbeat, and the release/resume handshake is unit-tested |
+| X11 WM iconification and overlay visuals | **not measured**: Xvfb has no window manager and no logged-in X11 session was available |
+| Socket transport (`F-PLAT-01`) | daemon protocol tests check `0600` socket / `0700` dir, single instance, clean socket removal, and a policy refreshed with no client |
+| Daemon autonomy (`F-PLAT-01`) | Xvfb end-to-end: `SIGKILL`ed the UI, daemon stayed alive and advanced the policy timestamp; relaunch reused the same daemon PID; explicit shutdown removed process and socket |
+| systemd unit and restart (`F-PLAT-01`) | `crates/ui/tests/test_service.py` covers unit text, quoting, socket naming, service states, and handover order; manual transient unit restarted a `kill -9`ed daemon with a new PID and stayed active |
+| Autostart toggle | **not measured** with a real `systemctl --user enable` + logout/login; requires a human session |
+| GNOME matching helpers | `gjs -m integrations/gnome/tests/matching.test.js` pass, including the `FocusTracker` interval rules |
 | Installed-app chooser | `PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests` pass; GTK construction smoke-tested under Xvfb |
+| First-run onboarding | five steps implemented; goal/app selection, starter profile, marker, and the “exactly one profile” guard covered by `crates/ui/tests/test_onboarding.py`; GTK flow construction-smoke-tested under Xvfb. Autostart, notifications, and the DNS helper are listed as unavailable and cannot be enabled from the wizard. |
 | GNOME install flow | exercised with an isolated `XDG_DATA_HOME` and keyfile settings backend; copied the extension and enabled it without touching the host session |
 | GNOME extension load | pass in headless GNOME Shell 49: loads, reads policy, writes heartbeat, drops expired/removed policy |
 | GNOME overlay focus/visuals | **not measured** in headless Shell because it has no seat; requires a logged-in session |
+| Browser decision (`F-RULE-02`, `F-RULE-03`, `F-CON-06`) | `browser_decision_blocks_sites_and_keywords_with_daemon_reasons` in `crates/daemon/tests/protocol.rs` starts the real daemon over the socket, checks an exact and a suffix site hit, a case-folded keyword hit, an allowlisted host, an inactive profile, and that the reply carries the same `R-*` reason and end time as the app path; `keyword_blocks_case_insensitively` and `keyword_matching_folds_unicode_and_case` in `crates/core` cover NFKC full-width forms |
+| Browser policy feed (`F-PLAT-08`) | The same protocol suite checks that `browser_policy` lists active-profile site blocks, suffix flags, quick site blocks, allowlist hosts, and keywords, that a paused or inactive profile contributes nothing, and that it returns `limitations: ["site_limits", "surface_rules"]` instead of claiming coverage |
+| Browser extension units (`F-PLAT-08`) | `node --test integrations/browser-extension/tests/*.test.mjs` (10 tests) covers exact/suffix host matching, allow-vs-block priority, quick-block priority, redirect parameters, subframe blocking, and block-page wording; `python3 -m unittest discover -s integrations/browser-extension/tests` (11 tests) covers native-messaging framing, the command allowlist, malformed and oversized frames, socket-name parity with the UI client, and the installer under a temporary `HOME` |
+| Browser extension live (`F-PLAT-08`, `A-PLAT-08`) | **observed** on Chrome 157 with a throwaway profile under `/tmp/opencode`: the unpacked extension loaded, the Python native host connected, dynamic DNR rules were applied, `bad.example.com` redirected to `blocked.html?reason=R-SITE&target=example.com` with the daemon's wording, a local page containing `GaMe` got the closed-shadow keyword overlay with the address bar unchanged, and the block page's countdown and buttons worked |
+| Browser keyword timing (`F-RULE-03`) | **limited**: `declarativeNetRequest` has no keyword filter, so a keyword block is applied by the content script after commit and a frame can paint first. `A-RULE-03` asks for a block "before paint where observable"; that part is not met and is recorded in `docs/spec/implementation-notes.md` |
+| Firefox extension (`F-PLAT-08`) | **not measured**: `manifest.firefox.json` is manifest-reviewed only (classic scripts, fixed `stayproductive@local` ID, temporary add-on instructions); it has not been loaded in Firefox |
+| Browser privacy | URLs and titles are used for one `browser_decision` call and are not written by the extension, native host, or daemon; `storage.local` keeps counts, the last check time, and a degraded message. Site limits and surfaces are absent from the policy feed rather than approximated |
+| Packaging (`F-PLAT-12`) | `packaging/tests/test_packaging.py` checks the desktop entry, AppStream ID/launchable/version/date, self-contained SVG, unit quoting, launcher substitution, version agreement across Cargo/RPM/Arch, and the Flatpak manifest's runtime and narrow filesystem access; it also runs `make install` into a temporary `DESTDIR` and asserts every installed path, the substituted launcher, the unit `ExecStart`, and the absence of `__pycache__`. `desktop-file-validate` and `appstreamcli validate --no-net` pass; `dpkg-deb` built `stayproductive_0.1.0_amd64.deb` (1.8 MB, 6.5 MB installed) and its control/file list were inspected. RPM, Arch, and Flatpak builds are **not measured** because those toolchains are absent |
 
 Manual UI inspection is not a substitute for the acceptance suite. Rows that
 depend on the UI remain `wip` until their `A-UX-*` scenarios are automated.

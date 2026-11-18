@@ -18,6 +18,35 @@ def clear(widget: Gtk.Widget) -> None:
         child = next_child
 
 
+def accessible(
+    widget: Gtk.Widget,
+    *,
+    label: str | None = None,
+    description: str | None = None,
+    role: Gtk.AccessibleRole | None = None,
+) -> Gtk.Widget:
+    """Give a widget an explicit accessible name or description.
+
+    GTK derives a name from a plain label, but not from an icon or from a
+    custom child, so icon-only controls must set one themselves: a tooltip is
+    not a screen-reader label (`docs/spec/ux-flows.md` §12, `A-UX-10`).
+    """
+
+    properties: list[Gtk.AccessibleProperty] = []
+    values: list[str] = []
+    if label:
+        properties.append(Gtk.AccessibleProperty.LABEL)
+        values.append(label)
+    if description:
+        properties.append(Gtk.AccessibleProperty.DESCRIPTION)
+        values.append(description)
+    if properties:
+        widget.update_property(properties, values)
+    if role is not None:
+        widget.set_accessible_role(role)
+    return widget
+
+
 class Card(Gtk.Box):
     def __init__(self, *, hero: bool = False, warning: bool = False, spacing: int = 14):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=spacing)
@@ -84,6 +113,7 @@ def button(
     *,
     css: str | None = None,
     tooltip: str | None = None,
+    accessible_label: str | None = None,
     on_click: Callable[[Gtk.Button], None] | None = None,
 ) -> Gtk.Button:
     widget = Gtk.Button()
@@ -100,6 +130,18 @@ def button(
         widget.add_css_class(css)
     if tooltip:
         widget.set_tooltip_text(tooltip)
+
+    name = accessible_label or text or tooltip
+    if name:
+        accessible(
+            widget,
+            label=name,
+            description=tooltip if tooltip and tooltip != name else None,
+        )
+    elif icon is not None:
+        # An unlabelled icon is silent to a screen reader: refuse it at
+        # construction instead of shipping it (`A-UX-10`).
+        raise ValueError("an icon-only button needs a tooltip or accessible_label")
     if on_click:
         widget.connect("clicked", on_click)
     return widget
@@ -117,7 +159,7 @@ def page_scroller(content: Gtk.Widget, max_width: int = 1000) -> Gtk.ScrolledWin
     return scroller
 
 
-def nav_row(key: str, title: str, icon: str) -> Gtk.ListBoxRow:
+def nav_row(key: str, title: str, icon: str, subtitle: str | None = None) -> Gtk.ListBoxRow:
     row = Gtk.ListBoxRow()
     row.add_css_class("nav-row")
     row.key = key  # type: ignore[attr-defined]
@@ -128,11 +170,13 @@ def nav_row(key: str, title: str, icon: str) -> Gtk.ListBoxRow:
     box.set_margin_end(10)
     image = Gtk.Image.new_from_icon_name(icon)
     image.set_pixel_size(18)
+    image.set_accessible_role(Gtk.AccessibleRole.PRESENTATION)
     box.append(image)
     text = Gtk.Label(label=title, xalign=0)
     text.set_hexpand(True)
     box.append(text)
     row.set_child(box)
+    accessible(row, label=title, description=subtitle)
     return row
 
 
@@ -171,6 +215,123 @@ def confirm(
     dialog.present(parent)
 
 
+PAUSE_CHOICES: tuple[tuple[str, int, bool], ...] = (
+    ("1 minute", 1, False),
+    ("5 minutes", 5, False),
+    ("10 minutes", 10, False),
+    ("15 minutes", 15, False),
+    ("30 minutes", 30, False),
+    ("1 hour", 60, False),
+    ("Rest of today", 0, True),
+    ("Until I resume", 0, False),
+)
+
+
+def pause_toast(minutes: int, until_end_of_day: bool) -> str:
+    """Short confirmation for a pause the person just chose."""
+
+    if until_end_of_day:
+        return "Paused until the next start of day"
+    if minutes <= 0:
+        return "Paused until you resume"
+    if minutes == 1:
+        return "Paused for 1 minute"
+    return f"Paused for {minutes} minutes"
+
+
+def choose_pause(
+    parent: Gtk.Widget,
+    on_choice: Callable[[int, bool], None],
+) -> None:
+    """Ask how long a profile should stay paused."""
+
+    dialog = Adw.AlertDialog(
+        heading="Pause this profile",
+        body="Rules stay off until the time you pick. You can resume earlier.",
+    )
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    for label, minutes, until_end_of_day in PAUSE_CHOICES:
+        button = Gtk.Button(label=label)
+
+        def choose(
+            _button: Gtk.Button,
+            minutes: int = minutes,
+            until_end_of_day: bool = until_end_of_day,
+        ) -> None:
+            dialog.close()
+            on_choice(minutes, until_end_of_day)
+
+        button.connect("clicked", choose)
+        box.append(button)
+    dialog.set_extra_child(box)
+    dialog.add_response("cancel", "Cancel")
+    dialog.set_default_response("cancel")
+    dialog.set_close_response("cancel")
+    dialog.present(parent)
+
+
+def ask_name(
+    parent: Gtk.Widget,
+    heading: str,
+    body: str,
+    initial: str,
+    confirm_label: str,
+    on_confirm: Callable[[str], None],
+) -> None:
+    """Ask for a single line of text."""
+
+    dialog = Adw.AlertDialog(heading=heading, body=body)
+    entry = Gtk.Entry()
+    entry.set_text(initial)
+    entry.set_activates_default(True)
+    accessible(entry, label=heading)
+    dialog.set_extra_child(entry)
+    dialog.add_response("cancel", "Cancel")
+    dialog.add_response("confirm", confirm_label)
+    dialog.set_response_appearance("confirm", Adw.ResponseAppearance.SUGGESTED)
+    dialog.set_default_response("confirm")
+    dialog.set_close_response("cancel")
+
+    def respond(_dialog: Adw.AlertDialog, response: str) -> None:
+        if response == "confirm":
+            on_confirm(entry.get_text().strip())
+
+    dialog.connect("response", respond)
+    dialog.present(parent)
+
+
+def pause_menu(on_choice: Callable[[int, bool], None]) -> Gtk.MenuButton:
+    """A Pause button whose menu lists the same durations as the profile dialog."""
+
+    menu = Gtk.Popover()
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    box.set_margin_top(6)
+    box.set_margin_bottom(6)
+    box.set_margin_start(6)
+    box.set_margin_end(6)
+    for label, minutes, until_end_of_day in PAUSE_CHOICES:
+        item = Gtk.Button(label=label)
+        item.add_css_class("flat")
+        item.set_halign(Gtk.Align.FILL)
+
+        def choose(
+            _button: Gtk.Button,
+            minutes: int = minutes,
+            until_end_of_day: bool = until_end_of_day,
+        ) -> None:
+            menu.popdown()
+            on_choice(minutes, until_end_of_day)
+
+        item.connect("clicked", choose)
+        box.append(item)
+    menu.set_child(box)
+    button = Gtk.MenuButton(label="Pause")
+    button.set_popover(menu)
+    button.set_focusable(True)
+    accessible(button, label="Pause the active profile")
+    return button
+
+
 def menu_button(
     name: str,
     items: list[tuple[str, Callable[[], None], bool]],
@@ -195,6 +356,10 @@ def menu_button(
     widget.add_css_class("flat")
     widget.set_popover(menu)
     widget.set_tooltip_text(name)
+    # GTK's menu button is not focusable by default; a keyboard user still
+    # needs to reach it, so put it in the tab chain ourselves (`A-UX-10`).
+    widget.set_focusable(True)
+    accessible(widget, label=name)
     return widget
 
 

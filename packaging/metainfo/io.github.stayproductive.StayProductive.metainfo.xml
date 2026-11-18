@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.stayproductive.StayProductive</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <name>StayProductive</name>
+  <summary>Plan focus sessions and block distractions locally</summary>
+
+  <description>
+    <p>
+      StayProductive is a local-first focus app for Linux. Profiles combine
+      schedules, application rules, website rules, and daily or hourly limits,
+      and a background daemon keeps enforcing them after the window is closed.
+    </p>
+    <p>It is built for privacy and autonomy:</p>
+    <ul>
+      <li>No account, cloud service, telemetry, ads, or paywall.</li>
+      <li>Block reasons and end times are shown with every block.</li>
+      <li>Schedules, limits, strict commitments, and statistics survive restarts.</li>
+      <li>Strict mode uses commitments and cool-downs, not hidden root access.</li>
+    </ul>
+    <p>
+      Application blocking works on X11 and through an opt-in GNOME Shell
+      extension. Website host rules and keyword replacement work in Chromium
+      browsers through the bundled companion extension. Site time limits and
+      in-page surfaces are not implemented yet and the application says so.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.stayproductive.StayProductive.desktop</launchable>
+  <url type="homepage">https://github.com/hassanraza-ai/StayProductive</url>
+  <url type="bugtracker">https://github.com/hassanraza-ai/StayProductive/issues</url>
+  <developer id="io.github.stayproductive">
+    <name>StayProductive contributors</name>
+  </developer>
+
+  <content_rating type="oars-1.1"/>
+  <categories>
+    <category>Utility</category>
+  </categories>
+  <provides>
+    <binary>stayproductive</binary>
+  </provides>
+  <releases>
+    <release version="0.1.0" date="2026-11-18">
+      <description>
+        <p>First packaged build: profiles, schedules, app limits, strict
+        sessions, statistics, X11 and GNOME app enforcement, and a browser
+        extension for host and keyword rules.</p>
+      </description>
+    </release>
+  </releases>
+</component>

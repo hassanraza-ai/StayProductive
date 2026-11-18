@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "StayProductive",
+  "version": "0.1.0",
+  "description": "Local-only site and keyword blocking that follows the profiles in your StayProductive daemon.",
+  "minimum_chrome_version": "120",
+  "permissions": ["nativeMessaging", "declarativeNetRequest", "storage", "alarms"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["lib/blockpage.js", "content.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["blocked.html", "blocked.css", "blocked.js"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "action": {
+    "default_title": "StayProductive"
+  }
+}

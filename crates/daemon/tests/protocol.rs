@@ -3,6 +3,7 @@
 //! These drive the real binary over stdio, with a temporary state file. They do
 //! not need a desktop or a display, so they run in CI alongside the core suite.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -27,6 +28,8 @@ impl Service {
     fn start(state: &Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_stayproductive-daemon"))
             .env("STAYPRODUCTIVE_STATE", state)
+            .env("STAYPRODUCTIVE_X11_ADAPTER", "0")
+            .env("TZ", "UTC")
             .env(
                 "XDG_RUNTIME_DIR",
                 state.parent().unwrap_or_else(|| Path::new(".")),
@@ -153,12 +156,13 @@ fn strict_commitment_locks_rules_and_survives_restart() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path)
-            .expect("state file")
+        let database = path.with_file_name("state.db");
+        let mode = std::fs::metadata(&database)
+            .expect("database file")
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o600, "state file must be private");
+        assert_eq!(mode, 0o600, "database file must be private");
     }
 
     let mut restarted = Service::start(&path);
@@ -173,8 +177,851 @@ fn strict_commitment_locks_rules_and_survives_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn write_heartbeat(
+    heartbeat: &Path,
+    focus: Option<Vec<&str>>,
+    focus_since: Option<chrono::DateTime<chrono::Utc>>,
+    blocked: bool,
+) {
+    write_adapter_heartbeat(heartbeat, "gnome-extension", focus, focus_since, blocked);
+}
+
+fn write_adapter_heartbeat(
+    heartbeat: &Path,
+    adapter: &str,
+    focus: Option<Vec<&str>>,
+    focus_since: Option<chrono::DateTime<chrono::Utc>>,
+    blocked: bool,
+) {
+    let now = chrono::Utc::now();
+    let body = json!({
+        "adapter": adapter,
+        "active": true,
+        "policy_loaded": true,
+        "blocked": blocked,
+        "focus": focus,
+        "focus_since": focus_since.map(|at| at.to_rfc3339()),
+        "checked_at": now.to_rfc3339(),
+    });
+    std::fs::write(heartbeat, body.to_string()).expect("write heartbeat");
+}
+
+fn policy_apps(policy_path: &Path) -> Vec<Value> {
+    let policy: Value = serde_json::from_slice(&std::fs::read(policy_path).expect("policy file"))
+        .expect("policy json");
+    policy["apps"].as_array().expect("apps array").clone()
+}
+
+fn usage_seconds(snapshot: &Value, app: &str) -> u64 {
+    snapshot["usage_today"]
+        .as_array()
+        .expect("usage_today array")
+        .iter()
+        .find(|entry| entry["app"] == app)
+        .map(|entry| entry["seconds"].as_u64().expect("seconds"))
+        .unwrap_or(0)
+}
+
+/// Seed a state file directly so period totals can be checked without waiting
+/// for real focus intervals (`A-STA-02`, `A-STA-03`, `A-STA-05`, `A-STA-07`).
+fn seed_state(state: &stayproductive_core::State, path: &Path) {
+    let payload = json!({
+        "version": 1,
+        "state": serde_json::to_value(state).expect("state json"),
+    });
+    std::fs::write(path, payload.to_string()).expect("seed state");
+}
+
+fn stats_apps(snapshot: &Value, range: &str) -> Vec<Value> {
+    snapshot["stats"][range]["apps"]
+        .as_array()
+        .expect("stats apps")
+        .clone()
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Read a stored zip written by the export command. This deliberately parses
+/// the central directory instead of trusting the writer, so a wrong offset or
+/// checksum fails the test.
+fn unzip(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
+    let eocd = (0..bytes.len() - 4)
+        .rev()
+        .find(|&at| &bytes[at..at + 4] == b"PK\x05\x06")
+        .expect("end of central directory");
+    let count = u16::from_le_bytes(bytes[eocd + 10..eocd + 12].try_into().expect("count")) as usize;
+    let mut at =
+        u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().expect("offset")) as usize;
+    let mut files = BTreeMap::new();
+    for _ in 0..count {
+        assert_eq!(
+            &bytes[at..at + 4],
+            b"PK\x01\x02",
+            "central directory header"
+        );
+        let method = u16::from_le_bytes(bytes[at + 10..at + 12].try_into().expect("method"));
+        assert_eq!(method, 0, "export entries are stored, not compressed");
+        let crc = u32::from_le_bytes(bytes[at + 16..at + 20].try_into().expect("crc"));
+        let size = u32::from_le_bytes(bytes[at + 20..at + 24].try_into().expect("size")) as usize;
+        let name_len =
+            u16::from_le_bytes(bytes[at + 28..at + 30].try_into().expect("name length")) as usize;
+        let extra_len =
+            u16::from_le_bytes(bytes[at + 30..at + 32].try_into().expect("extra length")) as usize;
+        let comment_len =
+            u16::from_le_bytes(bytes[at + 32..at + 34].try_into().expect("comment length"))
+                as usize;
+        let local =
+            u32::from_le_bytes(bytes[at + 42..at + 46].try_into().expect("local offset")) as usize;
+        let name = String::from_utf8(bytes[at + 46..at + 46 + name_len].to_vec())
+            .expect("utf-8 entry name");
+        assert_eq!(
+            &bytes[local..local + 4],
+            b"PK\x03\x04",
+            "local header for {name}"
+        );
+        let local_name = u16::from_le_bytes(
+            bytes[local + 26..local + 28]
+                .try_into()
+                .expect("name length"),
+        ) as usize;
+        let local_extra = u16::from_le_bytes(
+            bytes[local + 28..local + 30]
+                .try_into()
+                .expect("extra length"),
+        ) as usize;
+        let start = local + 30 + local_name + local_extra;
+        let data = bytes[start..start + size].to_vec();
+        assert_eq!(crc32(&data), crc, "crc for {name}");
+        files.insert(name, data);
+        at += 46 + name_len + extra_len + comment_len;
+    }
+    files
+}
+
 #[test]
-fn enforcement_snapshot_requires_fresh_extension_heartbeat() {
+fn export_and_delete_usage_data() {
+    let (dir, path) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let heartbeat = runtime.join("gnome-extension.json");
+    let export_path = dir.join("export.zip");
+
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "daily_limit", "minutes": 60}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    write_heartbeat(
+        &heartbeat,
+        Some(vec!["firefox"]),
+        Some(chrono::Utc::now() - chrono::Duration::seconds(90)),
+        false,
+    );
+    let snapshot = service.ok("snapshot", json!({}));
+    assert!(usage_seconds(&snapshot, "firefox") >= 90);
+
+    let exported = service.ok("export_data", json!({"path": export_path}));
+    assert_eq!(exported["version"], 1);
+    assert_eq!(exported["format"], "stayproductive.export");
+    assert_eq!(exported["usage_included"], true);
+    let bytes = std::fs::read(&export_path).expect("export archive");
+    let files = unzip(&bytes);
+
+    let manifest: Value = serde_json::from_slice(&files["manifest.json"]).expect("manifest json");
+    assert_eq!(manifest["format"], "stayproductive.export");
+    assert_eq!(manifest["version"], 1);
+    assert_eq!(manifest["usage_included"], true);
+
+    let profiles: Value = serde_json::from_slice(&files["profiles.json"]).expect("profiles json");
+    assert_eq!(profiles["profiles"][0]["name"], "Focus");
+
+    let settings: Value = serde_json::from_slice(&files["settings.json"]).expect("settings json");
+    assert_eq!(settings["start_of_day"], "00:00");
+
+    let usage_name = files
+        .keys()
+        .find(|name| name.starts_with("usage/"))
+        .expect("monthly usage file");
+    let usage: Value = serde_json::from_slice(&files[usage_name]).expect("usage json");
+    assert_eq!(usage["intervals"][0]["app"], "firefox");
+
+    // Deleting history needs an explicit decision.
+    let refused = service.request("delete_history", json!({}));
+    assert_eq!(refused["ok"], false, "unconfirmed delete: {refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .expect("error text")
+            .contains("confirm")
+    );
+
+    std::fs::remove_file(&heartbeat).ok();
+    let deleted = service.ok("delete_history", json!({"confirm": true}));
+    assert!(
+        deleted["removed"]["intervals"].as_u64().expect("count") >= 1,
+        "delete reports what it removed: {deleted}"
+    );
+    assert_eq!(deleted["snapshot"]["usage_today"], json!([]));
+    assert_eq!(deleted["snapshot"]["history"], json!([]));
+    assert_eq!(
+        deleted["snapshot"]["profiles"]
+            .as_array()
+            .expect("profiles")
+            .len(),
+        1,
+        "profiles are configuration, not history"
+    );
+
+    // The deletion is persisted, not only in memory.
+    service.shutdown();
+    let mut restarted = Service::start(&path);
+    let snapshot = restarted.ok("snapshot", json!({}));
+    assert_eq!(snapshot["usage_today"], json!([]));
+    assert_eq!(snapshot["profiles"].as_array().expect("profiles").len(), 1);
+    restarted.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn usage_tracking_enforces_daily_limit_and_records_history() {
+    let (dir, path) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let heartbeat = runtime.join("gnome-extension.json");
+    let policy_path = dir.join("enforcement.json");
+
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "daily_limit", "minutes": 1}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+    assert!(
+        policy_apps(&policy_path).is_empty(),
+        "under the limit the app is not blocked"
+    );
+
+    // 90 seconds of reported focus, over the 1-minute daily limit.
+    write_heartbeat(
+        &heartbeat,
+        Some(vec!["org.mozilla.firefox"]),
+        Some(chrono::Utc::now() - chrono::Duration::seconds(90)),
+        false,
+    );
+    let snapshot = service.ok("snapshot", json!({}));
+    let apps = policy_apps(&policy_path);
+    assert_eq!(apps.len(), 1, "the daily limit must now block: {apps:?}");
+    assert_eq!(apps[0]["app"], "firefox");
+    assert_eq!(apps[0]["reason"], "R-LIMIT-DAILY");
+    assert!(
+        apps[0]["until"].as_str().is_some(),
+        "limit blocks say when the day ends"
+    );
+    assert_eq!(apps[0]["profile"], "Focus");
+    assert!(
+        usage_seconds(&snapshot, "firefox") >= 90,
+        "focus time is attributed to the app: {}",
+        snapshot["usage_today"]
+    );
+    assert_eq!(
+        snapshot["usage_today"]
+            .as_array()
+            .expect("usage_today")
+            .len(),
+        1,
+        "no other app is attributed"
+    );
+    // The block is recorded when the policy is written, after the response
+    // above was rendered; the next poll sees it in history.
+    let snapshot = service.ok("snapshot", json!({}));
+    assert_eq!(
+        snapshot["history"][0]["target"], "firefox",
+        "the enforced block is recorded in history"
+    );
+    assert_eq!(snapshot["history"][0]["reason"], "R-LIMIT-DAILY");
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn blocked_overlay_suspends_usage_accrual() {
+    let (dir, path) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let heartbeat = runtime.join("gnome-extension.json");
+
+    let mut service = Service::start(&path);
+    service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "daily_limit", "minutes": 60}]
+            }
+        }),
+    );
+    let profile_id = service.ok("snapshot", json!({}))["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    let since = chrono::Utc::now() - chrono::Duration::seconds(90);
+    write_heartbeat(&heartbeat, Some(vec!["firefox"]), Some(since), false);
+    let before = usage_seconds(&service.ok("snapshot", json!({})), "firefox");
+    assert!(before >= 90, "usage is attributed while focused: {before}");
+
+    // The overlay is up; time behind the block screen must not count.
+    write_heartbeat(&heartbeat, Some(vec!["firefox"]), Some(since), true);
+    service.ok("snapshot", json!({}));
+
+    // Same focus window resumes after the overlay; the blocked gap must not
+    // be re-attributed even though focus_since still predates it.
+    write_heartbeat(&heartbeat, Some(vec!["firefox"]), Some(since), false);
+    let after = usage_seconds(&service.ok("snapshot", json!({})), "firefox");
+    assert!(
+        after - before < 30,
+        "blocked time must not accrue: before {before}, after {after}"
+    );
+
+    // A stale heartbeat means no observer: attribution stops again.
+    std::fs::write(
+        &heartbeat,
+        json!({
+            "active": true,
+            "policy_loaded": true,
+            "blocked": false,
+            "focus": ["firefox"],
+            "focus_since": since.to_rfc3339(),
+            "checked_at": (chrono::Utc::now() - chrono::Duration::seconds(30)).to_rfc3339(),
+        })
+        .to_string(),
+    )
+    .expect("write stale heartbeat");
+    let stopped = usage_seconds(&service.ok("snapshot", json!({})), "firefox");
+    assert!(
+        stopped - after < 30,
+        "attribution must stop without a fresh observer: after {after}, stopped {stopped}"
+    );
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stats_report_today_week_month_rankings_and_counts() {
+    use stayproductive_core::{AppKey, ClockSettings, ReasonCode, State, Target, day_period};
+
+    let (dir, path) = temp_state();
+    let mut state = State::new(ClockSettings::default());
+    let mut now = chrono::Utc::now();
+    let period = day_period(now, &state.settings);
+    if now - period.start < chrono::Duration::seconds(2) {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        now = chrono::Utc::now();
+    }
+    let period = day_period(now, &state.settings);
+    let start = (now - chrono::Duration::minutes(10)).max(period.start);
+    let end = now - chrono::Duration::seconds(1);
+    let split = start + (end - start) / 3 * 2;
+
+    let social = AppKey::new("social").unwrap();
+    let editor = AppKey::new("editor").unwrap();
+    state.usage.foreground(social.clone(), start);
+    state.usage.close_foreground(split);
+    state.usage.foreground(editor.clone(), split);
+    state.usage.close_foreground(end);
+    state
+        .usage
+        .screen_unlocked(now - chrono::Duration::seconds(45));
+    state.usage.blocked(
+        Target::App(social.clone()),
+        ReasonCode::LimitDaily,
+        now - chrono::Duration::seconds(30),
+        Some(now + chrono::Duration::hours(1)),
+        None,
+    );
+    seed_state(&state, &path);
+
+    let service = Service::start(&path);
+    let mut service = service;
+    let snapshot = service.ok("snapshot", json!({}));
+    assert!(
+        snapshot["data_path"]
+            .as_str()
+            .expect("database path")
+            .ends_with("state.db"),
+        "the snapshot reports the SQLite file: {}",
+        snapshot["data_path"]
+    );
+    let today = &snapshot["stats"]["today"];
+    assert!(
+        today["seconds"].as_u64().unwrap() >= 500,
+        "today's seeded intervals are counted: {today}"
+    );
+    assert_eq!(today["blocks"], 1);
+    assert_eq!(today["pickups"], 1);
+    assert_eq!(today["launches"], 2, "one launch per foreground entry");
+
+    let apps = stats_apps(&snapshot, "today");
+    assert_eq!(apps.len(), 2, "only apps with time are ranked: {apps:?}");
+    assert_eq!(apps[0]["app"], "social", "longest first: {apps:?}");
+    assert_eq!(apps[1]["app"], "editor");
+    assert!(
+        apps[0]["seconds"].as_u64() > apps[1]["seconds"].as_u64(),
+        "the ranking is ordered by time"
+    );
+    let app_seconds: u64 = apps
+        .iter()
+        .map(|app| app["seconds"].as_u64().unwrap())
+        .sum();
+    assert_eq!(
+        app_seconds,
+        today["seconds"].as_u64().unwrap(),
+        "ranked apps add up to the range total"
+    );
+    assert!(apps[0]["share"].as_f64().unwrap() > 0.0);
+
+    let week = snapshot["stats"]["week"]["seconds"].as_u64().unwrap();
+    let month = snapshot["stats"]["month"]["seconds"].as_u64().unwrap();
+    assert!(week >= today["seconds"].as_u64().unwrap());
+    assert!(month >= week, "month contains the week");
+
+    let history = snapshot["history"].as_array().expect("history");
+    assert_eq!(history[0]["target"], "social");
+    assert_eq!(history[0]["reason"], "R-LIMIT-DAILY");
+    assert!(
+        history[0]["until"].as_str().is_some(),
+        "history keeps the block end time"
+    );
+    assert!(
+        history[0].get("title").is_none(),
+        "history never records window titles"
+    );
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn allowlisted_app_is_never_put_in_the_enforcement_policy() {
+    let (dir, path) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let heartbeat = runtime.join("gnome-extension.json");
+    let policy_path = dir.join("enforcement.json");
+
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "block"}],
+                "allow_apps": ["firefox"]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    write_heartbeat(
+        &heartbeat,
+        Some(vec!["firefox"]),
+        Some(chrono::Utc::now() - chrono::Duration::seconds(30)),
+        false,
+    );
+    let snapshot = service.ok("snapshot", json!({}));
+    assert!(
+        policy_apps(&policy_path).is_empty(),
+        "an allowlist overrides a non-strict block in the policy: {:?}",
+        policy_apps(&policy_path)
+    );
+    assert_eq!(
+        snapshot["history"],
+        json!([]),
+        "nothing is recorded as blocked when the allowlist wins"
+    );
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn launch_limit_blocks_from_the_persisted_launch_count() {
+    use stayproductive_core::{
+        Activation, AppKey, ClockSettings, LimitPeriod, Profile, State, hour_period,
+    };
+
+    let (dir, path) = temp_state();
+    let mut now = chrono::Utc::now();
+    let hour = hour_period(now, chrono_tz::UTC);
+    if now - hour.start < chrono::Duration::seconds(30) {
+        std::thread::sleep(std::time::Duration::from_secs(31));
+        now = chrono::Utc::now();
+    }
+    let hour = hour_period(now, chrono_tz::UTC);
+    let social = AppKey::new("social").unwrap();
+    let mut state = State::new(ClockSettings::default());
+    state
+        .add_profile(
+            Profile::new("Focus", now)
+                .unwrap()
+                .with_activation(Activation::Always)
+                .launch_limit("social", 2, LimitPeriod::Hourly)
+                .unwrap(),
+        )
+        .unwrap();
+    // Three counted launches inside the current hour; each foreground return
+    // is more than five seconds after the previous exit, so all three count.
+    let first = hour.start + chrono::Duration::seconds(1);
+    state.usage.foreground(social.clone(), first);
+    state
+        .usage
+        .close_foreground(first + chrono::Duration::seconds(7));
+    state
+        .usage
+        .foreground(social.clone(), first + chrono::Duration::seconds(13));
+    state
+        .usage
+        .close_foreground(first + chrono::Duration::seconds(19));
+    state
+        .usage
+        .foreground(social.clone(), first + chrono::Duration::seconds(25));
+    state
+        .usage
+        .close_foreground(first + chrono::Duration::seconds(26));
+    seed_state(&state, &path);
+
+    let mut service = Service::start(&path);
+    let snapshot = service.ok("snapshot", json!({}));
+    let apps = policy_apps(&dir.join("enforcement.json"));
+    assert_eq!(apps.len(), 1, "the launch limit blocks: {apps:?}");
+    assert_eq!(apps[0]["app"], "social");
+    assert_eq!(apps[0]["reason"], "R-LAUNCH");
+    let until =
+        chrono::DateTime::parse_from_rfc3339(apps[0]["until"].as_str().expect("launch block end"))
+            .expect("rfc3339")
+            .with_timezone(&chrono::Utc);
+    assert_eq!(
+        until, hour.end,
+        "the launch allowance resets at the next hour"
+    );
+    assert_eq!(snapshot["stats"]["today"]["launches"], 3);
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn browser_decision_blocks_sites_and_keywords_with_daemon_reasons() {
+    let (dir, path) = temp_state();
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "sites": [{"pattern": "*.example.com", "action": "block"}],
+                "keywords": ["games"],
+                "allow_sites": ["good.example.com"]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    let blocked = service.ok(
+        "browser_decision",
+        json!({"url": "https://bad.example.com/play", "app": "firefox"}),
+    );
+    assert_eq!(blocked["blocked"], true, "{blocked}");
+    assert_eq!(blocked["reason"], "R-SITE");
+    assert_eq!(blocked["message"], "block.site");
+    assert_eq!(blocked["target"], "bad.example.com");
+
+    let bare = service.ok(
+        "browser_decision",
+        json!({"url": "https://example.com/", "app": "firefox"}),
+    );
+    assert_eq!(
+        bare["blocked"], false,
+        "a suffix rule excludes the bare domain: {bare}"
+    );
+
+    let allowed = service.ok(
+        "browser_decision",
+        json!({"url": "https://good.example.com/", "app": "firefox"}),
+    );
+    assert_eq!(allowed["blocked"], false, "the allowlist wins: {allowed}");
+    assert_eq!(allowed["reason"], "R-ALLOW");
+
+    let keyword = service.ok(
+        "browser_decision",
+        json!({"url": "https://elsewhere.test/?q=games", "app": "firefox"}),
+    );
+    assert_eq!(keyword["blocked"], true, "{keyword}");
+    assert_eq!(keyword["reason"], "R-KEYWORD");
+
+    let policy = service.ok("browser_policy", json!({}));
+    assert_eq!(policy["site_blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(policy["site_blocks"][0]["host"], "example.com");
+    assert_eq!(policy["site_blocks"][0]["suffix"], true);
+    assert_eq!(policy["site_allows"][0]["host"], "good.example.com");
+    assert_eq!(policy["keywords"][0]["text"], "games");
+    assert_eq!(
+        policy["limitations"],
+        json!(["site_limits", "surface_rules"])
+    );
+    assert_eq!(policy["refresh_after_seconds"], 30);
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn usage_counters_survive_restart() {
+    let (dir, path) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let heartbeat = runtime.join("gnome-extension.json");
+    let policy_path = dir.join("enforcement.json");
+
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "steam", "action": "daily_limit", "minutes": 1}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    write_heartbeat(
+        &heartbeat,
+        Some(vec!["steam"]),
+        Some(chrono::Utc::now() - chrono::Duration::seconds(90)),
+        false,
+    );
+    let snapshot = service.ok("snapshot", json!({}));
+    assert!(
+        usage_seconds(&snapshot, "steam") >= 90,
+        "usage recorded before restart"
+    );
+    assert!(
+        policy_apps(&policy_path)
+            .iter()
+            .any(|app| app["app"] == "steam"),
+        "blocked before restart"
+    );
+    service.shutdown();
+
+    // Restart with no focus reported: the recorded intervals must keep the
+    // limit exhausted (A-LIM-05).
+    write_heartbeat(&heartbeat, None, None, false);
+    let mut restarted = Service::start(&path);
+    let snapshot = restarted.ok("snapshot", json!({}));
+    assert!(
+        usage_seconds(&snapshot, "steam") >= 90,
+        "usage survives the restart"
+    );
+    assert!(
+        policy_apps(&policy_path)
+            .iter()
+            .any(|app| app["app"] == "steam" && app["reason"] == "R-LIMIT-DAILY"),
+        "the exhausted limit still blocks after restart"
+    );
+    restarted.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn x11_focus_reports_feed_usage_limits() {
+    let (dir, path) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    // No GNOME extension here: the X11 adapter is the only observer.
+    let heartbeat = runtime.join("x11-adapter.json");
+    let policy_path = dir.join("enforcement.json");
+
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "daily_limit", "minutes": 1}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    // The adapter reports WM_CLASS and desktop-id aliases; the daemon maps
+    // them to the profile's own key.
+    write_adapter_heartbeat(
+        &heartbeat,
+        "x11",
+        Some(vec!["navigator", "firefox", "org.mozilla.firefox"]),
+        Some(chrono::Utc::now() - chrono::Duration::seconds(90)),
+        false,
+    );
+    let snapshot = service.ok("snapshot", json!({}));
+    assert!(
+        usage_seconds(&snapshot, "firefox") >= 90,
+        "X11 focus time is attributed: {}",
+        usage_seconds(&snapshot, "firefox")
+    );
+    let apps = policy_apps(&policy_path);
+    assert_eq!(apps.len(), 1, "the daily limit blocks on X11 too: {apps:?}");
+    assert_eq!(apps[0]["app"], "firefox");
+    assert_eq!(apps[0]["reason"], "R-LIMIT-DAILY");
+
+    // Behind the X11 overlay the adapter reports no focus, so the interval
+    // closes instead of accruing behind the explanation.
+    write_adapter_heartbeat(&heartbeat, "x11", None, None, true);
+    let before = usage_seconds(&service.ok("snapshot", json!({})), "firefox");
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let after = usage_seconds(&service.ok("snapshot", json!({})), "firefox");
+    assert_eq!(after, before, "no usage accrues behind the block overlay");
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_clean_install_restores_an_export() {
+    let (source_dir, source_path) = temp_state();
+    let backup = source_dir.join("backup.zip");
+
+    let mut source = Service::start(&source_path);
+    let created = source.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "block"}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    source.ok("activate_profile", json!({"profile_id": profile_id}));
+    source.ok(
+        "set_settings",
+        json!({"start_of_day": "04:00", "timezone": "Europe/Berlin"}),
+    );
+    source.ok(
+        "start_strict",
+        json!({"minutes": 30, "cooldown_minutes": 5}),
+    );
+    source.ok(
+        "export_data",
+        json!({"path": backup, "include_usage": false}),
+    );
+    source.shutdown();
+
+    let (target_dir, target_path) = temp_state();
+    let mut target = Service::start(&target_path);
+    let empty = target.ok("snapshot", json!({}));
+    assert_eq!(empty["profiles"], json!([]));
+
+    // A file that is not our archive fails cleanly and changes nothing.
+    let bogus = target_dir.join("bogus.zip");
+    std::fs::write(&bogus, b"not a zip archive").expect("write bogus file");
+    let refused = target.request("import_data", json!({"path": bogus}));
+    assert_eq!(refused["ok"], false);
+    assert!(
+        refused["error"]
+            .as_str()
+            .expect("error text")
+            .contains("zip"),
+        "unexpected error: {refused}"
+    );
+    assert_eq!(target.ok("snapshot", json!({}))["profiles"], json!([]));
+
+    let imported = target.ok("import_data", json!({"path": backup}));
+    assert_eq!(imported["replaced"], true, "a clean install is replaced");
+    assert_eq!(imported["profiles_added"], 1);
+    assert_eq!(imported["settings_applied"], true);
+    assert_eq!(imported["usage_imported"], false);
+    let snapshot = &imported["snapshot"];
+    assert_eq!(snapshot["profiles"][0]["name"], "Focus");
+    assert_eq!(snapshot["settings"]["start_of_day"], "04:00");
+    assert_eq!(snapshot["settings"]["timezone"], "Europe/Berlin");
+    assert_eq!(
+        snapshot["commitment"]["state"], "active",
+        "the strict session is restored: {snapshot}"
+    );
+
+    // The restored state is persisted, not only held in memory.
+    target.shutdown();
+    let mut restarted = Service::start(&target_path);
+    let snapshot = restarted.ok("snapshot", json!({}));
+    assert_eq!(snapshot["profiles"][0]["name"], "Focus");
+    restarted.shutdown();
+    let _ = std::fs::remove_dir_all(&source_dir);
+    let _ = std::fs::remove_dir_all(&target_dir);
+}
+
+#[test]
+fn enforcement_snapshot_requires_a_fresh_adapter_heartbeat() {
     let (dir, path) = temp_state();
     let mut service = Service::start(&path);
     let runtime = dir.join("stayproductive");
@@ -192,6 +1039,7 @@ fn enforcement_snapshot_requires_fresh_extension_heartbeat() {
     std::fs::write(
         &heartbeat,
         json!({
+            "adapter": "gnome-extension",
             "active": true,
             "policy_loaded": true,
             "checked_at": chrono::Utc::now().to_rfc3339(),
@@ -205,6 +1053,7 @@ fn enforcement_snapshot_requires_fresh_extension_heartbeat() {
     std::fs::write(
         &heartbeat,
         json!({
+            "adapter": "gnome-extension",
             "active": true,
             "policy_loaded": true,
             "checked_at": (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339(),
@@ -218,6 +1067,7 @@ fn enforcement_snapshot_requires_fresh_extension_heartbeat() {
     std::fs::write(
         &heartbeat,
         json!({
+            "adapter": "gnome-extension",
             "active": true,
             "policy_loaded": false,
             "checked_at": chrono::Utc::now().to_rfc3339(),
@@ -231,6 +1081,7 @@ fn enforcement_snapshot_requires_fresh_extension_heartbeat() {
     std::fs::write(
         &heartbeat,
         json!({
+            "adapter": "gnome-extension",
             "active": false,
             "policy_loaded": true,
             "checked_at": chrono::Utc::now().to_rfc3339(),
@@ -240,6 +1091,38 @@ fn enforcement_snapshot_requires_fresh_extension_heartbeat() {
     .expect("write inactive heartbeat");
     let snapshot = service.ok("snapshot", json!({}));
     assert_eq!(snapshot["enforcement"]["state"], "unavailable");
+
+    // An X11 heartbeat with the expected adapter id wins over GNOME, and a
+    // file that declares a different adapter is ignored.
+    std::fs::write(
+        runtime.join("x11-adapter.json"),
+        json!({
+            "adapter": "not-x11",
+            "active": true,
+            "policy_loaded": true,
+            "checked_at": chrono::Utc::now().to_rfc3339(),
+        })
+        .to_string(),
+    )
+    .expect("write foreign x11 heartbeat");
+    let snapshot = service.ok("snapshot", json!({}));
+    assert_eq!(snapshot["enforcement"]["state"], "unavailable");
+
+    std::fs::write(
+        runtime.join("x11-adapter.json"),
+        json!({
+            "adapter": "x11",
+            "active": true,
+            "policy_loaded": true,
+            "checked_at": chrono::Utc::now().to_rfc3339(),
+        })
+        .to_string(),
+    )
+    .expect("write x11 heartbeat");
+    let snapshot = service.ok("snapshot", json!({}));
+    assert_eq!(snapshot["enforcement"]["state"], "active");
+    assert_eq!(snapshot["enforcement"]["adapter"], "x11");
+    let _ = std::fs::remove_file(runtime.join("x11-adapter.json"));
 
     service.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
@@ -328,4 +1211,762 @@ fn enforcement_policy_tracks_active_app_rules() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------- socket mode
+
+use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
+
+struct SocketClient {
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
+    next_id: u64,
+}
+
+impl SocketClient {
+    fn connect(path: &Path) -> Self {
+        let stream = UnixStream::connect(path).expect("connect to socket");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut client = Self {
+            stream,
+            reader,
+            next_id: 1,
+        };
+        let greeting: Value = serde_json::from_str(&client.read_line()).expect("greeting json");
+        assert_eq!(greeting["event"], "ready");
+        client
+    }
+
+    fn read_line(&mut self) -> String {
+        let mut line = String::new();
+        self.reader.read_line(&mut line).expect("read response");
+        assert!(!line.is_empty(), "service closed the socket");
+        line
+    }
+
+    fn request(&mut self, command: &str, payload: Value) -> Value {
+        let mut body = payload;
+        body["id"] = json!(self.next_id);
+        body["cmd"] = json!(command);
+        self.next_id += 1;
+        writeln!(self.stream, "{body}").expect("write request");
+        self.stream.flush().expect("flush request");
+        serde_json::from_str(&self.read_line()).expect("response json")
+    }
+
+    fn ok(&mut self, command: &str, payload: Value) -> Value {
+        let response = self.request(command, payload);
+        assert_eq!(response["ok"], true, "{command} failed: {response}");
+        response["data"].clone()
+    }
+}
+
+struct SocketDaemon {
+    child: Option<Child>,
+    socket: PathBuf,
+}
+
+impl SocketDaemon {
+    fn start(state: &Path, socket: &Path) -> Self {
+        Self::start_with_adapter(state, socket, None)
+    }
+
+    fn start_with_adapter(state: &Path, socket: &Path, adapter: Option<&Path>) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_stayproductive-daemon"));
+        command
+            .arg("--socket")
+            .arg(socket)
+            .env("STAYPRODUCTIVE_STATE", state)
+            .env(
+                "STAYPRODUCTIVE_X11_ADAPTER",
+                adapter
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "0".to_string()),
+            )
+            .env(
+                "XDG_RUNTIME_DIR",
+                state.parent().unwrap_or_else(|| Path::new(".")),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = command.spawn().expect("start socket service");
+        // Own the child immediately so a failed readiness check or a panic
+        // cannot leave a zombie behind.
+        let service = Self {
+            child: Some(child),
+            socket: socket.to_path_buf(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if UnixStream::connect(socket).is_ok() {
+                return service;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "socket service did not become ready at {}",
+            socket.display()
+        );
+    }
+
+    fn shutdown(mut self) {
+        let mut client = SocketClient::connect(&self.socket);
+        client.ok("shutdown", json!({}));
+        let mut child = self.child.take().expect("service child");
+        let status = child.wait().expect("wait for service");
+        assert!(status.success(), "service exited with {status}");
+        assert!(!self.socket.exists(), "socket file must be removed on exit");
+    }
+}
+
+impl Drop for SocketDaemon {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn socket_service_is_single_instance_and_private() {
+    let (dir, state) = temp_state();
+    let socket = dir.join("stayproductive").join("daemon.sock");
+    let daemon = SocketDaemon::start(&state, &socket);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&socket)
+            .expect("socket file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "socket must be same-user only");
+        let dir_mode = std::fs::metadata(socket.parent().expect("socket parent"))
+            .expect("socket directory")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "socket directory must be private");
+    }
+
+    let mut second = Command::new(env!("CARGO_BIN_EXE_stayproductive-daemon"))
+        .arg("--socket")
+        .arg(&socket)
+        .env("STAYPRODUCTIVE_STATE", &state)
+        .env("STAYPRODUCTIVE_X11_ADAPTER", "0")
+        .env(
+            "XDG_RUNTIME_DIR",
+            state.parent().unwrap_or_else(|| Path::new(".")),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start second instance");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = second.try_wait().expect("poll second instance") {
+            break Some(status);
+        }
+        if Instant::now() > deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "a second instance must exit successfully without taking over"
+    );
+
+    let mut client = SocketClient::connect(&socket);
+    let snapshot = client.ok("snapshot", json!({}));
+    assert_eq!(
+        PathBuf::from(snapshot["state_path"].as_str().expect("state path")),
+        state
+    );
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn socket_service_refreshes_the_policy_without_a_client() {
+    let (dir, state) = temp_state();
+    let socket = dir.join("stayproductive").join("daemon.sock");
+    let policy_path = dir.join("enforcement.json");
+    let daemon = SocketDaemon::start(&state, &socket);
+
+    let mut client = SocketClient::connect(&socket);
+    let created = client.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "block"}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    client.ok("activate_profile", json!({"profile_id": profile_id}));
+    let before = read_policy(&policy_path)["generated_at"]
+        .as_str()
+        .expect("generated_at")
+        .to_owned();
+    drop(client);
+
+    // No client for six seconds; the daemon itself must keep the short-lived
+    // policy fresh, otherwise enforcement silently lapses when the window closes.
+    std::thread::sleep(Duration::from_secs(6));
+    let after = read_policy(&policy_path)["generated_at"]
+        .as_str()
+        .expect("generated_at")
+        .to_owned();
+    assert!(
+        after > before,
+        "policy timestamp did not advance without a client: {before} -> {after}"
+    );
+
+    let mut client = SocketClient::connect(&socket);
+    let snapshot = client.ok("snapshot", json!({}));
+    assert_eq!(snapshot["profiles"][0]["name"], "Focus");
+    drop(client);
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn read_policy(path: &Path) -> Value {
+    serde_json::from_slice(&std::fs::read(path).expect("policy file")).expect("policy json")
+}
+
+#[test]
+fn socket_service_tracks_usage_without_a_client() {
+    let (dir, state) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let socket = runtime.join("daemon.sock");
+    let heartbeat = runtime.join("x11-adapter.json");
+    let daemon = SocketDaemon::start(&state, &socket);
+
+    let mut client = SocketClient::connect(&socket);
+    let created = client.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "daily_limit", "minutes": 60}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    client.ok("activate_profile", json!({"profile_id": profile_id}));
+    drop(client);
+
+    write_adapter_heartbeat(
+        &heartbeat,
+        "x11",
+        Some(vec!["firefox"]),
+        Some(chrono::Utc::now() - chrono::Duration::seconds(90)),
+        false,
+    );
+
+    // No client for six seconds: the daemon itself must attribute the reported
+    // focus, not only refresh the policy, so limits keep working when the GTK
+    // window is closed.
+    std::thread::sleep(Duration::from_secs(6));
+
+    let mut client = SocketClient::connect(&socket);
+    let snapshot = client.ok("snapshot", json!({}));
+    assert!(
+        usage_seconds(&snapshot, "firefox") >= 90,
+        "usage is attributed without a client: {}",
+        usage_seconds(&snapshot, "firefox")
+    );
+    drop(client);
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn socket_service_supervises_the_x11_adapter() {
+    let (dir, state) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let socket = runtime.join("daemon.sock");
+    let heartbeat = runtime.join("x11-adapter.json");
+    let pid_file = dir.join("adapter.pid");
+    let adapter = dir.join("fake-adapter.sh");
+    let script = format!(
+        "#!/bin/sh\n\
+         heartbeat=\"\"\n\
+         while [ $# -gt 0 ]; do\n\
+         \x20 case \"$1\" in\n\
+         \x20   --heartbeat) heartbeat=\"$2\"; shift 2 ;;\n\
+         \x20   *) shift ;;\n\
+         \x20 esac\n\
+         done\n\
+         echo $$ > \"{}\"\n\
+         while :; do\n\
+         \x20 mkdir -p \"$(dirname \"$heartbeat\")\"\n\
+         \x20 printf '{{\"adapter\":\"x11\",\"active\":true,\"policy_loaded\":true,\"checked_at\":\"%s\"}}\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$heartbeat\"\n\
+         \x20 sleep 0.2\n\
+         done\n",
+        pid_file.display()
+    );
+    std::fs::write(&adapter, script).expect("write fake adapter");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700))
+            .expect("make adapter executable");
+    }
+
+    let daemon = SocketDaemon::start_with_adapter(&state, &socket, Some(&adapter));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let first_pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file)
+            && let Ok(pid) = text.trim().parse::<u32>()
+            && heartbeat.exists()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "adapter did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let mut client = SocketClient::connect(&socket);
+    let snapshot = client.ok("snapshot", json!({}));
+    assert_eq!(snapshot["enforcement"]["state"], "active");
+    assert_eq!(snapshot["enforcement"]["adapter"], "x11");
+
+    // Kill the adapter: the daemon must notice, drop the stale heartbeat, and
+    // start a replacement without any UI or client involvement.
+    let status = Command::new("kill")
+        .args(["-9", &first_pid.to_string()])
+        .status()
+        .expect("kill adapter");
+    assert!(status.success(), "kill failed");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let second_pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&pid_file)
+            && let Ok(pid) = text.trim().parse::<u32>()
+            && pid != first_pid
+            && heartbeat.exists()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "adapter was not restarted");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let snapshot = client.ok("snapshot", json!({}));
+    assert_eq!(snapshot["enforcement"]["state"], "active");
+    assert_eq!(snapshot["enforcement"]["adapter"], "x11");
+    drop(client);
+    daemon.shutdown();
+
+    // Shutdown stops the adapter; no orphan keeps enforcing.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Path::new(&format!("/proc/{second_pid}")).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "adapter {second_pid} survived shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_data_03_a_newer_protocol_is_refused_while_enforcement_continues() {
+    let (dir, path) = temp_state();
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "sites": [{"pattern": "example.com", "action": "block"}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    let refused = service.request("snapshot", json!({"schema_version": 99}));
+    assert_eq!(refused["ok"], false, "{refused}");
+    let message = refused["error"].as_str().expect("error text");
+    assert!(message.contains("newer"), "{message}");
+    assert!(message.contains("Blocking continues"), "{message}");
+    assert_eq!(refused["protocol_version"], 1);
+    // The envelope echoes the id of the request that was refused.
+    assert_eq!(refused["id"], 3); // create_profile=1, activate_profile=2
+
+    // The same daemon still decides and therefore still enforces.
+    let decision = service.ok(
+        "browser_decision",
+        json!({"url": "https://example.com/lesson", "app": "firefox"}),
+    );
+    assert_eq!(decision["blocked"], true, "{decision}");
+    assert_eq!(decision["reason"], "R-SITE");
+
+    // Older peers that omit the field, or send the current version, work.
+    let current = service.ok("snapshot", json!({"schema_version": 1}));
+    assert_eq!(current["profiles"].as_array().expect("profiles").len(), 1);
+    let legacy = service.ok("snapshot", json!({}));
+    assert_eq!(legacy["profiles"].as_array().expect("profiles").len(), 1);
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_data_04_reset_needs_confirmation_and_strict_commitments_refuse_it() {
+    let (dir, path) = temp_state();
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "block"}],
+                "sites": [{"pattern": "example.com", "action": "block"}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+    service.ok(
+        "set_settings",
+        json!({"start_of_day": "04:00", "timezone": "UTC"}),
+    );
+    service.ok(
+        "quick_block",
+        json!({"kind": "site", "target": "news.example.com", "minutes": 10}),
+    );
+
+    let refused = service.request("reset_all", json!({}));
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("confirm"),
+        "{refused}"
+    );
+
+    service.ok(
+        "start_strict",
+        json!({"minutes": 30, "cooldown_minutes": 10}),
+    );
+    let locked = service.request("reset_all", json!({"confirm": true}));
+    assert_eq!(locked["ok"], false, "{locked}");
+    assert!(
+        locked["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("commitment"),
+        "{locked}"
+    );
+
+    let snapshot = service.ok("snapshot", json!({}));
+    assert_eq!(snapshot["profiles"].as_array().expect("profiles").len(), 1);
+    assert_eq!(
+        snapshot["quick_blocks"]
+            .as_array()
+            .expect("quick blocks")
+            .len(),
+        1
+    );
+    assert_eq!(snapshot["settings"]["start_of_day"], "04:00");
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_data_04_a_confirmed_reset_clears_rules_and_history_but_keeps_commitments() {
+    let (dir, path) = temp_state();
+    let mut service = Service::start(&path);
+    service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "block"}]
+            }
+        }),
+    );
+    service.ok(
+        "quick_block",
+        json!({"kind": "app", "target": "steam", "minutes": 10}),
+    );
+    service.ok(
+        "set_settings",
+        json!({"start_of_day": "04:00", "timezone": "UTC"}),
+    );
+
+    let result = service.ok("reset_all", json!({"confirm": true}));
+    assert_eq!(result["removed"]["profiles"], 1, "{result}");
+    assert_eq!(result["removed"]["quick_blocks"], 1, "{result}");
+    assert_eq!(result["commitments_kept"], 0, "{result}");
+
+    let snapshot = service.ok("snapshot", json!({}));
+    assert!(
+        snapshot["profiles"]
+            .as_array()
+            .expect("profiles")
+            .is_empty()
+    );
+    assert!(
+        snapshot["quick_blocks"]
+            .as_array()
+            .expect("quick blocks")
+            .is_empty()
+    );
+    assert_eq!(snapshot["settings"]["start_of_day"], "00:00");
+    assert_eq!(snapshot["settings"]["timezone"], "UTC");
+    assert_eq!(snapshot["stats"]["today"]["seconds"], 0);
+
+    service.shutdown();
+
+    // The reset is durable, not just a reply.
+    let mut restarted = Service::start(&path);
+    let snapshot = restarted.ok("snapshot", json!({}));
+    assert!(
+        snapshot["profiles"]
+            .as_array()
+            .expect("profiles")
+            .is_empty()
+    );
+    assert!(
+        snapshot["quick_blocks"]
+            .as_array()
+            .expect("quick blocks")
+            .is_empty()
+    );
+    restarted.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn duplicate_profile_copies_rules_and_refuses_a_clash_or_a_lock() {
+    let (dir, path) = temp_state();
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "block"}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+
+    let copied = service.ok(
+        "duplicate_profile",
+        json!({"profile_id": profile_id, "name": "Focus copy"}),
+    );
+    let profiles = copied["profiles"].as_array().expect("profiles");
+    assert_eq!(profiles.len(), 2);
+    let copy = profiles
+        .iter()
+        .find(|profile| profile["name"] == "Focus copy")
+        .expect("copy");
+    assert_ne!(copy["id"], profile_id);
+    assert_eq!(copy["apps"][0]["key"], "firefox");
+    assert_eq!(copy["apps"][0]["action"], "block");
+
+    let clash = service.request(
+        "duplicate_profile",
+        json!({"profile_id": profile_id, "name": "focus"}),
+    );
+    assert_eq!(clash["ok"], false, "duplicate name: {clash}");
+
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+    service.ok(
+        "start_strict",
+        json!({"minutes": 30, "cooldown_minutes": 5}),
+    );
+    let locked = service.request(
+        "duplicate_profile",
+        json!({"profile_id": profile_id, "name": "Another copy"}),
+    );
+    assert_eq!(locked["ok"], false, "strict session: {locked}");
+    assert!(
+        locked["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("locked") || error.contains("commitment")),
+        "{locked}"
+    );
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pause_for_fifteen_minutes_until_end_of_day_and_until_resume() {
+    let (dir, path) = temp_state();
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "block"}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    let paused = service.ok(
+        "pause_profile",
+        json!({"profile_id": profile_id, "minutes": 15}),
+    );
+    let profile = &paused["profiles"][0];
+    assert_eq!(profile["paused"], true);
+    let until = chrono::DateTime::parse_from_rfc3339(
+        profile["paused_until"].as_str().expect("paused until"),
+    )
+    .expect("paused until timestamp")
+    .with_timezone(&chrono::Utc);
+    let expected = chrono::Utc::now() + chrono::TimeDelta::minutes(15);
+    assert!(
+        (until - expected).num_seconds().abs() < 5,
+        "15 minute pause ended at {until}, expected near {expected}"
+    );
+    assert!(
+        policy_apps(&dir.join("enforcement.json")).is_empty(),
+        "a paused profile does not block"
+    );
+
+    service.ok("resume_profile", json!({"profile_id": profile_id}));
+    service.ok(
+        "set_settings",
+        json!({"start_of_day": "04:00", "timezone": "UTC"}),
+    );
+    let today = service.ok(
+        "pause_profile",
+        json!({"profile_id": profile_id, "until_end_of_day": true}),
+    );
+    let until = chrono::DateTime::parse_from_rfc3339(
+        today["profiles"][0]["paused_until"]
+            .as_str()
+            .expect("end of day"),
+    )
+    .expect("end of day timestamp")
+    .with_timezone(&chrono::Utc);
+    let now = chrono::Utc::now();
+    let today_boundary = now.date_naive().and_hms_opt(4, 0, 0).unwrap().and_utc();
+    let boundary = if now < today_boundary {
+        today_boundary
+    } else {
+        today_boundary + chrono::TimeDelta::days(1)
+    };
+    assert_eq!(until, boundary, "rest of today ends at the next 04:00 UTC");
+
+    service.ok("resume_profile", json!({"profile_id": profile_id}));
+    let indefinite = service.ok(
+        "pause_profile",
+        json!({"profile_id": profile_id, "minutes": 0}),
+    );
+    assert_eq!(indefinite["profiles"][0]["paused"], true);
+    assert!(indefinite["profiles"][0]["paused_until"].is_null());
+    let resumed = service.ok("resume_profile", json!({"profile_id": profile_id}));
+    assert_eq!(resumed["profiles"][0]["paused"], false);
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_unlock_records_one_pickup_and_a_reached_limit_blocks() {
+    let (dir, path) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let heartbeat = runtime.join("gnome-extension.json");
+
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "daily_limit", "minutes": 600}],
+                "pickup_limit": {"count": 1, "per": "daily"}
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    write_lock_heartbeat(&heartbeat, true);
+    let locked = service.ok("snapshot", json!({}));
+    assert_eq!(locked["stats"]["today"]["pickups"], 0);
+
+    write_lock_heartbeat(&heartbeat, false);
+    let unlocked = service.ok("snapshot", json!({}));
+    assert_eq!(unlocked["stats"]["today"]["pickups"], 1);
+    let policy = policy_apps(&dir.join("enforcement.json"));
+    assert!(
+        policy
+            .iter()
+            .any(|entry| entry["reason"] == "R-PICKUP" && entry["app"] == "firefox"),
+        "policy after one pickup: {policy:?}"
+    );
+
+    write_lock_heartbeat(&heartbeat, false);
+    let again = service.ok("snapshot", json!({}));
+    assert_eq!(again["stats"]["today"]["pickups"], 1);
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn write_lock_heartbeat(heartbeat: &Path, locked: bool) {
+    let body = json!({
+        "adapter": "gnome-extension",
+        "active": true,
+        "policy_loaded": true,
+        "blocked": false,
+        "focus": ["firefox"],
+        "locked": locked,
+        "suspended": false,
+        "checked_at": chrono::Utc::now().to_rfc3339(),
+    });
+    std::fs::write(heartbeat, body.to_string()).expect("write lock heartbeat");
 }

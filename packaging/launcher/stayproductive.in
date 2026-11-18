@@ -1,0 +1,7 @@
+#!/bin/sh
+# Installed launcher. The source checkout uses ./stayproductive instead.
+set -eu
+
+PYTHONPATH="@LIBDIR@${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+exec python3 -m stayproductive "$@"

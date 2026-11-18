@@ -1,46 +1,72 @@
 //! The StayProductive local state service.
 //!
-//! For the first runnable UI this binary owns the core `State` and persists it
-//! atomically as JSON under `$XDG_DATA_HOME/stayproductive/state.json`. It
-//! speaks newline-delimited JSON on stdin/stdout; one request per line and one
-//! response per line. The GTK frontend starts it and sends requests.
+//! The daemon owns the core `State` and persists it in SQLite under
+//! `$XDG_DATA_HOME/stayproductive/state.db` (an older `state.json` is imported
+//! once). It speaks newline-delimited JSON: one request per line and one
+//! response per line.
 //!
-//! This is deliberately a narrow boundary: replacing stdio with D-Bus later
-//! does not move decision logic out of `stayproductive-core`.
+//! Two transports are supported:
+//!
+//! - `--socket [PATH]` — the normal desktop transport. The daemon binds a
+//!   same-user Unix socket in `$XDG_RUNTIME_DIR/stayproductive/`, refreshes the
+//!   enforcement policy on its own, and keeps running after the GTK window
+//!   closes. systemd starts it at login and restarts it if it is killed.
+//! - stdio (default) — kept for the protocol tests and one-shot tooling. The
+//!   process exits with its parent.
+//!
+//! This is deliberately a narrow boundary: replacing it with D-Bus later does
+//! not move decision logic out of `stayproductive-core`.
 
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+mod clock;
 
 use chrono::{NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use stayproductive_core::{
     Activation, AppKey, AppRule, ClockSettings, Commitment, CommitmentKind, CountLimit, DateRange,
     DayPattern, DeactivationMethod, Event, HostPattern, HourlyPattern, Keyword, LimitPeriod,
-    PauseReason, Profile, Restriction, RuleSet, Schedule, SiteAction, State, Target, Timestamp,
-    Window, decide,
+    PauseReason, Profile, ProfileId, ReasonCode, Restriction, RuleSet, Schedule, SiteAction, State,
+    Store, Target, Timestamp, UsageLedger, Window, day_period, decide, month_period, week_period,
 };
+
+mod export;
 
 type DResult<T> = Result<T, String>;
 
-const FORMAT_VERSION: u32 = 1;
-
-#[derive(Serialize, Deserialize)]
-struct Persisted {
-    version: u32,
-    state: State,
-}
-
 struct Daemon {
     state: State,
+    /// The legacy JSON path, kept for the socket name and for the UI's
+    /// `state_path` field. The database lives beside it.
     path: PathBuf,
+    store: Store,
     shutdown: bool,
+    /// Apps present in the last written policy, to record newly engaged
+    /// blocks in the usage history.
+    policy_apps: BTreeSet<AppKey>,
+    /// Whether the first policy of this run has been written. Blocks that are
+    /// already active at startup were recorded before and are not duplicated.
+    policy_seeded: bool,
+    /// Previous wall and monotonic samples, for clock-jump detection.
+    last_wall: Option<Timestamp>,
+    last_mono: Option<Instant>,
+    /// Last lock and suspend bits from a fresh observer. `None` means this
+    /// process has not seen a heartbeat yet, so the first sample is not an
+    /// unlock.
+    session_locked: Option<bool>,
+    session_suspended: Option<bool>,
 }
 
 fn require_rule_edits_allowed(state: &State, now: Timestamp) -> DResult<()> {
@@ -51,20 +77,115 @@ fn require_rule_edits_allowed(state: &State, now: Timestamp) -> DResult<()> {
     }
 }
 
-fn main() {
-    let path = state_path();
-    let state = load_state(&path);
-    let mut daemon = Daemon {
-        state,
-        path,
-        shutdown: false,
-    };
-    daemon.write_policy(Utc::now());
+/// A cheap before/after comparison key for the usage ledger. Every structural
+/// change also moves the heartbeat, so this catches every persist-worthy edit.
+fn usage_fingerprint(
+    usage: &UsageLedger,
+) -> (
+    usize,
+    usize,
+    usize,
+    usize,
+    Option<Timestamp>,
+    Option<AppKey>,
+) {
+    (
+        usage.intervals().len(),
+        usage.launches().len(),
+        usage.pickups().len(),
+        usage.blocks().len(),
+        usage.last_heartbeat(),
+        usage.current_app().cloned(),
+    )
+}
 
-    println!(
-        "{}",
-        json!({"event": "ready", "state_path": daemon.path.display().to_string()})
-    );
+fn main() {
+    let mode = match parse_args(env::args().skip(1).collect()) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("stayproductive-daemon: {error}");
+            eprintln!("usage: stayproductive-daemon [--stdio | --socket [PATH]]");
+            std::process::exit(2);
+        }
+    };
+    match mode {
+        Mode::Stdio => run_stdio(),
+        Mode::Socket(path) => run_socket(path),
+    }
+}
+
+enum Mode {
+    Stdio,
+    Socket(PathBuf),
+}
+
+fn parse_args(args: Vec<String>) -> Result<Mode, String> {
+    let mut mode = Mode::Stdio;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        match argument {
+            "--stdio" => {
+                mode = Mode::Stdio;
+                index += 1;
+            }
+            "--socket" => match args.get(index + 1).filter(|value| !value.starts_with('-')) {
+                Some(path) => {
+                    mode = Mode::Socket(PathBuf::from(path));
+                    index += 2;
+                }
+                None => {
+                    mode = Mode::Socket(default_socket_path());
+                    index += 1;
+                }
+            },
+            "--help" | "-h" => {
+                println!("usage: stayproductive-daemon [--stdio | --socket [PATH]]");
+                std::process::exit(0);
+            }
+            other if other.starts_with("--socket=") => {
+                mode = Mode::Socket(PathBuf::from(&other["--socket=".len()..]));
+                index += 1;
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(mode)
+}
+
+/// Same-user control socket. A custom state file gets its own socket so a test
+/// or portable instance never talks to the login service's daemon.
+fn default_socket_path() -> PathBuf {
+    if let Ok(path) = env::var("STAYPRODUCTIVE_SOCKET") {
+        return PathBuf::from(path);
+    }
+    let mut name = String::from("daemon");
+    if let Ok(state) = env::var("STAYPRODUCTIVE_STATE") {
+        if !state.is_empty() {
+            name.push('-');
+            name.push_str(&fnv1a_hex(state.as_bytes()));
+        }
+    }
+    runtime_dir()
+        .join("stayproductive")
+        .join(format!("{name}.sock"))
+}
+
+/// Stable 64-bit FNV-1a, mirrored by `engine.py` for the same socket name.
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn run_stdio() {
+    let mut daemon = Daemon::new(state_path());
+    daemon.refresh_policy(Utc::now());
+
+    println!("{}", daemon.greeting());
     io::stdout().flush().ok();
 
     let stdin = io::stdin();
@@ -73,31 +194,159 @@ fn main() {
         if line.trim().is_empty() {
             continue;
         }
-        let request: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(error) => {
-                println!(
-                    "{}",
-                    json!({"id": 0, "ok": false, "error": format!("invalid JSON: {error}")})
-                );
-                continue;
-            }
-        };
-        let id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
-        let command = request
-            .get("cmd")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-
-        let response = match daemon.handle(&command, &request) {
-            Ok(data) => json!({"id": id, "ok": true, "data": data}),
-            Err(error) => json!({"id": id, "ok": false, "error": error}),
-        };
+        let response = daemon.respond(&line);
         println!("{response}");
         io::stdout().flush().ok();
         if daemon.shutdown {
             break;
+        }
+    }
+}
+
+/// Background transport. One daemon per state file; the socket is mode `0600`
+/// inside a `0700` directory, so only the same user can talk to it.
+fn run_socket(socket_path: PathBuf) {
+    if let Some(parent) = socket_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let existed = parent.exists();
+        if let Err(error) = fs::create_dir_all(parent) {
+            eprintln!(
+                "stayproductive-daemon: could not create {}: {error}",
+                parent.display()
+            );
+            std::process::exit(1);
+        }
+        #[cfg(unix)]
+        if !existed {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    if UnixStream::connect(&socket_path).is_ok() {
+        eprintln!(
+            "stayproductive-daemon: already running at {}",
+            socket_path.display()
+        );
+        return;
+    }
+    let _ = fs::remove_file(&socket_path);
+
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+            eprintln!(
+                "stayproductive-daemon: already running at {}",
+                socket_path.display()
+            );
+            return;
+        }
+        Err(error) => {
+            eprintln!(
+                "stayproductive-daemon: could not bind {}: {error}",
+                socket_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600));
+    }
+
+    let daemon = Arc::new(Mutex::new(Daemon::new(state_path())));
+    if let Ok(mut daemon) = daemon.lock() {
+        daemon.refresh_policy(Utc::now());
+    }
+    // On X11 the daemon owns adapter supervision: the adapter is what turns the
+    // short-lived policy into a hidden window and an overlay. It is deliberately
+    // a separate process so closing the GTK window cannot stop enforcement.
+    start_adapter_supervisor(state_path());
+    eprintln!(
+        "stayproductive-daemon: listening on {}",
+        socket_path.display()
+    );
+
+    // The window may be closed for hours. Refreshing the policy from the daemon
+    // itself is what lets enforcement (and schedule starts) continue without a
+    // client; the policy is deliberately short-lived. The same loop restarts a
+    // crashed X11 adapter within a second.
+    {
+        let shared = Arc::clone(&daemon);
+        thread::spawn(move || {
+            let mut last_policy = Instant::now();
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                supervise_adapter();
+                if last_policy.elapsed() < Duration::from_secs(5) {
+                    continue;
+                }
+                last_policy = Instant::now();
+                let Ok(mut daemon) = shared.lock() else {
+                    return;
+                };
+                if let Err(error) = daemon.pulse(Utc::now()) {
+                    eprintln!("stayproductive-daemon: could not persist periodic state: {error}");
+                }
+            }
+        });
+    }
+
+    for connection in listener.incoming() {
+        match connection {
+            Ok(stream) => {
+                let shared = Arc::clone(&daemon);
+                let path = socket_path.clone();
+                thread::spawn(move || serve_client(stream, shared, path));
+            }
+            Err(error) => eprintln!("stayproductive-daemon: accept failed: {error}"),
+        }
+    }
+}
+
+fn serve_client(stream: UnixStream, daemon: Arc<Mutex<Daemon>>, socket_path: PathBuf) {
+    let Ok(reader_stream) = stream.try_clone() else {
+        return;
+    };
+    let mut writer = stream;
+    {
+        let Ok(daemon) = daemon.lock() else {
+            return;
+        };
+        if writeln!(writer, "{}", daemon.greeting()).is_err() {
+            return;
+        }
+        if writer.flush().is_err() {
+            return;
+        }
+    }
+
+    let reader = BufReader::new(reader_stream);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (response, shutdown) = {
+            let Ok(mut daemon) = daemon.lock() else {
+                return;
+            };
+            let response = daemon.respond(&line);
+            (response, daemon.shutdown)
+        };
+        if writeln!(writer, "{response}")
+            .and_then(|_| writer.flush())
+            .is_err()
+        {
+            return;
+        }
+        if shutdown {
+            stop_adapter();
+            let _ = fs::remove_file(&socket_path);
+            std::process::exit(0);
         }
     }
 }
@@ -113,27 +362,14 @@ fn state_path() -> PathBuf {
     data_home.join("stayproductive/state.json")
 }
 
-fn load_state(path: &Path) -> State {
-    let Ok(text) = fs::read_to_string(path) else {
-        return fresh_state();
-    };
-    match serde_json::from_str::<Persisted>(&text) {
-        Ok(persisted) if persisted.version == FORMAT_VERSION => persisted.state,
-        Ok(_) => {
-            backup(path);
-            fresh_state()
-        }
-        Err(error) => {
-            eprintln!("stayproductive: state file is invalid: {error}");
-            backup(path);
-            fresh_state()
-        }
+/// The SQLite path beside the historical JSON path.
+fn database_path(state: &Path) -> PathBuf {
+    if let Ok(path) = env::var("STAYPRODUCTIVE_DB")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
     }
-}
-
-fn backup(path: &Path) {
-    let backup = path.with_extension(format!("invalid-{}.json", Utc::now().timestamp()));
-    let _ = fs::rename(path, backup);
+    state.with_file_name("state.db")
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> DResult<()> {
@@ -167,34 +403,373 @@ fn runtime_dir() -> PathBuf {
         .unwrap_or_else(|_| env::temp_dir())
 }
 
-/// The extension writes this heartbeat while it is enabled. It is deliberately
-/// short-lived so a crashed or disabled extension cannot keep claiming
-/// enforcement.
-fn extension_heartbeat(now: Timestamp) -> bool {
-    let path = runtime_dir().join("stayproductive/gnome-extension.json");
-    let Ok(text) = fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return false;
-    };
-    if value.get("active").and_then(Value::as_bool) != Some(true)
-        || value.get("policy_loaded").and_then(Value::as_bool) != Some(true)
-    {
-        return false;
-    }
-    let Some(checked_at) = value
-        .get("checked_at")
-        .and_then(Value::as_str)
-        .and_then(|value| value.parse::<Timestamp>().ok())
-    else {
-        return false;
-    };
-    let age = now.signed_duration_since(checked_at);
-    age <= chrono::TimeDelta::seconds(5)
+fn adapter_runtime_dir() -> PathBuf {
+    runtime_dir().join("stayproductive")
 }
 
-fn enforcement_policy(state: &State, now: Timestamp) -> Value {
+/// Version of the newline-JSON envelope. Older peers may omit it; a newer
+/// version is refused instead of guessed at (`A-DATA-03`).
+const PROTOCOL_VERSION: u64 = 1;
+
+const X11_HEARTBEAT_FILE: &str = "x11-adapter.json";
+const GNOME_HEARTBEAT_FILE: &str = "gnome-extension.json";
+
+/// Whether this session can be enforced through X11 window operations.
+///
+/// ``STAYPRODUCTIVE_X11_ADAPTER`` is both an override and the adapter path, so
+/// a test or a portable install can force the adapter without an X11 login
+/// session. ``0``/``off`` disables it explicitly.
+fn x11_session() -> bool {
+    if let Ok(value) = env::var("STAYPRODUCTIVE_X11_ADAPTER") {
+        let value = value.trim();
+        if value.is_empty() {
+            return false;
+        }
+        match value.to_ascii_lowercase().as_str() {
+            "0" | "off" | "no" | "false" => return false,
+            "1" | "on" | "yes" | "true" => {}
+            _ => return true,
+        }
+    }
+    if env::var_os("WAYLAND_DISPLAY").is_some() {
+        return false;
+    }
+    if env::var("XDG_SESSION_TYPE").is_ok_and(|value| value.eq_ignore_ascii_case("wayland")) {
+        return false;
+    }
+    env::var_os("DISPLAY").is_some_and(|value| !value.is_empty())
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.is_file()
+            && path
+                .metadata()
+                .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+fn which(program: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|directory| directory.join(program))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Find the adapter launcher: explicit override, then `PATH`, then the source
+/// checkout next to the daemon binary.
+fn adapter_program() -> Option<PathBuf> {
+    if let Ok(value) = env::var("STAYPRODUCTIVE_X11_ADAPTER") {
+        let value = value.trim();
+        if !value.is_empty()
+            && !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "off" | "no" | "false" | "1" | "on" | "yes" | "true"
+            )
+        {
+            let candidate = PathBuf::from(value);
+            return if candidate.components().count() > 1 || candidate.is_absolute() {
+                is_executable(&candidate).then_some(candidate)
+            } else {
+                which(value)
+            };
+        }
+    }
+    if let Some(candidate) = which("stayproductive-x11") {
+        return Some(candidate);
+    }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(current) = env::current_dir() {
+        roots.push(current);
+    }
+    if let Ok(executable) = env::current_exe()
+        && let Some(root) = executable
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+    {
+        roots.push(root.to_path_buf());
+    }
+    roots
+        .into_iter()
+        .map(|root| root.join("stayproductive-x11"))
+        .find(|candidate| is_executable(candidate))
+}
+
+struct AdapterSupervisor {
+    program: PathBuf,
+    state: PathBuf,
+    heartbeat: PathBuf,
+    log: PathBuf,
+    child: Option<Child>,
+    last_exit: Option<Instant>,
+}
+
+impl AdapterSupervisor {
+    fn new(program: PathBuf, state: PathBuf) -> Self {
+        Self {
+            program,
+            state,
+            heartbeat: adapter_runtime_dir().join(X11_HEARTBEAT_FILE),
+            log: adapter_runtime_dir().join("x11-adapter.log"),
+            child: None,
+            last_exit: None,
+        }
+    }
+
+    fn spawn(&mut self) {
+        if self.child.is_some() {
+            return;
+        }
+        // Give a crashing adapter a moment before trying again so a broken
+        // launcher cannot turn into a fork loop.
+        if self
+            .last_exit
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(2))
+        {
+            return;
+        }
+        if let Some(parent) = self.log.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "stayproductive-daemon: could not create {}: {error}",
+                parent.display()
+            );
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(
+                self.log.parent().unwrap_or(Path::new(".")),
+                fs::Permissions::from_mode(0o700),
+            );
+        }
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log);
+        let mut command = Command::new(&self.program);
+        command
+            .arg("--state")
+            .arg(&self.state)
+            .arg("--heartbeat")
+            .arg(&self.heartbeat)
+            .arg("--parent-pid")
+            .arg(std::process::id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        match log {
+            Ok(log) => {
+                command.stderr(Stdio::from(log));
+            }
+            Err(error) => {
+                command.stderr(Stdio::null());
+                eprintln!(
+                    "stayproductive-daemon: could not open {}: {error}",
+                    self.log.display()
+                );
+            }
+        }
+        match command.spawn() {
+            Ok(child) => {
+                eprintln!(
+                    "stayproductive-daemon: started X11 adapter pid {} ({})",
+                    child.id(),
+                    self.program.display()
+                );
+                self.child = Some(child);
+            }
+            Err(error) => {
+                eprintln!(
+                    "stayproductive-daemon: could not start X11 adapter {}: {error}",
+                    self.program.display()
+                );
+                self.last_exit = Some(Instant::now());
+            }
+        }
+    }
+
+    fn tick(&mut self) {
+        // Prefer a reporting GNOME extension on an X11 GNOME session: it has
+        // native window/overlay access and running both adapters would mean two
+        // explanations for one block. Hand enforcement back when it goes stale.
+        if fresh_heartbeat(GNOME_HEARTBEAT_FILE, "gnome-extension", Utc::now()) {
+            if self.child.is_some() {
+                eprintln!(
+                    "stayproductive-daemon: GNOME extension is reporting; handing off from the X11 adapter"
+                );
+            }
+            self.stop();
+            return;
+        }
+        if let Some(child) = self.child.as_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            eprintln!(
+                "stayproductive-daemon: X11 adapter pid {} exited: {status}",
+                child.id()
+            );
+            self.child = None;
+            self.last_exit = Some(Instant::now());
+            // Do not let a heartbeat from the process that just died keep
+            // claiming enforcement while the replacement starts.
+            let _ = fs::remove_file(&self.heartbeat);
+        }
+        self.spawn();
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&self.heartbeat);
+        }
+    }
+}
+
+static ADAPTER: Mutex<Option<AdapterSupervisor>> = Mutex::new(None);
+
+fn start_adapter_supervisor(state: PathBuf) {
+    if !x11_session() {
+        return;
+    }
+    let Some(program) = adapter_program() else {
+        eprintln!(
+            "stayproductive-daemon: X11 session but no stayproductive-x11 launcher was found"
+        );
+        return;
+    };
+    if let Ok(mut slot) = ADAPTER.lock() {
+        *slot = Some(AdapterSupervisor::new(program, state));
+    }
+}
+
+fn supervise_adapter() {
+    if let Ok(mut slot) = ADAPTER.lock()
+        && let Some(supervisor) = slot.as_mut()
+    {
+        supervisor.tick();
+    }
+}
+
+fn stop_adapter() {
+    if let Ok(mut slot) = ADAPTER.lock()
+        && let Some(mut supervisor) = slot.take()
+    {
+        supervisor.stop();
+    }
+}
+
+/// The heartbeat an adapter writes while it is enforcing. It is deliberately
+/// short-lived so a crashed or disabled adapter cannot keep claiming
+/// enforcement or keep reporting focus.
+struct Heartbeat {
+    /// Enabled, policy loaded, and checked within the freshness window.
+    fresh: bool,
+    /// The block overlay is showing; no usage accrues behind it.
+    blocked: bool,
+    /// The session is locked. Missing from older heartbeats, which means
+    /// unlocked so a writer that does not know about lock cannot invent one.
+    locked: bool,
+    /// The session is suspending. Not a pickup.
+    suspended: bool,
+    /// Normalized app ids of the focused window, empty when nothing is
+    /// attributable.
+    focus: Vec<AppKey>,
+    /// When the current focus window became foreground, if the observer knows.
+    focus_since: Option<Timestamp>,
+}
+
+/// Read one adapter heartbeat by file name and expected adapter id.
+fn read_heartbeat(file: &str, adapter: &str, now: Timestamp) -> Option<Heartbeat> {
+    let path = adapter_runtime_dir().join(file);
+    let text = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    if value.get("adapter").and_then(Value::as_str) != Some(adapter) {
+        return None;
+    }
+    let active = value.get("active").and_then(Value::as_bool) == Some(true);
+    let policy_loaded = value.get("policy_loaded").and_then(Value::as_bool) == Some(true);
+    let checked_at = value
+        .get("checked_at")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<Timestamp>().ok())?;
+    let fresh = active
+        && policy_loaded
+        && now.signed_duration_since(checked_at) <= chrono::TimeDelta::seconds(5);
+    // Adapters have written `blocked` both as a boolean and as 0/1.
+    let blocked = match value.get("blocked") {
+        Some(Value::Bool(blocked)) => *blocked,
+        Some(value) => value.as_i64().is_some_and(|value| value != 0),
+        None => false,
+    };
+    let locked = value
+        .get("locked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let suspended = value
+        .get("suspended")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let focus = value
+        .get("focus")
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .filter_map(|id| AppKey::new(id).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let focus_since = value
+        .get("focus_since")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<Timestamp>().ok());
+    Some(Heartbeat {
+        fresh,
+        blocked,
+        locked,
+        suspended,
+        focus,
+        focus_since,
+    })
+}
+
+/// Whether an adapter is currently enforcing under the expected identity.
+fn fresh_heartbeat(file: &str, adapter: &str, now: Timestamp) -> bool {
+    read_heartbeat(file, adapter, now).is_some_and(|heartbeat| heartbeat.fresh)
+}
+
+/// The newest fresh observer. On an X11 GNOME session the extension wins
+/// because the supervisor hands enforcement to it; otherwise the X11 adapter
+/// is the only observer.
+fn observer_heartbeat(now: Timestamp) -> Option<Heartbeat> {
+    read_heartbeat(GNOME_HEARTBEAT_FILE, "gnome-extension", now)
+        .filter(|heartbeat| heartbeat.fresh)
+        .or_else(|| {
+            read_heartbeat(X11_HEARTBEAT_FILE, "x11", now).filter(|heartbeat| heartbeat.fresh)
+        })
+}
+
+/// One app the engine would block right now.
+struct PolicyEntry {
+    app: AppKey,
+    reason: ReasonCode,
+    until: Option<Timestamp>,
+    profile: Option<ProfileId>,
+    profile_name: Option<String>,
+}
+
+fn policy_entries(state: &State, now: Timestamp) -> Vec<PolicyEntry> {
     let mut candidates: BTreeSet<AppKey> = BTreeSet::new();
     for profile in &state.profiles {
         for app in profile.rules.apps.keys() {
@@ -207,7 +782,7 @@ fn enforcement_policy(state: &State, now: Timestamp) -> Value {
         }
     }
 
-    let mut apps = Vec::new();
+    let mut entries = Vec::new();
     for app in candidates {
         let event = Event::ForegroundChanged {
             app: app.clone(),
@@ -221,20 +796,15 @@ fn enforcement_policy(state: &State, now: Timestamp) -> Value {
             .profile
             .and_then(|id| state.profile(id))
             .map(|profile| profile.name.clone());
-        apps.push(json!({
-            "app": app.as_str(),
-            "reason": decision.reason.as_str(),
-            "until": decision.until,
-            "profile": profile,
-        }));
+        entries.push(PolicyEntry {
+            app,
+            reason: decision.reason,
+            until: decision.until,
+            profile: decision.profile,
+            profile_name: profile,
+        });
     }
-
-    json!({
-        "version": 1,
-        "generated_at": now,
-        "valid_until": now + chrono::TimeDelta::seconds(30),
-        "apps": apps,
-    })
+    entries
 }
 
 fn fresh_state() -> State {
@@ -261,15 +831,170 @@ fn system_timezone() -> Tz {
 }
 
 impl Daemon {
+    fn new(path: PathBuf) -> Self {
+        let database = database_path(&path);
+        let (store, opened) = match Store::open(&database, Some(&path), fresh_state()) {
+            Ok(value) => value,
+            Err(error) => {
+                // Starting empty on a corrupt or newer database would quietly
+                // drop rules and could weaken enforcement. Refuse instead.
+                eprintln!(
+                    "stayproductive-daemon: cannot open {}: {error}",
+                    database.display()
+                );
+                std::process::exit(1);
+            }
+        };
+        if let Some(imported) = &opened.imported_from {
+            eprintln!(
+                "stayproductive-daemon: imported {} into {} (schema {}); old file kept at {}",
+                path.display(),
+                database.display(),
+                opened.schema_version,
+                imported.display()
+            );
+        }
+        let mut state = opened.state;
+        // A crash can leave a foreground interval open; close it at the last
+        // heartbeat so restored usage is never over-counted.
+        state.recover();
+        Self {
+            state,
+            path,
+            store,
+            shutdown: false,
+            policy_apps: BTreeSet::new(),
+            policy_seeded: false,
+            last_wall: None,
+            last_mono: None,
+            session_locked: None,
+            session_suspended: None,
+        }
+    }
+
+    /// Compare this wall sample with the monotonic clock and close an open
+    /// interval when the wall clock stepped (`A-DATA-02`).
+    fn note_clock(&mut self, now: Timestamp) {
+        let mono = Instant::now();
+        if let (Some(previous_wall), Some(previous_mono)) = (self.last_wall, self.last_mono)
+            && let Some((old, new)) = clock::clock_discontinuity(
+                previous_wall,
+                previous_mono,
+                now,
+                mono,
+                Duration::from_secs(2),
+            )
+        {
+            self.state.handle_clock_jump(old, new);
+        }
+        self.last_wall = Some(now);
+        self.last_mono = Some(mono);
+    }
+
+    /// Record one pickup on the falling edge of a fresh lock bit.
+    ///
+    /// A missing heartbeat leaves the previous bit alone, so a dropped file
+    /// cannot look like an unlock. Suspend closes the interval and is not a
+    /// pickup (`A-LIM-04`, `A-STA-05`).
+    fn note_session(&mut self, heartbeat: &Option<Heartbeat>, now: Timestamp) {
+        let Some(heartbeat) = heartbeat else {
+            return;
+        };
+        if !heartbeat.fresh {
+            return;
+        }
+        if heartbeat.suspended {
+            if self.session_suspended != Some(true) {
+                self.state.observe(&Event::SessionSuspended, now);
+            }
+        } else if self.session_suspended == Some(true) {
+            self.state.observe(&Event::Resumed, now);
+        }
+        self.session_suspended = Some(heartbeat.suspended);
+        match (self.session_locked, heartbeat.locked) {
+            (Some(true), false) => {
+                self.state.observe(&Event::ScreenUnlocked, now);
+            }
+            (_, true) if self.session_locked != Some(true) => {
+                self.state.observe(&Event::ScreenLocked, now);
+            }
+            _ => {}
+        }
+        self.session_locked = Some(heartbeat.locked);
+    }
+
+    fn greeting(&self) -> String {
+        json!({
+            "event": "ready",
+            "state_path": self.path.display().to_string(),
+            "data_path": self.store.path().display().to_string(),
+            "protocol_version": PROTOCOL_VERSION,
+        })
+        .to_string()
+    }
+
+    /// One newline-delimited request in, one out. Invalid JSON never kills the
+    /// service; it returns an error envelope with a zero id.
+    fn respond(&mut self, line: &str) -> String {
+        let request: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(error) => {
+                return json!({
+                    "id": 0,
+                    "ok": false,
+                    "error": format!("invalid JSON: {error}"),
+                    "protocol_version": PROTOCOL_VERSION,
+                })
+                .to_string();
+            }
+        };
+        let id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
+        let command = request
+            .get("cmd")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        match self.handle(&command, &request) {
+            Ok(data) => json!({
+                "id": id,
+                "ok": true,
+                "data": data,
+                "protocol_version": PROTOCOL_VERSION,
+            }),
+            Err(error) => json!({
+                "id": id,
+                "ok": false,
+                "error": error,
+                "protocol_version": PROTOCOL_VERSION,
+            }),
+        }
+        .to_string()
+    }
+
     fn handle(&mut self, command: &str, request: &Value) -> DResult<Value> {
+        if let Some(version) = request.get("schema_version") {
+            let version = version
+                .as_u64()
+                .ok_or_else(|| "schema_version must be a whole number".to_owned())?;
+            if version > PROTOCOL_VERSION {
+                return Err(format!(
+                    "schema version {version} is newer than this service supports \
+                     ({PROTOCOL_VERSION}); update StayProductive. Blocking continues."
+                ));
+            }
+        }
         let now = Utc::now();
-        let mut dirty = true;
+        self.note_clock(now);
+        let tracked = self.track_usage(now);
+        let command_dirty = !matches!(
+            command,
+            "snapshot" | "shutdown" | "export_data" | "browser_decision" | "browser_policy"
+        );
         let result =
             match command {
-                "snapshot" => {
-                    dirty = false;
-                    Ok(self.snapshot())
-                }
+                "snapshot" => Ok(self.snapshot()),
+                "browser_decision" => self.browser_decision(request, now),
+                "browser_policy" => Ok(self.browser_policy(now)),
                 "create_profile" => {
                     require_rule_edits_allowed(&self.state, now)?;
                     let spec: ProfileSpec = from_request(request, "profile")?;
@@ -306,6 +1031,23 @@ impl Daemon {
                     self.state.remove_profile(id).map_err(|e| e.to_string())?;
                     Ok(self.snapshot())
                 }
+                "duplicate_profile" => {
+                    require_rule_edits_allowed(&self.state, now)?;
+                    let id = parse_ulid(request, "profile_id")?;
+                    let name = request
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_owned();
+                    if name.is_empty() {
+                        return Err("profile name is required".into());
+                    }
+                    self.state
+                        .duplicate_profile(id, name, now)
+                        .map_err(|e| e.to_string())?;
+                    Ok(self.snapshot())
+                }
                 "activate_profile" => {
                     require_rule_edits_allowed(&self.state, now)?;
                     let id = parse_ulid(request, "profile_id")?;
@@ -328,8 +1070,12 @@ impl Daemon {
                 }
                 "pause_profile" => {
                     let id = parse_ulid(request, "profile_id")?;
+                    let until_end_of_day =
+                        request.get("until_end_of_day").and_then(Value::as_bool) == Some(true);
                     let minutes = request.get("minutes").and_then(Value::as_u64).unwrap_or(0);
-                    let until = if minutes == 0 {
+                    let until = if until_end_of_day {
+                        Some(day_period(now, &self.state.settings).end)
+                    } else if minutes == 0 {
                         None
                     } else {
                         Some(now + chrono::TimeDelta::minutes(minutes as i64))
@@ -447,30 +1193,291 @@ impl Daemon {
                     self.state.settings.timezone = timezone;
                     Ok(self.snapshot())
                 }
+                "export_data" => {
+                    // The user asked for their own data, so usage history is
+                    // included unless they explicitly opt out (A-STA-08).
+                    let include_usage = request
+                        .get("include_usage")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    let name = format!(
+                        "stayproductive-export-{}.stayproductive.zip",
+                        now.format("%Y%m%d-%H%M%S")
+                    );
+                    let path = match request.get("path").and_then(Value::as_str) {
+                        Some(value) if !value.trim().is_empty() => PathBuf::from(value),
+                        _ => self.data_dir().join("exports").join(name),
+                    };
+                    if let Some(parent) = path
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        && let Err(error) = fs::create_dir_all(parent)
+                    {
+                        return Err(format!("could not create {}: {error}", parent.display()));
+                    }
+                    let files = export::entries(&self.state, now, include_usage);
+                    let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+                    let bytes = export::archive(&files, now);
+                    write_private(&path, &bytes)
+                        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+                    Ok(json!({
+                        "path": path.display().to_string(),
+                        "bytes": bytes.len(),
+                        "version": export::EXPORT_VERSION,
+                        "format": export::EXPORT_FORMAT,
+                        "usage_included": include_usage,
+                        "files": names,
+                    }))
+                }
+                "delete_history" => {
+                    // The UI asks first; the flag keeps a stray protocol call
+                    // from wiping history without an explicit decision.
+                    if request.get("confirm").and_then(Value::as_bool) != Some(true) {
+                        return Err("delete_history requires confirm: true".into());
+                    }
+                    let removed = json!({
+                        "intervals": self.state.usage.intervals().len(),
+                        "launches": self.state.usage.launches().len(),
+                        "pickups": self.state.usage.pickups().len(),
+                        "blocks": self.state.usage.blocks().len(),
+                    });
+                    // Profiles, schedules, quick blocks, and commitments are
+                    // decisions the user configured, not history: deleting
+                    // history never weakens an active block.
+                    self.state.usage = UsageLedger::new();
+                    Ok(json!({"removed": removed, "snapshot": self.snapshot()}))
+                }
+                "reset_all" => {
+                    // Destructive and irreversible, so it needs the same
+                    // explicit confirmation as history deletion. An active
+                    // commitment is a promise the user made and blocks reset,
+                    // exactly like profile edits (`strict-and-lock.md` §7).
+                    if request.get("confirm").and_then(Value::as_bool) != Some(true) {
+                        return Err("reset_all requires confirm: true".into());
+                    }
+                    require_rule_edits_allowed(&self.state, now)?;
+                    let removed = json!({
+                        "profiles": self.state.profiles.len(),
+                        "quick_blocks": self.state.quick_blocks.len(),
+                        "extensions": self.state.extensions.len(),
+                        "intervals": self.state.usage.intervals().len(),
+                        "launches": self.state.usage.launches().len(),
+                        "pickups": self.state.usage.pickups().len(),
+                        "blocks": self.state.usage.blocks().len(),
+                    });
+                    // Commitments are excluded from a reset by spec; ended
+                    // commitments stay as history, and an active one refused
+                    // above, so the list is carried across rather than cleared.
+                    let commitments = std::mem::take(&mut self.state.commitments);
+                    let kept = commitments.len();
+                    self.state = State::new(ClockSettings::new(NaiveTime::MIN, system_timezone()));
+                    self.state.commitments = commitments;
+                    Ok(json!({
+                        "removed": removed,
+                        "commitments_kept": kept,
+                        "snapshot": self.snapshot(),
+                    }))
+                }
+                "import_data" => {
+                    require_rule_edits_allowed(&self.state, now)?;
+                    let value = request
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .ok_or_else(|| "missing path".to_owned())?;
+                    let path = PathBuf::from(value);
+                    let bytes = fs::read(&path)
+                        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+                    let files = export::read_archive(&bytes)?;
+                    let summary = export::import(&mut self.state, &files, now)?;
+                    Ok(json!({
+                        "path": path.display().to_string(),
+                        "replaced": summary.replaced,
+                        "profiles_added": summary.profiles_added,
+                        "profiles_skipped": summary.profiles_skipped,
+                        "commitments_added": summary.commitments_added,
+                        "commitments_skipped": summary.commitments_skipped,
+                        "settings_applied": summary.settings_applied,
+                        // Usage files are validated but not re-imported: the
+                        // counters have no restore path yet, and a partial
+                        // history would be misleading.
+                        "usage_imported": false,
+                        "snapshot": self.snapshot(),
+                    }))
+                }
                 "shutdown" => {
-                    dirty = false;
                     self.shutdown = true;
                     Ok(json!({"bye": true}))
                 }
                 other => return Err(format!("unknown command: {other}")),
             };
 
-        if dirty && result.is_ok() {
-            self.persist()?;
-        }
         if result.is_ok() {
-            self.write_policy(now);
+            let recorded = self.refresh_policy(now);
+            if command_dirty || tracked || recorded {
+                self.persist()?;
+            }
         }
         result
     }
 
-    fn persist(&self) -> DResult<()> {
-        let payload = Persisted {
-            version: FORMAT_VERSION,
-            state: self.state.clone(),
+    /// Periodic work with no client attached: attribute usage, refresh the
+    /// policy, and persist when either changed. This is what keeps tracking and
+    /// schedule starts working while the GTK window is closed.
+    fn pulse(&mut self, now: Timestamp) -> DResult<()> {
+        self.note_clock(now);
+        let tracked = self.track_usage(now);
+        let recorded = self.refresh_policy(now);
+        if tracked || recorded {
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    /// Feed the newest observer heartbeat into the usage ledger.
+    ///
+    /// Usage accrues only while a fresh observer reports an attributable,
+    /// unblocked focus window. Without an observer, or behind the block
+    /// overlay, the open interval is closed at `now`. Returns whether the
+    /// ledger changed, so the caller knows to persist.
+    fn track_usage(&mut self, now: Timestamp) -> bool {
+        let heartbeat = observer_heartbeat(now);
+        self.note_session(&heartbeat, now);
+        let focus = match &heartbeat {
+            Some(hb)
+                if hb.fresh
+                    && !hb.blocked
+                    && !hb.locked
+                    && !hb.suspended
+                    && !hb.focus.is_empty() =>
+            {
+                // Attribution must use the profile's own app key, or the
+                // engine's usage queries would look at a different app.
+                self.resolve_focus(&hb.focus)
+                    .map(|app| (app, hb.focus_since))
+            }
+            _ => None,
         };
-        let encoded = serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?;
-        write_private(&self.path, &encoded)
+        let usage = &mut self.state.usage;
+        let before = usage_fingerprint(usage);
+        match focus {
+            Some((app, since)) => {
+                // An interval can only start at or after the last
+                // observation; an older `focus_since` (for example after a
+                // block ended) would re-attribute time we already closed.
+                // With no prior observation the observer's word is all we
+                // have, so its `focus_since` is trusted.
+                let mut at = since.unwrap_or(now);
+                if let Some(floor) = usage.last_heartbeat() {
+                    at = at.max(floor);
+                }
+                if at > now {
+                    at = now;
+                }
+                if usage.current_app() == Some(&app) {
+                    match usage.current_since() {
+                        Some(start) if at <= start => usage.heartbeat(now),
+                        // The focus left and returned within one sampling
+                        // gap; close and reopen at the reported instant.
+                        Some(_) => {
+                            usage.close_foreground(at);
+                            usage.foreground(app, at);
+                        }
+                        None => usage.foreground(app, at),
+                    }
+                } else {
+                    usage.foreground(app, at);
+                }
+            }
+            None => {
+                if usage.current_app().is_some() {
+                    usage.close_foreground(now);
+                }
+            }
+        }
+        let after = usage_fingerprint(&self.state.usage);
+        before != after
+    }
+
+    /// Map the ids a window reported to the app key a profile rules over.
+    ///
+    /// The extension already expands trailing-component aliases, but a
+    /// profile may use a desktop id while the window reports only the
+    /// WM_CLASS or the other way round, so both tails are matched. Apps no
+    /// profile rules over are not tracked.
+    fn resolve_focus(&self, ids: &[AppKey]) -> Option<AppKey> {
+        for id in ids {
+            let id_tail = id.as_str().rsplit('.').next().unwrap_or_default();
+            for profile in &self.state.profiles {
+                for key in profile.rules.apps.keys() {
+                    let key_tail = key.as_str().rsplit('.').next().unwrap_or_default();
+                    if key == id
+                        || (!key_tail.is_empty() && key_tail == id.as_str())
+                        || (!id_tail.is_empty() && id_tail == key.as_str())
+                    {
+                        return Some(key.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Write the enforcement policy and record newly engaged blocks.
+    ///
+    /// Returns whether any block record was added, so the caller knows to
+    /// persist. The first policy of a run only seeds the comparison set: a
+    /// block that is already active at startup was recorded by the run that
+    /// engaged it.
+    fn refresh_policy(&mut self, now: Timestamp) -> bool {
+        let entries = policy_entries(&self.state, now);
+        let mut recorded = false;
+        let mut current = BTreeSet::new();
+        for entry in &entries {
+            current.insert(entry.app.clone());
+            if self.policy_seeded && !self.policy_apps.contains(&entry.app) {
+                self.state.usage.blocked(
+                    Target::App(entry.app.clone()),
+                    entry.reason,
+                    now,
+                    entry.until,
+                    entry.profile,
+                );
+                recorded = true;
+            }
+        }
+        self.policy_apps = current;
+        self.policy_seeded = true;
+
+        let apps: Vec<Value> = entries
+            .iter()
+            .map(|entry| {
+                json!({
+                    "app": entry.app.as_str(),
+                    "reason": entry.reason.as_str(),
+                    "until": entry.until,
+                    "profile": entry.profile_name,
+                })
+            })
+            .collect();
+        let policy = json!({
+            "version": 1,
+            "generated_at": now,
+            "valid_until": now + chrono::TimeDelta::seconds(30),
+            "apps": apps,
+        });
+        let Ok(encoded) = serde_json::to_vec_pretty(&policy) else {
+            eprintln!("stayproductive: could not encode enforcement policy");
+            return recorded;
+        };
+        if let Err(error) = write_private(&self.policy_path(), &encoded) {
+            eprintln!("stayproductive: could not write enforcement policy: {error}");
+        }
+        recorded
+    }
+
+    fn persist(&mut self) -> DResult<()> {
+        self.store.save(&self.state).map_err(|e| e.to_string())
     }
 
     fn policy_path(&self) -> PathBuf {
@@ -480,33 +1487,244 @@ impl Daemon {
             .join("enforcement.json")
     }
 
-    fn write_policy(&self, now: Timestamp) {
-        let policy = enforcement_policy(&self.state, now);
-        let Ok(encoded) = serde_json::to_vec_pretty(&policy) else {
-            eprintln!("stayproductive: could not encode enforcement policy");
-            return;
+    fn data_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    }
+
+    fn usage_today(&self, now: Timestamp) -> Value {
+        let day = day_period(now, &self.state.settings);
+        let mut rows: Vec<(String, u64)> = self
+            .state
+            .usage
+            .usage_per_app(&day, now)
+            .into_iter()
+            .map(|(app, duration)| (app.as_str().to_owned(), duration.as_secs()))
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        Value::Array(
+            rows.into_iter()
+                .map(|(app, seconds)| json!({"app": app, "seconds": seconds}))
+                .collect(),
+        )
+    }
+
+    /// One Stats range: totals, ranked apps, and the equal-length period
+    /// before it for the trend column (`F-STA-02`, `F-STA-03`, `F-STA-05`).
+    fn stats_range(&self, period: &stayproductive_core::Period, now: Timestamp) -> Value {
+        let length = period.end - period.start;
+        let previous = stayproductive_core::Period::new(period.start - length, period.start);
+        let previous_by_app = self.state.usage.usage_per_app(&previous, now);
+        let ranking: Vec<(AppKey, u64)> = self
+            .state
+            .usage
+            .usage_ranking(period, now)
+            .into_iter()
+            .map(|(app, duration)| (app, duration.as_secs()))
+            .collect();
+        // The range total is the sum of the integer seconds shown per app, so
+        // the rows always add up to the headline even when durations have a
+        // sub-second tail.
+        let total: u64 = ranking.iter().map(|(_app, seconds)| *seconds).sum();
+        let apps: Vec<Value> = ranking
+            .into_iter()
+            .map(|(app, seconds)| {
+                let previous_seconds = previous_by_app
+                    .get(&app)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0);
+                let share = if total == 0 {
+                    0.0
+                } else {
+                    (seconds as f64 / total as f64 * 100.0).round()
+                };
+                json!({
+                    "app": app.as_str(),
+                    "seconds": seconds,
+                    "share": share,
+                    "previous_seconds": previous_seconds,
+                })
+            })
+            .collect();
+        json!({
+            "start": period.start,
+            "end": period.end,
+            "seconds": total,
+            "blocks": self.state.usage.block_count(period),
+            "pickups": self.state.usage.pickup_count(period),
+            "launches": self.state.usage.launch_total(period),
+            "apps": apps,
+        })
+    }
+
+    /// Answer one browser navigation without mutating state.
+    ///
+    /// The extension asks before it renders a page; the daemon is the single
+    /// decision point, so a site or keyword block has the same reason code and
+    /// end time as an app overlay (`A-PLAT-08`, `A-CON-06`). URLs are used for
+    /// this call only and are not stored.
+    fn browser_decision(&self, request: &Value, now: Timestamp) -> DResult<Value> {
+        let url = request
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "missing url".to_owned())?;
+        let app = match request.get("app").and_then(Value::as_str) {
+            Some(value) if !value.trim().is_empty() => {
+                AppKey::new(value).map_err(|error| error.to_string())?
+            }
+            _ => AppKey::new("browser").map_err(|error| error.to_string())?,
         };
-        if let Err(error) = write_private(&self.policy_path(), &encoded) {
-            eprintln!("stayproductive: could not write enforcement policy: {error}");
+        let title = request
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let event = Event::UrlChanged {
+            app,
+            url: url.to_owned(),
+            title,
+        };
+        let decision = decide(&self.state, &event, now);
+        Ok(json!({
+            "blocked": decision.is_block(),
+            "verdict": match decision.verdict {
+                stayproductive_core::Verdict::Allow => "allow",
+                stayproductive_core::Verdict::Block => "block",
+                stayproductive_core::Verdict::BlockUntil => "block_until",
+                stayproductive_core::Verdict::AllowWithNotice => "allow_notice",
+            },
+            "reason": decision.reason.as_str(),
+            "message": decision.message.as_str(),
+            "until": decision.until,
+            "target": decision.target.as_ref().map(Target::key),
+            "profile": decision.profile.map(|profile| profile.to_string()),
+            "now": now,
+        }))
+    }
+
+    /// The host and keyword rules the extension can apply before navigation.
+    ///
+    /// This is a best-effort acceleration layer: the extension still asks
+    /// `browser_decision` for the authoritative page. Only active, unpaused
+    /// profiles contribute, and quick blocks override them. Site limits and
+    /// surface rules are not represented yet, so the extension must not claim
+    /// coverage it does not have.
+    fn browser_policy(&self, now: Timestamp) -> Value {
+        let mut site_blocks: Vec<Value> = Vec::new();
+        let mut site_allows: Vec<Value> = Vec::new();
+        let mut keywords: Vec<Value> = Vec::new();
+        for profile in &self.state.profiles {
+            if !self.state.profile_is_active(profile, now) || profile.pause.is_paused(now) {
+                continue;
+            }
+            for rule in &profile.rules.sites {
+                if matches!(rule.action, SiteAction::Block | SiteAction::Adult) {
+                    site_blocks.push(json!({
+                        "host": rule.pattern.host().as_str(),
+                        "suffix": matches!(rule.pattern, HostPattern::Suffix(_)),
+                        "reason": match rule.action {
+                            SiteAction::Adult => "R-ADULT",
+                            _ => "R-SITE",
+                        },
+                    }));
+                }
+            }
+            for pattern in &profile.rules.allow_sites {
+                site_allows.push(json!({
+                    "host": pattern.host().as_str(),
+                    "suffix": matches!(pattern, HostPattern::Suffix(_)),
+                }));
+            }
+            for keyword in &profile.rules.keywords {
+                keywords.push(json!({
+                    "text": keyword.text.as_str(),
+                    "scope": match keyword.scope {
+                        stayproductive_core::KeywordScope::Url => "url",
+                        stayproductive_core::KeywordScope::Search => "search",
+                        stayproductive_core::KeywordScope::Both => "both",
+                    },
+                }));
+            }
         }
+        for block in &self.state.quick_blocks {
+            if now < block.until
+                && let Target::Site(host) = &block.target
+            {
+                site_blocks.push(json!({
+                    "host": host.as_str(),
+                    "suffix": false,
+                    "reason": "R-QUICK",
+                    "until": block.until,
+                    "quick": true,
+                }));
+            }
+        }
+        for commitment in &self.state.commitments {
+            if commitment.is_enforcing(now) {
+                for pattern in &commitment.allow_sites {
+                    site_allows.push(json!({
+                        "host": pattern.host().as_str(),
+                        "suffix": matches!(pattern, HostPattern::Suffix(_)),
+                        "strict": true,
+                    }));
+                }
+            }
+        }
+        json!({
+            "generated_at": now,
+            "refresh_after_seconds": 30,
+            "site_blocks": site_blocks,
+            "site_allows": site_allows,
+            "keywords": keywords,
+            "limitations": ["site_limits", "surface_rules"],
+        })
+    }
+
+    fn stats(&self, now: Timestamp) -> Value {
+        json!({
+            "today": self.stats_range(&day_period(now, &self.state.settings), now),
+            "week": self.stats_range(&week_period(now, &self.state.settings), now),
+            "month": self.stats_range(&month_period(now, &self.state.settings), now),
+        })
     }
 
     fn snapshot(&self) -> Value {
         let now = Utc::now();
-        let heartbeat = extension_heartbeat(now);
-        let enforcement = if heartbeat {
+        let policy_path = self.policy_path().display().to_string();
+        let enforcement = if fresh_heartbeat(X11_HEARTBEAT_FILE, "x11", now) {
+            json!({
+                "state": "active",
+                "adapter": "x11",
+                "message": "The X11 enforcement adapter is hiding blocked windows and showing the block overlay.",
+                "policy_path": policy_path,
+            })
+        } else if fresh_heartbeat(GNOME_HEARTBEAT_FILE, "gnome-extension", now) {
             json!({
                 "state": "active",
                 "adapter": "gnome-extension",
                 "message": "The GNOME Shell extension is enforcing app blocks for native Wayland and XWayland windows.",
-                "policy_path": self.policy_path().display().to_string(),
+                "policy_path": policy_path,
+            })
+        } else if x11_session() {
+            let message = if adapter_program().is_some() {
+                "The X11 enforcement adapter is not reporting. The daemon keeps the policy fresh and restarts the adapter if it exits."
+            } else {
+                "No X11 enforcement adapter was found. Install the stayproductive-x11 launcher or set STAYPRODUCTIVE_X11_ADAPTER."
+            };
+            json!({
+                "state": "unavailable",
+                "adapter": "x11",
+                "message": message,
+                "policy_path": policy_path,
             })
         } else {
             json!({
                 "state": "unavailable",
                 "adapter": "gnome-extension",
                 "message": "No enforcement adapter is reporting. The policy file is ready; install and enable the GNOME extension to apply it.",
-                "policy_path": self.policy_path().display().to_string(),
+                "policy_path": policy_path,
             })
         };
         let profiles: Vec<Value> = self
@@ -561,12 +1779,15 @@ impl Daemon {
             "commitment": commitment,
             "quick_blocks": self.state.quick_blocks.iter().map(|block| json!({
                 "target": block.target.key(),
-                "kind": match block.target { Target::App(_) => "app", Target::Site(_) => "site" },
+                "kind": match &block.target { Target::App(_) => "app", Target::Site(_) => "site" },
                 "until": block.until,
             })).collect::<Vec<_>>(),
             "history": history,
+            "usage_today": self.usage_today(now),
+            "stats": self.stats(now),
             "enforcement": enforcement,
             "state_path": self.path.display().to_string(),
+            "data_path": self.store.path().display().to_string(),
         })
     }
 
@@ -1076,4 +2297,42 @@ fn commitment_view(commitment: &Commitment) -> Value {
             Restriction::BlockPause => "block_pause",
         }).collect::<Vec<_>>(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fnv_matches_the_python_client() {
+        // `engine.py` derives the same socket suffix for a custom state file.
+        assert_eq!(fnv1a_hex(b""), "cbf29ce484222325");
+        assert_eq!(fnv1a_hex(b"abc"), "e71fa2190541574b");
+    }
+
+    #[test]
+    fn socket_argument_takes_an_optional_explicit_path() {
+        match parse_args(vec!["--socket".into(), "/tmp/chosen.sock".into()]).unwrap() {
+            Mode::Socket(path) => assert_eq!(path, PathBuf::from("/tmp/chosen.sock")),
+            Mode::Stdio => panic!("expected socket mode"),
+        }
+        match parse_args(vec!["--socket=/tmp/inline.sock".into()]).unwrap() {
+            Mode::Socket(path) => assert_eq!(path, PathBuf::from("/tmp/inline.sock")),
+            Mode::Stdio => panic!("expected socket mode"),
+        }
+        assert!(matches!(
+            parse_args(vec!["--stdio".into()]).unwrap(),
+            Mode::Stdio
+        ));
+        assert!(parse_args(vec!["--wat".into()]).is_err());
+    }
+
+    #[test]
+    fn invalid_json_returns_an_error_envelope() {
+        let path = env::temp_dir().join(format!("stayproductive-unit-{}.json", ulid::Ulid::new()));
+        let mut daemon = Daemon::new(path);
+        let response: Value = serde_json::from_str(&daemon.respond("{not json")).unwrap();
+        assert_eq!(response["id"], 0);
+        assert_eq!(response["ok"], false);
+    }
 }

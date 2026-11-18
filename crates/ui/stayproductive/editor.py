@@ -368,6 +368,7 @@ class ProfileEditor(Adw.Dialog):
             w.button(
                 icon="list-add-symbolic",
                 css="flat",
+                tooltip="Add the application ID to the allowlist",
                 on_click=lambda _button: self._add_allow_app(),
             )
         )
@@ -379,6 +380,7 @@ class ProfileEditor(Adw.Dialog):
             w.button(
                 icon="list-add-symbolic",
                 css="flat",
+                tooltip="Add the website to the allowlist",
                 on_click=lambda _button: self._add_allow_site(),
             )
         )
@@ -612,6 +614,7 @@ class ProfileEditor(Adw.Dialog):
                 w.button(
                     icon="user-trash-symbolic",
                     css="flat",
+                    tooltip=f"Remove {name} from the allowlist",
                     on_click=lambda _button, item=app: self._remove_value(
                         "allow_apps", item
                     ),
@@ -625,6 +628,7 @@ class ProfileEditor(Adw.Dialog):
                 w.button(
                     icon="user-trash-symbolic",
                     css="flat",
+                    tooltip=f"Remove {site} from the allowlist",
                     on_click=lambda _button, item=site: self._remove_value(
                         "allow_sites", item
                     ),

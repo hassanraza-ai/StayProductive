@@ -245,7 +245,12 @@ class ProfilesPage:
                         not edits_locked,
                     ),
                     (
-                        "Resume" if profile.get("paused") else "Pause for 30 min",
+                        "Duplicate",
+                        lambda item=profile: self._duplicate(item),
+                        not edits_locked,
+                    ),
+                    (
+                        "Resume" if profile.get("paused") else "Pause…",
                         lambda item=profile: self._pause(item),
                         not pause_locked or bool(profile.get("paused")),
                     ),
@@ -303,17 +308,48 @@ class ProfilesPage:
             self.window.show_error("Could not change activation", error_text(error))
             self.window.refresh()
 
+    def _duplicate(self, profile: dict) -> None:
+        def create(name: str) -> None:
+            if not name:
+                self.window.show_message("Enter a name for the copy.")
+                return
+            try:
+                self.window.engine.duplicate_profile(profile["id"], name)
+                self.window.refresh()
+                self.window.toast(f"Duplicated “{profile.get('name')}” as “{name}”")
+            except Exception as error:  # noqa: BLE001
+                self.window.show_error("Could not duplicate profile", error_text(error))
+
+        w.ask_name(
+            self.window,
+            f"Duplicate “{profile.get('name')}”",
+            "The copy keeps the rules and starts without this profile's history.",
+            f"{profile.get('name', 'Profile')} copy",
+            "Duplicate",
+            create,
+        )
+
     def _pause(self, profile: dict) -> None:
-        try:
-            if profile.get("paused"):
+        if profile.get("paused"):
+            try:
                 self.window.engine.resume_profile(profile["id"])
+                self.window.refresh()
                 self.window.toast("Profile resumed")
-            else:
-                self.window.engine.pause_profile(profile["id"], 30)
-                self.window.toast("Profile paused for 30 minutes")
-            self.window.refresh()
-        except Exception as error:  # noqa: BLE001
-            self.window.show_error("Could not pause or resume", error_text(error))
+            except Exception as error:  # noqa: BLE001
+                self.window.show_error("Could not pause or resume", error_text(error))
+            return
+
+        def apply(minutes: int, until_end_of_day: bool) -> None:
+            try:
+                self.window.engine.pause_profile(
+                    profile["id"], minutes, until_end_of_day=until_end_of_day
+                )
+                self.window.refresh()
+                self.window.toast(w.pause_toast(minutes, until_end_of_day))
+            except Exception as error:  # noqa: BLE001
+                self.window.show_error("Could not pause or resume", error_text(error))
+
+        w.choose_pause(self.window, apply)
 
     def _delete(self, profile: dict) -> None:
         def remove() -> None:

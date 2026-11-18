@@ -1,0 +1,41 @@
+{
+  "app-id": "io.github.stayproductive.StayProductive",
+  "runtime": "org.gnome.Platform",
+  "runtime-version": "49",
+  "sdk": "org.gnome.Sdk",
+  "sdk-extensions": ["org.freedesktop.Sdk.Extension.rust-stable"],
+  "command": "stayproductive",
+  "finish-args": [
+    "--share=ipc",
+    "--socket=fallback-x11",
+    "--socket=wayland",
+    "--filesystem=xdg-run/stayproductive:create",
+    "--filesystem=~/.local/share/stayproductive:create",
+    "--talk-name=org.freedesktop.Notifications",
+    "--talk-name=org.freedesktop.portal.Desktop",
+    "--env=PYTHONPATH=/app/lib/stayproductive"
+  ],
+  "build-options": {
+    "append-path": "/usr/lib/sdk/rust-stable/bin",
+    "env": {
+      "CARGO_HOME": "/run/build/stayproductive/cargo"
+    },
+    "build-args": ["--share=network"]
+  },
+  "modules": [
+    {
+      "name": "stayproductive",
+      "buildsystem": "simple",
+      "build-commands": [
+        "cargo build --release -p stayproductive-daemon",
+        "make -C packaging install PREFIX=/app"
+      ],
+      "sources": [
+        {
+          "type": "dir",
+          "path": ".."
+        }
+      ]
+    }
+  ]
+}
