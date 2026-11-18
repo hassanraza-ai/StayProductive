@@ -922,9 +922,11 @@ fn profile_match(
     now: Timestamp,
 ) -> Option<RuleMatch> {
     let mut matches = Vec::new();
+    let mut pickup_hit = false;
 
     if let Some(limit) = profile.rules.pickup_limit {
         if let Some(matched) = count_limit_match(profile, limit, state, now, RuleKind::Pickup) {
+            pickup_hit = true;
             matches.push(matched);
         }
     }
@@ -933,7 +935,15 @@ fn profile_match(
         Target::App(app) => {
             if let Some(entry) = profile.rules.apps.get(app) {
                 if let Some(matched) = app_rule_match(profile, app, entry, state, now) {
-                    matches.push(matched);
+                    // Blocking engine §3 checks an exhausted pickup limit
+                    // (step 9) before a plain profile block (step 10). The
+                    // pickup is the reason the overlay shows, and it carries
+                    // the period end. A usage or launch limit still competes
+                    // on its own precedence.
+                    let plain_block = matches!(&entry.rule, AppRule::Block);
+                    if !(pickup_hit && plain_block) {
+                        matches.push(matched);
+                    }
                 }
             }
         }

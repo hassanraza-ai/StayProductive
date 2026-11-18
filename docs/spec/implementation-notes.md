@@ -309,10 +309,17 @@ top three distractions with a link to Stats.
 Limits: there is no timeline chart or per-hour/per-day bar (`F-STA-04`), and the
 seven-day report is the week range with a trend rather than a separate printable
 report (`F-STA-06` stays `wip`). Site usage is not recorded because no adapter
-reports site intervals. The X11 heartbeat includes `locked`. The daemon records
-one pickup when that bit falls, and a reached limit is an `R-PICKUP` policy
-entry (`F-STA-05`, `F-LIM-04`). The GNOME extension does not send `locked` yet,
-so a GNOME-only session still records no pickups.
+reports site intervals. The X11 heartbeat includes `locked` and `suspended`. The daemon remembers the
+previous lock bit for the active observer and records one pickup when a fresh
+heartbeat goes from locked to unlocked. Staying locked, reading the same
+unlocked heartbeat again, losing the file, and `suspended: true` do not add a
+pickup. Suspend closes the open foreground interval. A reached limit is an
+`R-PICKUP` policy entry with the period end, including when the app also has a
+plain block rule: blocking-engine §3 checks the pickup limit (step 9) before
+the profile block (step 10) (`F-STA-05`, `F-LIM-04`). The GNOME extension does
+not send `locked` yet, so a GNOME-only session still records no pickups. No
+logged-in session was locked for this check; the protocol test writes the
+heartbeat file.
 Evidence: the core acceptance tests cover range boundaries, DST-length weeks,
 ranking ties, and one launch per foreground entry; the daemon protocol test
 seeds a real state file and checks the computed snapshot; the Stats page is
@@ -787,13 +794,13 @@ first report site visits). Launch limits are enforced by the engine once
 launches are counted, but the extension does not yet report background
 launches, only foreground entries. A fresh heartbeat whose `locked` bit falls
 records one pickup, and a reached pickup limit is written into the enforcement
-policy as `R-PICKUP`. Application daily and hourly limits are now enforced
-end-to-end through the GNOME extension or the X11 adapter observer. The UI
-labels the rest as configuration rather than claiming they are enforced. Site
-time limits need a per-site interval tracker, in-page surfaces need a content
-layer, and other compositors plus launch/pickup tracking remain the largest
-missing pieces; the browser extension covers host rules and keyword replacement
-only.
+policy as `R-PICKUP`. The GNOME extension does not write `locked` yet.
+Application daily and hourly limits are now enforced end-to-end through the
+GNOME extension or the X11 adapter observer. The UI labels the rest as
+configuration rather than claiming they are enforced. Site time limits need a
+per-site interval tracker, in-page surfaces need a content layer, and other
+compositors remain the largest missing pieces; the browser extension covers
+host rules and keyword replacement only.
 
 ## Not implemented yet
 
@@ -827,7 +834,8 @@ only.
   usage counters are exported but not re-imported. Today/week/month totals, top
   distractions, launch counts, pickup counts, and block history are in Stats;
   the timeline and a separate seven-day report do not exist, and site usage is
-  not tracked. Pickups are counted from a heartbeat `locked` edge. Keyboard navigation and explicit
+  not tracked. Pickups are counted from a heartbeat `locked` edge; the GNOME
+  extension does not write that field yet. Keyboard navigation and explicit
   accessible names are in place (see *Keyboard navigation and screen readers*);
   an Orca pass, real key injection, and contrast-theme review are still manual.
 - **Low-time alerts** (`A-LIM-07` / `A-PLAT-11`).

@@ -8,23 +8,27 @@ use std::time::{Duration, Instant};
 
 use stayproductive_core::Timestamp;
 
-/// Return `(previous wall, new wall)` when the wall clock moved by more than
-/// `threshold` relative to the monotonic clock.
+/// Wall and monotonic clocks may disagree by this much without a jump.
 ///
-/// Drift at or under the threshold is ordinary scheduling delay and is not a
+/// Two seconds covers a delayed sample. Anything larger is a step.
+const JUMP_TOLERANCE: Duration = Duration::from_secs(2);
+
+/// Return `(previous wall, new wall)` when wall elapsed time and monotonic
+/// elapsed time disagree by more than two seconds.
+///
+/// Drift at or under two seconds is ordinary scheduling delay and is not a
 /// jump. A backwards step and a large forward step both qualify.
 pub fn clock_discontinuity(
     previous_wall: Timestamp,
     previous_mono: Instant,
     wall: Timestamp,
     mono: Instant,
-    threshold: Duration,
 ) -> Option<(Timestamp, Timestamp)> {
     let wall_ms = wall.signed_duration_since(previous_wall).num_milliseconds();
     let mono_ms = i64::try_from(mono.saturating_duration_since(previous_mono).as_millis())
         .unwrap_or(i64::MAX);
     let gap = wall_ms.abs_diff(mono_ms);
-    if u128::from(gap) > threshold.as_millis() {
+    if u128::from(gap) > JUMP_TOLERANCE.as_millis() {
         Some((previous_wall, wall))
     } else {
         None
@@ -44,41 +48,25 @@ mod tests {
     #[test]
     fn one_second_of_drift_is_not_a_jump() {
         let mono = Instant::now();
+        // Wall advanced 5s while the monotonic clock advanced 4s.
         assert!(
-            clock_discontinuity(
-                wall(0),
-                mono,
-                wall(1),
-                mono + Duration::from_secs(1),
-                Duration::from_secs(2),
-            )
-            .is_none()
+            clock_discontinuity(wall(0), mono, wall(5), mono + Duration::from_secs(4)).is_none()
         );
+        // Exactly two seconds of disagreement stays inside the tolerance.
+        assert!(clock_discontinuity(wall(0), mono, wall(2), mono).is_none());
     }
 
     #[test]
     fn a_backwards_step_is_a_jump() {
         let mono = Instant::now();
-        let jump = clock_discontinuity(
-            wall(100),
-            mono,
-            wall(70),
-            mono + Duration::from_secs(1),
-            Duration::from_secs(2),
-        );
+        let jump = clock_discontinuity(wall(100), mono, wall(70), mono + Duration::from_secs(1));
         assert_eq!(jump, Some((wall(100), wall(70))));
     }
 
     #[test]
     fn a_forward_step_is_a_jump() {
         let mono = Instant::now();
-        let jump = clock_discontinuity(
-            wall(100),
-            mono,
-            wall(130),
-            mono + Duration::from_secs(1),
-            Duration::from_secs(2),
-        );
+        let jump = clock_discontinuity(wall(100), mono, wall(130), mono + Duration::from_secs(1));
         assert_eq!(jump, Some((wall(100), wall(130))));
     }
 }

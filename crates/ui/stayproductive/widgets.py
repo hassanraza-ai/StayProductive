@@ -231,11 +231,13 @@ def pause_toast(minutes: int, until_end_of_day: bool) -> str:
     """Short confirmation for a pause the person just chose."""
 
     if until_end_of_day:
-        return "Paused until the next start of day"
+        return "Paused for the rest of today"
     if minutes <= 0:
         return "Paused until you resume"
     if minutes == 1:
         return "Paused for 1 minute"
+    if minutes == 60:
+        return "Paused for 1 hour"
     return f"Paused for {minutes} minutes"
 
 
@@ -252,6 +254,7 @@ def choose_pause(
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
     for label, minutes, until_end_of_day in PAUSE_CHOICES:
         button = Gtk.Button(label=label)
+        accessible(button, label=label)
 
         def choose(
             _button: Gtk.Button,
@@ -313,6 +316,7 @@ def pause_menu(on_choice: Callable[[int, bool], None]) -> Gtk.MenuButton:
         item = Gtk.Button(label=label)
         item.add_css_class("flat")
         item.set_halign(Gtk.Align.FILL)
+        accessible(item, label=label)
 
         def choose(
             _button: Gtk.Button,
@@ -325,10 +329,14 @@ def pause_menu(on_choice: Callable[[int, bool], None]) -> Gtk.MenuButton:
         item.connect("clicked", choose)
         box.append(item)
     menu.set_child(box)
-    button = Gtk.MenuButton(label="Pause")
+    button = Gtk.MenuButton(label="Pause this profile")
     button.set_popover(menu)
     button.set_focusable(True)
-    accessible(button, label="Pause the active profile")
+    accessible(
+        button,
+        label="Pause this profile",
+        description="Choose how long the active profile stays paused.",
+    )
     return button
 
 

@@ -75,8 +75,15 @@ dashboard and Settings page report the adapter state rather than pretending.
   attributes intervals to the core usage ledger, and daily/hourly app limits
   enforce for real, even with the GTK window closed. Usage survives restart,
   stops behind the block overlay or a locked session, and drives launch limits.
-A locked-to-unlocked heartbeat counts one pickup, and a reached pickup limit
-blocks with `R-PICKUP`.
+  A locked-to-unlocked heartbeat counts one pickup, and a reached pickup limit
+  blocks with `R-PICKUP`. The X11 adapter writes `locked`; the GNOME extension
+  does not yet, so a GNOME-only session still records no pickups.
+- A profile can be duplicated under a new name. The copy keeps the rules and
+  does not take the original's usage. A clashing name is refused, and so is a
+  duplicate during an active strict session.
+- Pausing offers 1, 5, 10, 15, 30, and 60 minutes, the rest of today, or until
+  you resume. Rest of today ends at the next start of day from the saved clock
+  settings. Zero minutes stays paused until resume, including across a restart.
 - Stats: today, week, and month screen time; top distractions ranked by time
   with share and previous-period trend; block, pickup, and launch counts; and
   block history with reason codes and end times. The dashboard shows today's
