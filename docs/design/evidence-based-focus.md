@@ -34,29 +34,31 @@ wrote. The engine does not treat the plan as a rule.
 
 ## Self-monitoring and feedback
 
-Harkin and colleagues (2016) meta-analysed experiments on monitoring progress
-toward a goal. Monitoring raised the chance of attaining the goal, and the
-effect was larger when the record was physical and when it was reported often.
-The practical reading for this app is a local today / week / month record of
-the apps the person chose to track.
+Harkin and colleagues (2016) meta-analysed 138 randomized studies of monitoring
+progress toward a goal. Prompts to monitor raised attainment (d+ = 0.40, 95%
+CI 0.32 to 0.48). The gain was larger when progress was written down, and when
+it was reported to someone else, mostly for health goals. Monitoring a
+behaviour moved that behaviour. The practical reading for this app is a local
+today / week / month record of the apps the person chose to track. Publishing
+that record is not required.
 
-Kluger and DeNisi (1996) reviewed feedback interventions and found that
-feedback does not reliably help. About a third of the interventions reduced
-performance. Their feedback intervention theory says feedback that pulls
-attention onto the self ("you are easily distracted") is more likely to hurt
-than feedback that stays on the task. Stats in this app therefore say where
-time went and how that compares with the previous period of the same length.
-They do not score the person.
+Kluger and DeNisi (1996) found that feedback helped on average (d = 0.41) and
+that more than a third of interventions reduced performance. Benefit shrank as
+attention moved from the task toward the self. Praise, discouragement, and
+comparison with other people pull attention that way. Stats in this app
+therefore say where time went and how that compares with the previous period
+of the same length. They do not score the person.
 
 ## Friction and commitment
 
 Bryan, Karlan, and Nelson (2010) review commitment devices: arrangements people
-set up now to make a later choice harder or more expensive. They work when the
-person chooses the constraint and can still see what they agreed to. A device
-that cannot be left at all is a different product, and it is outside what this
-desktop app can honestly promise. The same local user can read the state file.
-Strict mode here is a cool-down and a refusal to edit rules while the
-commitment is active, with the end time on screen.
+set up now to make a later choice harder or more expensive. Rogers, Milkman,
+and Volpp (2014) describe the ones that have been tried as voluntary, including
+soft devices a person can later leave. A device that cannot be left at all is
+a different product, and it is outside what this desktop app can honestly
+promise. The same local user can read the state file. Strict mode here is a
+cool-down and a refusal to edit rules while the commitment is active, with the
+end time on screen.
 
 Duckworth, Gendler, and Gross (2016) group self-control strategies and put
 situation selection and situation modification ahead of relying on in-the-moment
@@ -66,20 +68,26 @@ works, or that a harder block is always better.
 
 ## Breaks
 
-Hunter and Wu (2016) studied workday breaks and found that breaks people
-preferred, and breaks earlier in the day, were associated with more recovery.
-The paper does not nominate a minute count that everyone should use. Claims
-such as a universal 52/17 split, a 25-minute Pomodoro as a proven optimum, or
-an ultradian rhythm that the app should enforce are not used here.
+Hunter and Wu (2016) followed 95 employees for five days and found that breaks
+people preferred, and breaks earlier in the day, were associated with more
+recovery. Longer breaks and frequent short breaks both beat rare short ones.
+The study is observational and does not nominate a minute count. Trougakos,
+Beal, Green, and Weiss (2008) found that how people spent a long break, not
+only that they stopped, was tied to how they felt afterward. Claims such as a
+universal 52/17 split, a 25-minute Pomodoro as a proven optimum, or an
+ultradian rhythm that the app should enforce are not used here.
 
 Product use: a pause lists a few durations, the rest of today, and "until I
 resume," and the screen says when it ends. The person picks the length.
 
 ## Habits
 
-Lally, van Jaarsveld, Potts, and Wardle (2010) modelled habit formation for
-daily behaviours. The median time to reach a plateau of automaticity was 66
-days, and the range was 18 to 254 days. That median is not a target. Wood and
+Lally, van Jaarsveld, Potts, and Wardle (2010) followed 96 volunteers repeating
+one chosen daily behaviour in the same context for 12 weeks. For the 39 people
+whose automaticity fit a curve, the median time to 95% of their own plateau
+was 66 days, with a range of 18 to 254. Estimates past day 84 are
+extrapolations. One missed day did not materially change the curve. That
+median is not a target, and the sample was not about screen time. Wood and
 Neal (2007) describe habits as responses tied to stable contexts, not to
 repetition alone. A profile that runs on the same days and hours is a context
 cue. The app does not tell anyone they have formed a habit after a set number
@@ -122,6 +130,13 @@ of days.
 - Lally, P., van Jaarsveld, C. H. M., Potts, H. W. W., & Wardle, J. (2010). How
   are habits formed: Modelling habit formation in the real world. *European
   Journal of Social Psychology, 40*(6), 998–1009. https://doi.org/10.1002/ejsp.674
+- Rogers, T., Milkman, K. L., & Volpp, K. G. (2014). Commitment devices: Using
+  initiatives to change behavior. *JAMA, 311*(20), 2065–2066.
+  https://doi.org/10.1001/jama.2014.3485
+- Trougakos, J. P., Beal, D. J., Green, S. G., & Weiss, H. M. (2008). Making the
+  break count: An episodic examination of recovery activities, emotional
+  experiences, and positive affective displays. *Academy of Management Journal,
+  51*(1), 131–146. https://doi.org/10.5465/amj.2008.30764063
 - Wood, W., & Neal, D. T. (2007). A new look at habits and the habit–goal
   interface. *Psychological Review, 114*(4), 843–863.
   https://doi.org/10.1037/0033-295X.114.4.843
