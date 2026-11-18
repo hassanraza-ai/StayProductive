@@ -193,6 +193,39 @@ a silently partial history would be misleading. The response reports
 `usage_imported:false` and the UI says so after a restore. `F-UX-12` therefore
 stays `wip` until counters can be restored too.
 
+### IPC versioning and full reset (`F-DATA-03`, `F-DATA-04`)
+
+The socket envelope carries `schema_version` on requests and `protocol_version`
+on the greeting and every reply. Version 1 is the current shape. The daemon
+accepts older peers that omit the field, refuses a strictly newer version with a
+message that names both versions and states that blocking continues, and echoes
+the refused request's id. Refusing happens before any state mutation, so a
+mismatched client cannot weaken an active block. The Python client attaches the
+field to every request and raises an `EngineError` with an update instruction if
+a greeting or reply reports a newer version; it does not close the socket on the
+reply path, because the daemon behind it is still enforcing. `A-DATA-03` is
+proven by driving the real binary: an active site block still returns `R-SITE`
+after a version-99 refusal, while version-1 and version-less snapshots succeed.
+
+`reset_all` is a separate, destructive command with the same explicit
+`confirm:true` gate as `delete_history`. It clears profiles, their schedules and
+rules, the manual activation, quick blocks, schedule extensions, the entire usage
+ledger, and restores the default clock settings (midnight, system timezone).
+Commitments are **excluded**: an active commitment refuses the reset through the
+same `edits_blocked` check that guards rule edits, and ended commitments are
+carried across as history. The operation builds a fresh `State` in memory and
+persists it through the normal transaction, so a restart sees the clean state.
+The Settings page places the action behind a destructive confirmation that says
+what is deleted and when the action is refused. The daemon protocol tests cover
+the confirmation gate, the commitment refusal, the cleared counts and settings,
+and restart durability.
+
+These two rows are `done`, but the reset does not remove the onboarding marker or
+browser host registrations: those live outside the app state, so the wizard does
+not reappear and the native host stays installed. That is deliberate — a reset of
+app data should not silently change browser permissions. Export first if any of
+it matters; there is no undo.
+
 ### Usage tracking
 
 Each adapter heartbeat is also a foreground observer. Besides the liveness

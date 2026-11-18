@@ -24,6 +24,10 @@ REQUEST_TIMEOUT = 20.0
 CONNECT_TIMEOUT = 5.0
 START_TIMEOUT = 10.0
 
+# Version of the newline-JSON envelope. The daemon accepts older peers that
+# omit it, refuses newer ones, and reports its own version in every reply.
+PROTOCOL_VERSION = 1
+
 
 class EngineError(RuntimeError):
     """A request failed, or the state service refused it."""
@@ -106,6 +110,14 @@ class Engine:
             sock.close()
             raise EngineConnectionError(
                 "The local state service sent an unexpected greeting."
+            )
+        server_version = greeting.get("protocol_version")
+        if isinstance(server_version, int) and server_version > PROTOCOL_VERSION:
+            sock.close()
+            raise EngineError(
+                f"The background service speaks protocol {server_version}, "
+                f"which is newer than this app ({PROTOCOL_VERSION}). Update "
+                "StayProductive; blocking continues in the background."
             )
         state_path = Path(greeting.get("state_path", "")).expanduser().resolve()
         if state_path != self._expected_state:
@@ -200,12 +212,21 @@ class Engine:
         payload = payload or {}
         if "id" in payload:
             raise EngineError("the request field 'id' is reserved for the envelope")
+        if "schema_version" in payload:
+            raise EngineError(
+                "the request field 'schema_version' is reserved for the envelope"
+            )
         with self._lock:
             if self._socket is None or self._reader is None:
                 self._establish()
             request_id = self._next_id
             self._next_id += 1
-            message = {"id": request_id, "cmd": command, **payload}
+            message = {
+                "id": request_id,
+                "cmd": command,
+                "schema_version": PROTOCOL_VERSION,
+                **payload,
+            }
             assert self._socket is not None and self._reader is not None
             try:
                 self._socket.settimeout(timeout)
@@ -230,6 +251,13 @@ class Engine:
             if response.get("id") not in (request_id, 0):
                 raise EngineConnectionError(
                     "The local state service sent a mismatched reply."
+                )
+            server_version = response.get("protocol_version")
+            if isinstance(server_version, int) and server_version > PROTOCOL_VERSION:
+                raise EngineError(
+                    f"The background service speaks protocol {server_version}, "
+                    f"which is newer than this app ({PROTOCOL_VERSION}). Update "
+                    "StayProductive; blocking continues in the background."
                 )
             if not response.get("ok"):
                 raise EngineError(response.get("error") or "The request failed.")
@@ -304,6 +332,14 @@ class Engine:
         """Forget raw and aggregate usage. Profiles and commitments are kept."""
 
         return self.request("delete_history", confirm=True)
+
+    def reset_all(self) -> dict[str, Any]:
+        """Clear profiles, rules, quick blocks, and history.
+
+        An active strict commitment refuses this; ended commitments are kept.
+        """
+
+        return self.request("reset_all", confirm=True)
 
     def import_data(self, path: str) -> dict[str, Any]:
         """Restore profiles, settings, and commitments from an export archive."""

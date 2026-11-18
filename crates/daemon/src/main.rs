@@ -397,6 +397,10 @@ fn adapter_runtime_dir() -> PathBuf {
     runtime_dir().join("stayproductive")
 }
 
+/// Version of the newline-JSON envelope. Older peers may omit it; a newer
+/// version is refused instead of guessed at (`A-DATA-03`).
+const PROTOCOL_VERSION: u64 = 1;
+
 const X11_HEARTBEAT_FILE: &str = "x11-adapter.json";
 const GNOME_HEARTBEAT_FILE: &str = "gnome-extension.json";
 
@@ -844,6 +848,7 @@ impl Daemon {
             "event": "ready",
             "state_path": self.path.display().to_string(),
             "data_path": self.store.path().display().to_string(),
+            "protocol_version": PROTOCOL_VERSION,
         })
         .to_string()
     }
@@ -858,6 +863,7 @@ impl Daemon {
                     "id": 0,
                     "ok": false,
                     "error": format!("invalid JSON: {error}"),
+                    "protocol_version": PROTOCOL_VERSION,
                 })
                 .to_string();
             }
@@ -869,13 +875,34 @@ impl Daemon {
             .unwrap_or_default()
             .to_owned();
         match self.handle(&command, &request) {
-            Ok(data) => json!({"id": id, "ok": true, "data": data}),
-            Err(error) => json!({"id": id, "ok": false, "error": error}),
+            Ok(data) => json!({
+                "id": id,
+                "ok": true,
+                "data": data,
+                "protocol_version": PROTOCOL_VERSION,
+            }),
+            Err(error) => json!({
+                "id": id,
+                "ok": false,
+                "error": error,
+                "protocol_version": PROTOCOL_VERSION,
+            }),
         }
         .to_string()
     }
 
     fn handle(&mut self, command: &str, request: &Value) -> DResult<Value> {
+        if let Some(version) = request.get("schema_version") {
+            let version = version
+                .as_u64()
+                .ok_or_else(|| "schema_version must be a whole number".to_owned())?;
+            if version > PROTOCOL_VERSION {
+                return Err(format!(
+                    "schema version {version} is newer than this service supports \
+                     ({PROTOCOL_VERSION}); update StayProductive. Blocking continues."
+                ));
+            }
+        }
         let now = Utc::now();
         let tracked = self.track_usage(now);
         let command_dirty = !matches!(
@@ -1117,6 +1144,37 @@ impl Daemon {
                     // history never weakens an active block.
                     self.state.usage = UsageLedger::new();
                     Ok(json!({"removed": removed, "snapshot": self.snapshot()}))
+                }
+                "reset_all" => {
+                    // Destructive and irreversible, so it needs the same
+                    // explicit confirmation as history deletion. An active
+                    // commitment is a promise the user made and blocks reset,
+                    // exactly like profile edits (`strict-and-lock.md` §7).
+                    if request.get("confirm").and_then(Value::as_bool) != Some(true) {
+                        return Err("reset_all requires confirm: true".into());
+                    }
+                    require_rule_edits_allowed(&self.state, now)?;
+                    let removed = json!({
+                        "profiles": self.state.profiles.len(),
+                        "quick_blocks": self.state.quick_blocks.len(),
+                        "extensions": self.state.extensions.len(),
+                        "intervals": self.state.usage.intervals().len(),
+                        "launches": self.state.usage.launches().len(),
+                        "pickups": self.state.usage.pickups().len(),
+                        "blocks": self.state.usage.blocks().len(),
+                    });
+                    // Commitments are excluded from a reset by spec; ended
+                    // commitments stay as history, and an active one refused
+                    // above, so the list is carried across rather than cleared.
+                    let commitments = std::mem::take(&mut self.state.commitments);
+                    let kept = commitments.len();
+                    self.state = State::new(ClockSettings::new(NaiveTime::MIN, system_timezone()));
+                    self.state.commitments = commitments;
+                    Ok(json!({
+                        "removed": removed,
+                        "commitments_kept": kept,
+                        "snapshot": self.snapshot(),
+                    }))
                 }
                 "import_data" => {
                     require_rule_edits_allowed(&self.state, now)?;

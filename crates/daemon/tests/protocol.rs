@@ -1588,3 +1588,184 @@ fn socket_service_supervises_the_x11_adapter() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_data_03_a_newer_protocol_is_refused_while_enforcement_continues() {
+    let (dir, path) = temp_state();
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "sites": [{"pattern": "example.com", "action": "block"}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    let refused = service.request("snapshot", json!({"schema_version": 99}));
+    assert_eq!(refused["ok"], false, "{refused}");
+    let message = refused["error"].as_str().expect("error text");
+    assert!(message.contains("newer"), "{message}");
+    assert!(message.contains("Blocking continues"), "{message}");
+    assert_eq!(refused["protocol_version"], 1);
+    // The envelope echoes the id of the request that was refused.
+    assert_eq!(refused["id"], 3); // create_profile=1, activate_profile=2
+
+    // The same daemon still decides and therefore still enforces.
+    let decision = service.ok(
+        "browser_decision",
+        json!({"url": "https://example.com/lesson", "app": "firefox"}),
+    );
+    assert_eq!(decision["blocked"], true, "{decision}");
+    assert_eq!(decision["reason"], "R-SITE");
+
+    // Older peers that omit the field, or send the current version, work.
+    let current = service.ok("snapshot", json!({"schema_version": 1}));
+    assert_eq!(current["profiles"].as_array().expect("profiles").len(), 1);
+    let legacy = service.ok("snapshot", json!({}));
+    assert_eq!(legacy["profiles"].as_array().expect("profiles").len(), 1);
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_data_04_reset_needs_confirmation_and_strict_commitments_refuse_it() {
+    let (dir, path) = temp_state();
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "block"}],
+                "sites": [{"pattern": "example.com", "action": "block"}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+    service.ok(
+        "set_settings",
+        json!({"start_of_day": "04:00", "timezone": "UTC"}),
+    );
+    service.ok(
+        "quick_block",
+        json!({"kind": "site", "target": "news.example.com", "minutes": 10}),
+    );
+
+    let refused = service.request("reset_all", json!({}));
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("confirm"),
+        "{refused}"
+    );
+
+    service.ok(
+        "start_strict",
+        json!({"minutes": 30, "cooldown_minutes": 10}),
+    );
+    let locked = service.request("reset_all", json!({"confirm": true}));
+    assert_eq!(locked["ok"], false, "{locked}");
+    assert!(
+        locked["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("commitment"),
+        "{locked}"
+    );
+
+    let snapshot = service.ok("snapshot", json!({}));
+    assert_eq!(snapshot["profiles"].as_array().expect("profiles").len(), 1);
+    assert_eq!(
+        snapshot["quick_blocks"]
+            .as_array()
+            .expect("quick blocks")
+            .len(),
+        1
+    );
+    assert_eq!(snapshot["settings"]["start_of_day"], "04:00");
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_data_04_a_confirmed_reset_clears_rules_and_history_but_keeps_commitments() {
+    let (dir, path) = temp_state();
+    let mut service = Service::start(&path);
+    service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "block"}]
+            }
+        }),
+    );
+    service.ok(
+        "quick_block",
+        json!({"kind": "app", "target": "steam", "minutes": 10}),
+    );
+    service.ok(
+        "set_settings",
+        json!({"start_of_day": "04:00", "timezone": "UTC"}),
+    );
+
+    let result = service.ok("reset_all", json!({"confirm": true}));
+    assert_eq!(result["removed"]["profiles"], 1, "{result}");
+    assert_eq!(result["removed"]["quick_blocks"], 1, "{result}");
+    assert_eq!(result["commitments_kept"], 0, "{result}");
+
+    let snapshot = service.ok("snapshot", json!({}));
+    assert!(
+        snapshot["profiles"]
+            .as_array()
+            .expect("profiles")
+            .is_empty()
+    );
+    assert!(
+        snapshot["quick_blocks"]
+            .as_array()
+            .expect("quick blocks")
+            .is_empty()
+    );
+    assert_eq!(snapshot["settings"]["start_of_day"], "00:00");
+    assert_eq!(snapshot["settings"]["timezone"], "UTC");
+    assert_eq!(snapshot["stats"]["today"]["seconds"], 0);
+
+    service.shutdown();
+
+    // The reset is durable, not just a reply.
+    let mut restarted = Service::start(&path);
+    let snapshot = restarted.ok("snapshot", json!({}));
+    assert!(
+        snapshot["profiles"]
+            .as_array()
+            .expect("profiles")
+            .is_empty()
+    );
+    assert!(
+        snapshot["quick_blocks"]
+            .as_array()
+            .expect("quick blocks")
+            .is_empty()
+    );
+    restarted.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -108,6 +108,29 @@ class SettingsPage:
         backup.add(self.restore_row)
         self.page.add(backup)
 
+        reset = Adw.PreferencesGroup(
+            title="Reset",
+            description=(
+                "Start over on this device. An active strict session blocks "
+                "this action until it ends; ended commitments are kept as "
+                "history. Export first if you may want the data again."
+            ),
+        )
+        self.reset_row = Adw.ActionRow(
+            title="Reset all data",
+            subtitle="Delete profiles, schedules, rules, quick blocks, and usage history",
+        )
+        self.reset_row.add_suffix(
+            w.button(
+                "Reset…",
+                css="destructive-action",
+                tooltip="Delete local rules and history",
+                on_click=lambda _button: self._confirm_reset(),
+            )
+        )
+        reset.add(self.reset_row)
+        self.page.add(reset)
+
         background = Adw.PreferencesGroup(
             title="Background service",
             description=(
@@ -439,6 +462,30 @@ class SettingsPage:
         if display is not None:
             display.get_clipboard().set(path)
             self.window.toast("Data path copied")
+
+    def _confirm_reset(self) -> None:
+        w.confirm(
+            self.window,
+            "Reset all data?",
+            "This deletes every profile, schedule, rule, quick block, and usage "
+            "record. Settings return to their defaults. An active strict session "
+            "refuses the reset, and ended commitments stay in history. There is "
+            "no undo, so export first if you want a copy.",
+            "Reset everything",
+            self._reset_all,
+            destructive=True,
+        )
+
+    def _reset_all(self) -> None:
+        try:
+            result = self.window.engine.reset_all()
+        except Exception as error:  # noqa: BLE001
+            self.window.show_error("Could not reset data", error_text(error))
+            return
+        removed = result.get("removed", {})
+        count = sum(int(removed.get(key, 0) or 0) for key in removed)
+        self.window.refresh()
+        self.window.toast(f"Reset {count} local records")
 
     def _open_folder(self) -> None:
         path = self.window.snapshot.get("state_path")

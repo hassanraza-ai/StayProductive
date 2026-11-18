@@ -193,6 +193,18 @@ class MainWindowAccessibilityTest(unittest.TestCase):
     def setUp(self) -> None:
         self.engine.data = dict(SNAPSHOT)
 
+    def test_reset_all_uses_a_destructive_confirmation(self) -> None:
+        # The reset row is built into the real Settings page; the daemon tests
+        # cover the command itself, this check covers the UI's safety prompt.
+        page = self.window.settings
+        self.assertIsNotNone(page.reset_row)
+        with mock.patch.object(self.w, "confirm") as confirm:
+            page._confirm_reset()
+        confirm.assert_called_once()
+        self.assertEqual(confirm.call_args.args[0], self.window)
+        self.assertIn("Reset", confirm.call_args.args[1])
+        self.assertIs(confirm.call_args.kwargs.get("destructive"), True)
+
     # ------------------------------------------------------------- widget layer
     def _describe(self, widget) -> str:
         text = widget.get_tooltip_text() or ""

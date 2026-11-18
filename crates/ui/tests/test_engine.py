@@ -20,6 +20,7 @@ class FakeDaemon:
         self.state_path = Path(state_path)
         self.commands: list[str] = []
         self.requests: list[dict] = []
+        self.protocol_version = 1
         self._closing = False
         self._connections: list[socket.socket] = []
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -48,7 +49,11 @@ class FakeDaemon:
             stream = connection.makefile("rw", encoding="utf-8", newline="\n")
             stream.write(
                 json.dumps(
-                    {"event": "ready", "state_path": str(self.state_path)}
+                    {
+                        "event": "ready",
+                        "state_path": str(self.state_path),
+                        "protocol_version": self.protocol_version,
+                    }
                 )
                 + "\n"
             )
@@ -73,6 +78,7 @@ class FakeDaemon:
                         {
                             "id": request["id"],
                             "ok": True,
+                            "protocol_version": self.protocol_version,
                             "data": {
                                 "state_path": str(self.state_path),
                                 "profiles": [],
@@ -200,6 +206,29 @@ class EngineSocketTest(unittest.TestCase):
         self.assertEqual(decision["title"], "Games")
         self.assertEqual(decision["app"], "browser")
         self.assertNotIn("store", decision)
+
+    def test_reset_sends_confirmation_and_the_current_schema(self) -> None:
+        engine = self.engine()
+        engine.snapshot()
+        engine.reset_all()
+
+        self.assertEqual(self.daemon.requests[1]["cmd"], "reset_all")
+        self.assertIs(self.daemon.requests[1]["confirm"], True)
+        self.assertEqual(self.daemon.requests[0]["schema_version"], 1)
+
+    def test_a_newer_service_is_reported_instead_of_guessed(self) -> None:
+        self.daemon.protocol_version = 2
+        with self.assertRaises(EngineError) as caught:
+            self.engine()  # the version check happens on connect
+        message = str(caught.exception)
+        self.assertIn("protocol 2", message)
+        self.assertIn("newer", message)
+        self.assertIn("continues", message)
+
+        # Once the service matches again, a fresh client connects normally.
+        self.daemon.protocol_version = 1
+        engine = self.engine()
+        self.assertEqual(engine.snapshot()["profiles"], [])
 
 
 if __name__ == "__main__":

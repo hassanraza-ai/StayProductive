@@ -84,6 +84,11 @@ dashboard and Settings page report the adapter state rather than pretending.
   Backup restores an export: a clean install is replaced, a used install is
   merged without shortening an active strict session, and usage counters are
   left in the archive rather than re-imported.
+- IPC version negotiation: the client and daemon exchange a schema version; a
+  newer daemon is reported to the user with an update message while blocking
+  continues in the background. Settings → Reset clears profiles, rules, quick
+  blocks, and history after a destructive confirmation; an active strict session
+  refuses the reset, and ended commitments are kept.
 - GNOME Shell integration: a short-lived `enforcement.json` policy, an opt-in
   extension that overlays blocked application windows on Wayland and XWayland,
   a runtime heartbeat, and an install/status flow in Settings.
