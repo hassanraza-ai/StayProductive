@@ -63,9 +63,10 @@ struct Daemon {
     /// Previous wall and monotonic samples, for clock-jump detection.
     last_wall: Option<Timestamp>,
     last_mono: Option<Instant>,
-    /// Last lock and suspend bits from a fresh observer. `None` means this
-    /// process has not seen a heartbeat yet, so the first sample is not an
+    /// Last lock and suspend bits from the active observer. `None` means this
+    /// process has not seen that observer yet, so the first sample is not an
     /// unlock.
+    session_adapter: Option<String>,
     session_locked: Option<bool>,
     session_suspended: Option<bool>,
 }
@@ -674,6 +675,8 @@ fn stop_adapter() {
 /// short-lived so a crashed or disabled adapter cannot keep claiming
 /// enforcement or keep reporting focus.
 struct Heartbeat {
+    /// `x11` or `gnome-extension`. Lock edges are per observer.
+    adapter: String,
     /// Enabled, policy loaded, and checked within the freshness window.
     fresh: bool,
     /// The block overlay is showing; no usage accrues behind it.
@@ -736,6 +739,7 @@ fn read_heartbeat(file: &str, adapter: &str, now: Timestamp) -> Option<Heartbeat
         .and_then(Value::as_str)
         .and_then(|value| value.parse::<Timestamp>().ok());
     Some(Heartbeat {
+        adapter: adapter.to_owned(),
         fresh,
         blocked,
         locked,
@@ -868,6 +872,7 @@ impl Daemon {
             policy_seeded: false,
             last_wall: None,
             last_mono: None,
+            session_adapter: None,
             session_locked: None,
             session_suspended: None,
         }
@@ -878,13 +883,8 @@ impl Daemon {
     fn note_clock(&mut self, now: Timestamp) {
         let mono = Instant::now();
         if let (Some(previous_wall), Some(previous_mono)) = (self.last_wall, self.last_mono)
-            && let Some((old, new)) = clock::clock_discontinuity(
-                previous_wall,
-                previous_mono,
-                now,
-                mono,
-                Duration::from_secs(2),
-            )
+            && let Some((old, new)) =
+                clock::clock_discontinuity(previous_wall, previous_mono, now, mono)
         {
             self.state.handle_clock_jump(old, new);
         }
@@ -904,14 +904,27 @@ impl Daemon {
         if !heartbeat.fresh {
             return;
         }
+        // A different observer starts a new edge. Its first sample is not an
+        // unlock borrowed from the previous adapter.
+        if self.session_adapter.as_deref() != Some(heartbeat.adapter.as_str()) {
+            self.session_adapter = Some(heartbeat.adapter.clone());
+            self.session_locked = None;
+            self.session_suspended = None;
+        }
         if heartbeat.suspended {
             if self.session_suspended != Some(true) {
                 self.state.observe(&Event::SessionSuspended, now);
             }
-        } else if self.session_suspended == Some(true) {
+            // Remember the lock bit, but do not treat a change while
+            // suspended as a pickup.
+            self.session_suspended = Some(true);
+            self.session_locked = Some(heartbeat.locked);
+            return;
+        }
+        if self.session_suspended == Some(true) {
             self.state.observe(&Event::Resumed, now);
         }
-        self.session_suspended = Some(heartbeat.suspended);
+        self.session_suspended = Some(false);
         match (self.session_locked, heartbeat.locked) {
             (Some(true), false) => {
                 self.state.observe(&Event::ScreenUnlocked, now);
@@ -1343,6 +1356,7 @@ impl Daemon {
     /// ledger changed, so the caller knows to persist.
     fn track_usage(&mut self, now: Timestamp) -> bool {
         let heartbeat = observer_heartbeat(now);
+        let before = usage_fingerprint(&self.state.usage);
         self.note_session(&heartbeat, now);
         let focus = match &heartbeat {
             Some(hb)
@@ -1360,7 +1374,6 @@ impl Daemon {
             _ => None,
         };
         let usage = &mut self.state.usage;
-        let before = usage_fingerprint(usage);
         match focus {
             Some((app, since)) => {
                 // An interval can only start at or after the last
