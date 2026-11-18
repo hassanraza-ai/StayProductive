@@ -23,7 +23,8 @@ resources, or assets from the reference app are included or licensed.
 | Core engine | **implemented** — profiles, rules, limits, schedules, commitments, 38 acceptance scenarios |
 | Local state service | **implemented** — SQLite with forward migrations, profiles, quick blocks, strict cool-down, settings |
 | Desktop UI | **implemented** — dashboard, profiles and editor, schedules, strict session, stats, settings |
-| Desktop enforcement | **implemented for GNOME app windows** — opt-in Shell extension covering app blocks, quick blocks, and daily/hourly app usage limits; sites, keywords, and other compositors remain |
+| Desktop enforcement | **implemented for GNOME and X11 app windows** — opt-in Shell extension and a supervised X11 adapter covering app blocks, quick blocks, and daily/hourly app usage limits |
+| Browser enforcement | **implemented for host rules and keyword replacement** — Manifest V3 extension plus a per-user native host; Chrome/Chromium live-tested, Firefox manifest-reviewed; site limits and in-page surfaces remain |
 | Runtime parity verification | impossible against the reference without a device; parity is defined by the acceptance suite |
 
 The current build is useful as a real, persistent focus planner: profiles,
@@ -32,8 +33,11 @@ can also block application windows and enforce daily/hourly application usage
 limits once the bundled Shell extension is installed and enabled — the
 extension reports the focused app, the daemon accumulates foreground time in
 the engine's usage ledger, and a reached limit blocks like any other rule.
-Website, keyword, and non-GNOME enforcement are still missing; the dashboard
-and Settings page report the adapter state rather than pretending.
+Website host rules and keywords work in Chrome/Chromium through the bundled
+extension (see below): host blocks are applied before the request, and a
+keyword-blocked page is replaced after it commits. Site time limits, in-page
+surfaces, DNS filtering, and non-X11/GNOME compositors are still missing; the
+dashboard and Settings page report the adapter state rather than pretending.
 
 ### Implemented today
 
@@ -82,6 +86,14 @@ and Settings page report the adapter state rather than pretending.
 - GNOME Shell integration: a short-lived `enforcement.json` policy, an opt-in
   extension that overlays blocked application windows on Wayland and XWayland,
   a runtime heartbeat, and an install/status flow in Settings.
+- Browser extension for Chrome/Chromium, Brave, Edge, and Firefox: the daemon
+  answers `browser_decision` for every navigation, `browser_policy` feeds
+  dynamic `declarativeNetRequest` host rules refreshed once a minute, quick
+  site blocks outrank normal allows, and a keyword block mounts a closed-shadow
+  overlay without touching the address bar. The native host is a short Python
+  proxy with a fixed command allowlist and a 1 MiB frame limit, installed per
+  user without root. Site limits and in-page surfaces are reported as
+  limitations, not approximated.
 - The dashboard only says enforcement is active when the extension heartbeat is
   fresh and reports a loaded policy; otherwise it explains what is missing.
 - A five-step first-run wizard: purpose, a goal (Social, Work, Study, Sleep,
@@ -94,11 +106,15 @@ and Settings page report the adapter state rather than pretending.
 
 ### Not implemented yet
 
-Website and keyword enforcement, the browser extension, site time limits,
-pickup limits, non-GNOME compositor adapters, tray integration, DNS helper,
-usage timeline charts, a separate seven-day report, site usage, runtime pickup
-events, low-time notifications, restoring usage counters from a backup, full
-translation catalogs, and manual screen-reader/high-contrast verification.
+Site time limits and in-page surfaces (Shorts/Reels/Stories, adult filtering),
+pickup limits, DNS filtering, non-X11/GNOME compositor adapters, tray
+integration, usage timeline charts, a separate seven-day report, site usage,
+runtime pickup events, low-time notifications, restoring usage counters from a
+backup, full translation catalogs, and manual screen-reader/high-contrast
+verification. Keyword blocking happens after navigation commits because
+`declarativeNetRequest` has no keyword filter, so a frame may paint first; host
+rules do block before the request. The Firefox manifest is reviewed but the
+extension has not been loaded in Firefox.
 Notifications and the DNS helper are listed in
 onboarding but deliberately unavailable, so nothing is enabled by clicking
 through the wizard. Autostart is implemented through the systemd user unit, but
@@ -165,10 +181,11 @@ does not use `pip` for PyGObject.
 
 The extension is optional and local. It enforces application `block` rules,
 application quick blocks, and daily/hourly application usage limits (by
-reporting the focused app so the daemon can attribute foreground time); sites,
-keywords, launch and pickup limits still need the browser extension and a
-logind hookup. The daemon keeps refreshing the policy while it runs, including
-when the window is closed, so enforcement continues until the daemon is stopped.
+reporting the focused app so the daemon can attribute foreground time); sites
+and keywords are covered by the browser extension below, while launch and
+pickup limits still need a logind hookup. The daemon keeps refreshing the policy
+while it runs, including when the window is closed, so enforcement continues
+until the daemon is stopped.
 See [`integrations/gnome/README.md`](integrations/gnome/README.md)
 for the policy format, usage tracking, emergency unblock, privacy notes, and
 uninstall steps.
@@ -214,6 +231,40 @@ manager; enabling autostart from Settings imports them for the current manager,
 and the unit passes them through with `PassEnvironment`. See
 [`docs/spec/implementation-notes.md`](docs/spec/implementation-notes.md).
 
+### Enable website and keyword blocking in the browser
+
+The extension is a companion, not a second engine: the daemon still decides
+every block, so site and keyword rules behave the same as app rules and carry
+the same reason code and end time.
+
+Chrome, Chromium, Brave, Edge:
+
+1. Open `chrome://extensions`, enable **Developer mode**, choose **Load
+   unpacked**, and select `integrations/browser-extension/extension`.
+2. Copy the extension ID from the card.
+3. Install the native host for that ID:
+
+   ```sh
+   python3 integrations/browser-extension/install.py \
+     --browser chrome --extension-id <the-id-from-step-2>
+   ```
+
+4. Restart the browser and press **Reload** on the extension. A blank badge
+   means the host and daemon are reachable; `!` means they are not.
+
+Firefox: load `extension/manifest.firefox.json` from
+`about:debugging#/runtime/this-firefox` as a temporary add-on, then run
+`python3 integrations/browser-extension/install.py --browser firefox`. The
+fixed ID is `stayproductive@local`; a signed permanent build is not packaged.
+
+The extension asks for `nativeMessaging`, `declarativeNetRequest`, `storage`,
+`alarms`, and `<all_urls>`. URLs and titles go only to the local daemon socket
+for one decision and are not stored. Host blocks happen before the request;
+keyword blocks replace the page after commit. Site time limits and in-page
+surfaces are not implemented and `browser_policy` says so. See
+[`integrations/browser-extension/README.md`](integrations/browser-extension/README.md)
+for uninstall, troubleshooting, and the full limitation list.
+
 ### Verify the engine
 
 ```sh
@@ -227,11 +278,14 @@ The acceptance suite is `crates/core/tests/acceptance.rs`; every test names the
 test is `crates/daemon/tests/protocol.rs`; it drives the real daemon binary over
 stdio and over the Unix socket, and checks strict locks, the cool-down refusal,
 restart persistence, state-file permissions, socket privacy and single-instance
-behaviour, the generated enforcement policy, and the extension heartbeat gate.
-The GNOME matching helpers have a compositor-free test:
+behaviour, the generated enforcement policy, the extension heartbeat gate, and
+the browser decision/policy replies.
+The GNOME matching helpers and browser extension have compositor-free tests:
 
 ```sh
 gjs -m integrations/gnome/tests/matching.test.js
+node --test integrations/browser-extension/tests/*.test.mjs
+python3 -m unittest discover -s integrations/browser-extension/tests -v
 PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests
 ```
 
@@ -248,7 +302,11 @@ profile logic, the socket client (detach, reconnect, state mismatch), the
 systemd unit text and service-state logic, and the display-free X11 matching,
 monitor-card choice, and planner pause/resume rules. The GTK wizard itself is
 construction-smoke-tested under Xvfb; visual inspection is not an acceptance
-test.
+test. The browser extension's Node tests check host matching, rule priority,
+redirect parameters, subframe handling, and block-page text; its Python tests
+check native-messaging framing, the command allowlist, daemon failures, and the
+installer in a temporary `HOME`. Chrome has been exercised live with the real
+daemon; that run is evidence, not a CI browser test.
 
 ## What "identical behaviour" means here
 

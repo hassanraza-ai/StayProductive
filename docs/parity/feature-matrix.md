@@ -21,9 +21,13 @@ daily/hourly application usage limits on real windows; an opt-in GNOME Shell
 extension does the same for native Wayland and XWayland. The observer reports
 the focused app, the daemon attributes foreground intervals to the engine's
 usage ledger, and a reached limit produces a policy entry like any other block.
-It does **not** yet enforce websites, keywords, site time limits, launch/pickup
-limits, or other compositors. Every row whose user-visible result depends on
-those missing layers remains `wip` or `todo`. The app reports enforcement as
+It does **not** yet enforce sites system-wide, site time limits, in-page
+surfaces, launch/pickup limits, or other compositors. A Manifest V3 browser
+extension is implemented for Chrome/Chromium and Firefox (reviewed, not yet
+loaded there): it applies host rules before the request through
+`declarativeNetRequest`, asks the daemon for every navigation, and replaces a
+keyword-blocked page after commit. Every row whose user-visible result depends
+on those missing layers remains `wip` or `todo`. The app reports enforcement as
 active only when an adapter heartbeat is fresh and has loaded a valid policy.
 
 ## 1. Profiles and rules
@@ -38,7 +42,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | F-PROF-06 | Mark profile as strict-mode eligible | P1 | engine | strict §3 | A-PROF-06 | wip |
 | F-RULE-01 | Block selected apps | P0 | compositor adapter | block §5 | A-RULE-01 | wip |
 | F-RULE-02 | Block selected websites | P0 | DNS + extension | content §2 | A-RULE-02 | wip |
-| F-RULE-03 | Block selected keywords | P1 | extension + URL pipe | content §3 | A-RULE-03 | wip |
+| F-RULE-03 | Block selected keywords | P1 | extension + URL pipe (after commit) | content §3 | A-RULE-03 | wip |
 | F-RULE-04 | Allowlist apps (override non-strict rules) | P0 | engine | block §4 | A-RULE-04 | done |
 | F-RULE-05 | Allowlist websites | P1 | engine + resolver | content §2 | A-RULE-05 | wip |
 | F-RULE-06 | Goal-based unlock (spend time to earn access) | P1 | engine counters | block §6 | A-RULE-06 | todo |
@@ -100,7 +104,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | F-CON-03 | Per-surface toggles (Shorts, Reels, Stories, …) | P1 | settings | content §4 | A-CON-03 | todo |
 | F-CON-04 | Adult-domain filtering | P1 | DNS lists | content §5 | A-CON-04 | todo |
 | F-CON-05 | Block unsupported browsers (policy) | P2 | engine | content §6 | A-CON-05 | todo |
-| F-CON-06 | Keyword matching is case-insensitive | P0 | engine | content §3 | A-CON-06 | wip |
+| F-CON-06 | Keyword matching is case-insensitive | P0 | engine | content §3 | A-CON-06 | done |
 | F-CON-07 | Native mobile surfaces | — | not reproducible | content §7 | — | gap |
 | F-CON-08 | In-app browser webviews | — | not inspectable | content §7 | — | gap |
 
@@ -145,7 +149,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | F-PLAT-05 | GNOME Shell adapter | P2 | extension + policy file | arch §4 | A-PLAT-05 | wip |
 | F-PLAT-06 | KDE/KWin adapter | P2 | script + D-Bus | arch §4 | A-PLAT-06 | todo |
 | F-PLAT-07 | System-wide DNS filtering (optional helper) | P1 | polkit + resolver | arch §7 | A-PLAT-07 | decision |
-| F-PLAT-08 | Browser extension (URL + DOM signals) | P1 | WebExtension | content §2 | A-PLAT-08 | todo |
+| F-PLAT-08 | Browser extension (URL + DOM signals) | P1 | WebExtension + native host | content §2 | A-PLAT-08 | wip |
 | F-PLAT-09 | Idle/lock/suspend awareness | P0 | logind | arch §4 | A-PLAT-09 | wip |
 | F-PLAT-10 | Multi-monitor lock overlay | P0 | compositor adapter | arch §6 | A-PLAT-10 | wip |
 | F-PLAT-11 | Notifications and low-time alerts | P1 | D-Bus | arch §5 | A-PLAT-11 | todo |
@@ -203,6 +207,13 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | GNOME install flow | exercised with an isolated `XDG_DATA_HOME` and keyfile settings backend; copied the extension and enabled it without touching the host session |
 | GNOME extension load | pass in headless GNOME Shell 49: loads, reads policy, writes heartbeat, drops expired/removed policy |
 | GNOME overlay focus/visuals | **not measured** in headless Shell because it has no seat; requires a logged-in session |
+| Browser decision (`F-RULE-02`, `F-RULE-03`, `F-CON-06`) | `browser_decision_blocks_sites_and_keywords_with_daemon_reasons` in `crates/daemon/tests/protocol.rs` starts the real daemon over the socket, checks an exact and a suffix site hit, a case-folded keyword hit, an allowlisted host, an inactive profile, and that the reply carries the same `R-*` reason and end time as the app path; `keyword_blocks_case_insensitively` and `keyword_matching_folds_unicode_and_case` in `crates/core` cover NFKC full-width forms |
+| Browser policy feed (`F-PLAT-08`) | The same protocol suite checks that `browser_policy` lists active-profile site blocks, suffix flags, quick site blocks, allowlist hosts, and keywords, that a paused or inactive profile contributes nothing, and that it returns `limitations: ["site_limits", "surface_rules"]` instead of claiming coverage |
+| Browser extension units (`F-PLAT-08`) | `node --test integrations/browser-extension/tests/*.test.mjs` (10 tests) covers exact/suffix host matching, allow-vs-block priority, quick-block priority, redirect parameters, subframe blocking, and block-page wording; `python3 -m unittest discover -s integrations/browser-extension/tests` (11 tests) covers native-messaging framing, the command allowlist, malformed and oversized frames, socket-name parity with the UI client, and the installer under a temporary `HOME` |
+| Browser extension live (`F-PLAT-08`, `A-PLAT-08`) | **observed** on Chrome 157 with a throwaway profile under `/tmp/opencode`: the unpacked extension loaded, the Python native host connected, dynamic DNR rules were applied, `bad.example.com` redirected to `blocked.html?reason=R-SITE&target=example.com` with the daemon's wording, a local page containing `GaMe` got the closed-shadow keyword overlay with the address bar unchanged, and the block page's countdown and buttons worked |
+| Browser keyword timing (`F-RULE-03`) | **limited**: `declarativeNetRequest` has no keyword filter, so a keyword block is applied by the content script after commit and a frame can paint first. `A-RULE-03` asks for a block "before paint where observable"; that part is not met and is recorded in `docs/spec/implementation-notes.md` |
+| Firefox extension (`F-PLAT-08`) | **not measured**: `manifest.firefox.json` is manifest-reviewed only (classic scripts, fixed `stayproductive@local` ID, temporary add-on instructions); it has not been loaded in Firefox |
+| Browser privacy | URLs and titles are used for one `browser_decision` call and are not written by the extension, native host, or daemon; `storage.local` keeps counts, the last check time, and a degraded message. Site limits and surfaces are absent from the policy feed rather than approximated |
 
 Manual UI inspection is not a substitute for the acceptance suite. Rows that
 depend on the UI remain `wip` until their `A-UX-*` scenarios are automated.

@@ -752,6 +752,76 @@ fn launch_limit_blocks_from_the_persisted_launch_count() {
 }
 
 #[test]
+fn browser_decision_blocks_sites_and_keywords_with_daemon_reasons() {
+    let (dir, path) = temp_state();
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "sites": [{"pattern": "*.example.com", "action": "block"}],
+                "keywords": ["games"],
+                "allow_sites": ["good.example.com"]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    let blocked = service.ok(
+        "browser_decision",
+        json!({"url": "https://bad.example.com/play", "app": "firefox"}),
+    );
+    assert_eq!(blocked["blocked"], true, "{blocked}");
+    assert_eq!(blocked["reason"], "R-SITE");
+    assert_eq!(blocked["message"], "block.site");
+    assert_eq!(blocked["target"], "bad.example.com");
+
+    let bare = service.ok(
+        "browser_decision",
+        json!({"url": "https://example.com/", "app": "firefox"}),
+    );
+    assert_eq!(
+        bare["blocked"], false,
+        "a suffix rule excludes the bare domain: {bare}"
+    );
+
+    let allowed = service.ok(
+        "browser_decision",
+        json!({"url": "https://good.example.com/", "app": "firefox"}),
+    );
+    assert_eq!(allowed["blocked"], false, "the allowlist wins: {allowed}");
+    assert_eq!(allowed["reason"], "R-ALLOW");
+
+    let keyword = service.ok(
+        "browser_decision",
+        json!({"url": "https://elsewhere.test/?q=games", "app": "firefox"}),
+    );
+    assert_eq!(keyword["blocked"], true, "{keyword}");
+    assert_eq!(keyword["reason"], "R-KEYWORD");
+
+    let policy = service.ok("browser_policy", json!({}));
+    assert_eq!(policy["site_blocks"].as_array().unwrap().len(), 1);
+    assert_eq!(policy["site_blocks"][0]["host"], "example.com");
+    assert_eq!(policy["site_blocks"][0]["suffix"], true);
+    assert_eq!(policy["site_allows"][0]["host"], "good.example.com");
+    assert_eq!(policy["keywords"][0]["text"], "games");
+    assert_eq!(
+        policy["limitations"],
+        json!(["site_limits", "surface_rules"])
+    );
+    assert_eq!(policy["refresh_after_seconds"], 30);
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn usage_counters_survive_restart() {
     let (dir, path) = temp_state();
     let runtime = dir.join("stayproductive");

@@ -878,10 +878,15 @@ impl Daemon {
     fn handle(&mut self, command: &str, request: &Value) -> DResult<Value> {
         let now = Utc::now();
         let tracked = self.track_usage(now);
-        let command_dirty = !matches!(command, "snapshot" | "shutdown" | "export_data");
+        let command_dirty = !matches!(
+            command,
+            "snapshot" | "shutdown" | "export_data" | "browser_decision" | "browser_policy"
+        );
         let result =
             match command {
                 "snapshot" => Ok(self.snapshot()),
+                "browser_decision" => self.browser_decision(request, now),
+                "browser_policy" => Ok(self.browser_policy(now)),
                 "create_profile" => {
                     require_rule_edits_allowed(&self.state, now)?;
                     let spec: ProfileSpec = from_request(request, "profile")?;
@@ -1383,6 +1388,129 @@ impl Daemon {
             "pickups": self.state.usage.pickup_count(period),
             "launches": self.state.usage.launch_total(period),
             "apps": apps,
+        })
+    }
+
+    /// Answer one browser navigation without mutating state.
+    ///
+    /// The extension asks before it renders a page; the daemon is the single
+    /// decision point, so a site or keyword block has the same reason code and
+    /// end time as an app overlay (`A-PLAT-08`, `A-CON-06`). URLs are used for
+    /// this call only and are not stored.
+    fn browser_decision(&self, request: &Value, now: Timestamp) -> DResult<Value> {
+        let url = request
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "missing url".to_owned())?;
+        let app = match request.get("app").and_then(Value::as_str) {
+            Some(value) if !value.trim().is_empty() => {
+                AppKey::new(value).map_err(|error| error.to_string())?
+            }
+            _ => AppKey::new("browser").map_err(|error| error.to_string())?,
+        };
+        let title = request
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let event = Event::UrlChanged {
+            app,
+            url: url.to_owned(),
+            title,
+        };
+        let decision = decide(&self.state, &event, now);
+        Ok(json!({
+            "blocked": decision.is_block(),
+            "verdict": match decision.verdict {
+                stayproductive_core::Verdict::Allow => "allow",
+                stayproductive_core::Verdict::Block => "block",
+                stayproductive_core::Verdict::BlockUntil => "block_until",
+                stayproductive_core::Verdict::AllowWithNotice => "allow_notice",
+            },
+            "reason": decision.reason.as_str(),
+            "message": decision.message.as_str(),
+            "until": decision.until,
+            "target": decision.target.as_ref().map(Target::key),
+            "profile": decision.profile.map(|profile| profile.to_string()),
+            "now": now,
+        }))
+    }
+
+    /// The host and keyword rules the extension can apply before navigation.
+    ///
+    /// This is a best-effort acceleration layer: the extension still asks
+    /// `browser_decision` for the authoritative page. Only active, unpaused
+    /// profiles contribute, and quick blocks override them. Site limits and
+    /// surface rules are not represented yet, so the extension must not claim
+    /// coverage it does not have.
+    fn browser_policy(&self, now: Timestamp) -> Value {
+        let mut site_blocks: Vec<Value> = Vec::new();
+        let mut site_allows: Vec<Value> = Vec::new();
+        let mut keywords: Vec<Value> = Vec::new();
+        for profile in &self.state.profiles {
+            if !self.state.profile_is_active(profile, now) || profile.pause.is_paused(now) {
+                continue;
+            }
+            for rule in &profile.rules.sites {
+                if matches!(rule.action, SiteAction::Block | SiteAction::Adult) {
+                    site_blocks.push(json!({
+                        "host": rule.pattern.host().as_str(),
+                        "suffix": matches!(rule.pattern, HostPattern::Suffix(_)),
+                        "reason": match rule.action {
+                            SiteAction::Adult => "R-ADULT",
+                            _ => "R-SITE",
+                        },
+                    }));
+                }
+            }
+            for pattern in &profile.rules.allow_sites {
+                site_allows.push(json!({
+                    "host": pattern.host().as_str(),
+                    "suffix": matches!(pattern, HostPattern::Suffix(_)),
+                }));
+            }
+            for keyword in &profile.rules.keywords {
+                keywords.push(json!({
+                    "text": keyword.text.as_str(),
+                    "scope": match keyword.scope {
+                        stayproductive_core::KeywordScope::Url => "url",
+                        stayproductive_core::KeywordScope::Search => "search",
+                        stayproductive_core::KeywordScope::Both => "both",
+                    },
+                }));
+            }
+        }
+        for block in &self.state.quick_blocks {
+            if now < block.until
+                && let Target::Site(host) = &block.target
+            {
+                site_blocks.push(json!({
+                    "host": host.as_str(),
+                    "suffix": false,
+                    "reason": "R-QUICK",
+                    "until": block.until,
+                    "quick": true,
+                }));
+            }
+        }
+        for commitment in &self.state.commitments {
+            if commitment.is_enforcing(now) {
+                for pattern in &commitment.allow_sites {
+                    site_allows.push(json!({
+                        "host": pattern.host().as_str(),
+                        "suffix": matches!(pattern, HostPattern::Suffix(_)),
+                        "strict": true,
+                    }));
+                }
+            }
+        }
+        json!({
+            "generated_at": now,
+            "refresh_after_seconds": 30,
+            "site_blocks": site_blocks,
+            "site_allows": site_allows,
+            "keywords": keywords,
+            "limitations": ["site_limits", "surface_rules"],
         })
     }
 

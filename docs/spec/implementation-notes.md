@@ -507,6 +507,74 @@ browser extension. Launch limits are tracked from foreground entries; pickup
 limits have no unlock source. Usage limits and the Stats totals are recorded per
 application.
 
+### Browser extension (`F-PLAT-08`, `F-RULE-02`, `F-RULE-03`, `F-CON-06`)
+
+`integrations/browser-extension` is a Manifest V3 companion for Chrome/Chromium,
+Brave, Edge, and Firefox. It is not a second rule engine: the extension asks the
+Rust daemon, and the daemon's answer is final. Two daemon commands serve it and
+both are pure reads (`browser_decision`, `browser_policy`), so neither writes a
+state file or counts as a rule edit under strict mode.
+
+**Layers.** `browser_policy` returns active-profile host blocks (with a
+`suffix` flag), quick site blocks, allowlist hosts, and keyword rules, plus
+`limitations: ["site_limits", "surface_rules"]`. `background.js` turns the host
+entries into dynamic `declarativeNetRequest` rules: allow rules at priority 20,
+block rules at 50, quick blocks at 90, main-frame blocks redirect to
+`blocked.html?reason=…&target=…`, and subframe blocks are dropped without a page.
+Rules refresh on install/startup, once a minute by alarm, and opportunistically
+at most every 30 s after a navigation. If the daemon is unreachable the last
+rules stay applied and the toolbar badge shows `!` — dropping them would weaken
+an active block, so the failure is visible instead.
+
+`content.js` sends every committed navigation and same-document URL change to
+`browser_decision` and, on a block, mounts an overlay with the daemon's reason,
+target, and end time in a **closed** shadow root. It never rewrites or replaces
+the address bar, so the user can see which site was blocked. The overlay has a
+Back button and a countdown; `lib/blockpage.js` is shared with the redirect page
+so both use the same wording.
+
+**Native host.** `native/stayproductive_native.py` speaks the browser's
+native-messaging framing: a 32-bit native-endian length followed by UTF-8 JSON.
+It accepts only `browser_policy` and `browser_decision`, forwards a fixed set of
+arguments to the existing Unix socket, and returns a JSON reply. It cannot read
+files, spawn processes, or open network connections for the extension. Frames
+over 1 MiB, malformed JSON, unknown commands, and non-object arguments end the
+port. It selects the same socket name as the UI client (`$XDG_RUNTIME_DIR` or
+`/tmp` fallback), and never writes URLs to disk. `install.py` writes the host
+manifest and the browser's `NativeMessagingHosts` entry per user (no root); for
+Chrome it requires the exact unpacked-extension ID in `allowed_origins`. Moving
+the repository changes an unpacked Chrome ID, so the installer must be rerun.
+
+**The keyword timing conflict (`A-RULE-03`).** `A-RULE-03` asks for a keyword
+block "before paint where observable". `declarativeNetRequest` matches URL
+patterns, not arbitrary substrings, and has no keyword filter, so a keyword can
+only be detected after the navigation commits. The content script replaces the
+page immediately, but a frame may paint first. This is a platform limitation,
+not an unfinished handler: the extension does not claim pre-paint keyword
+coverage, and the matrix records the scenario as partially met. Host rules do
+block before the request through DNR, which is the stronger guarantee available.
+
+**Privacy and limits.** URLs and titles exist only for the duration of one
+`browser_decision` call; the extension, host, and daemon do not persist them for
+that command. `storage.local` holds counts, the last check time, and a degraded
+message. Incognito windows are covered only if the user grants access. Site
+time limits and in-page surfaces (Shorts/Reels/Stories, adult filtering) are not
+implemented and are reported as limitations by `browser_policy`; the extension
+does not approximate them. A user who disables the extension, edits its files,
+or uses a browser without it is not blocked. Strict-mode tamper resistance stays
+with the daemon's commitments, as `docs/legal/clean-room.md` and the threat model
+require.
+
+**Evidence.** Node tests cover host matching, priorities, redirect parameters,
+subframe blocking, and block-page text. Python tests cover framing, the command
+allowlist, malformed/oversized frames, socket parity, and the installer in a
+temporary `HOME`. The daemon protocol suite covers `browser_decision` and
+`browser_policy` against the real binary. A live Chrome 157 run under a
+throwaway `/tmp/opencode` profile loaded the unpacked extension, connected the
+native host, applied dynamic rules, redirected `bad.example.com` with
+`reason=R-SITE`, and overlaid a keyword page without changing its URL. Firefox
+is manifest-reviewed only; it has not been loaded.
+
 ### GTK frontend
 
 `crates/ui` is GTK 4 + libadwaita through PyGObject. It contains no blocking
@@ -655,9 +723,11 @@ launches are counted, but the extension does not yet report background
 launches, only foreground entries; pickup limits likewise need the
 logind/tracker adapter. Application daily and hourly limits are now enforced
 end-to-end through the GNOME extension or the X11 adapter observer. The UI
-labels the rest as configuration rather than claiming they are enforced. The
-browser extension, other compositors, and launch/pickup tracking remain the
-largest missing pieces.
+labels the rest as configuration rather than claiming they are enforced. Site
+time limits need a per-site interval tracker, in-page surfaces need a content
+layer, and other compositors plus launch/pickup tracking remain the largest
+missing pieces; the browser extension covers host rules and keyword replacement
+only.
 
 ## Not implemented yet
 
@@ -667,7 +737,7 @@ largest missing pieces.
 - **`A-PROF-04` templates** — the UI ships three ordinary starter profiles, but
   the reference template set and acceptance scenario are not yet specified.
   TODO(spec).
-- **Site time limits** — the extension must first record per-site intervals;
+- **Site time limits** — the extension does not record per-site intervals yet;
   `SiteAction::Limit` is stored and explained but inert rather than guessed at.
   TODO(spec).
 - **Content surfaces** (`A-CON-01`…`A-CON-05`) — the engine has no surface rule
@@ -677,9 +747,10 @@ largest missing pieces.
   `state.json` checksum snapshot is not written. The ledger itself is queryable
   in `usage_events`, `usage_launches`, `usage_pickups`, and `usage_blocks`.
 - **Desktop enforcement beyond X11 and GNOME** — the supervised X11 adapter and
-  the GNOME extension cover application windows only; sway/i3, Hyprland, KWin,
-  website, keyword, and site-limit enforcement still need adapters. The UI
-  labels the adapter and its scope.
+  the GNOME extension cover application windows only; sway/i3, Hyprland, and KWin
+  still need adapters. The browser extension covers host blocks and post-commit
+  keyword replacement in Chrome/Chromium and Firefox, not site time limits or
+  in-page surfaces. The UI labels the adapter and its scope.
 - **D-Bus name and tray/CLI** — the boundary is newline JSON over a Unix socket;
   systemd can own the daemon, but there is no `org.stayproductive.Daemon1` name,
   tray, or CLI yet.
@@ -705,6 +776,8 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 gjs -m integrations/gnome/tests/matching.test.js
+node --test integrations/browser-extension/tests/*.test.mjs
+python3 -m unittest discover -s integrations/browser-extension/tests -v
 PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests
 gnome-extensions pack integrations/gnome/stayproductive@hassanraza.ai --out-dir /tmp
 cargo build --release -p stayproductive-daemon
