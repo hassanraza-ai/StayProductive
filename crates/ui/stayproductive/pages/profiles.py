@@ -282,6 +282,15 @@ class ProfilesPage:
             card.append(chips)
         else:
             card.append(w.label("No rules yet. Edit this profile to add some.", "muted small"))
+        intention = profile.get("intention")
+        if isinstance(intention, dict) and intention.get("cue") and intention.get("response"):
+            plan = w.label(
+                f"When {intention['cue']}, {intention['response']}.",
+                "muted small",
+            )
+            plan.set_wrap(True)
+            plan.set_margin_top(4)
+            card.append(plan)
         return card
 
     def _use_template(self, spec: dict) -> None:
