@@ -153,6 +153,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | F-PLAT-09 | Idle/lock/suspend awareness | P0 | logind | arch §4 | A-PLAT-09 | wip |
 | F-PLAT-10 | Multi-monitor lock overlay | P0 | compositor adapter | arch §6 | A-PLAT-10 | wip |
 | F-PLAT-11 | Notifications and low-time alerts | P1 | D-Bus | arch §5 | A-PLAT-11 | todo |
+| F-PLAT-12 | Distribution packages (deb, rpm, Arch, Flatpak) | P1 | dpkg-deb, rpmbuild, makepkg, flatpak-builder | arch §6 | packaging tests | wip |
 
 ## 9. Data and lifecycle
 
@@ -214,6 +215,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | Browser keyword timing (`F-RULE-03`) | **limited**: `declarativeNetRequest` has no keyword filter, so a keyword block is applied by the content script after commit and a frame can paint first. `A-RULE-03` asks for a block "before paint where observable"; that part is not met and is recorded in `docs/spec/implementation-notes.md` |
 | Firefox extension (`F-PLAT-08`) | **not measured**: `manifest.firefox.json` is manifest-reviewed only (classic scripts, fixed `stayproductive@local` ID, temporary add-on instructions); it has not been loaded in Firefox |
 | Browser privacy | URLs and titles are used for one `browser_decision` call and are not written by the extension, native host, or daemon; `storage.local` keeps counts, the last check time, and a degraded message. Site limits and surfaces are absent from the policy feed rather than approximated |
+| Packaging (`F-PLAT-12`) | `packaging/tests/test_packaging.py` checks the desktop entry, AppStream ID/launchable/version/date, self-contained SVG, unit quoting, launcher substitution, version agreement across Cargo/RPM/Arch, and the Flatpak manifest's runtime and narrow filesystem access; it also runs `make install` into a temporary `DESTDIR` and asserts every installed path, the substituted launcher, the unit `ExecStart`, and the absence of `__pycache__`. `desktop-file-validate` and `appstreamcli validate --no-net` pass; `dpkg-deb` built `stayproductive_0.1.0_amd64.deb` (1.8 MB, 6.5 MB installed) and its control/file list were inspected. RPM, Arch, and Flatpak builds are **not measured** because those toolchains are absent |
 
 Manual UI inspection is not a substitute for the acceptance suite. Rows that
 depend on the UI remain `wip` until their `A-UX-*` scenarios are automated.

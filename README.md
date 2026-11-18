@@ -25,6 +25,7 @@ resources, or assets from the reference app are included or licensed.
 | Desktop UI | **implemented** — dashboard, profiles and editor, schedules, strict session, stats, settings |
 | Desktop enforcement | **implemented for GNOME and X11 app windows** — opt-in Shell extension and a supervised X11 adapter covering app blocks, quick blocks, and daily/hourly app usage limits |
 | Browser enforcement | **implemented for host rules and keyword replacement** — Manifest V3 extension plus a per-user native host; Chrome/Chromium live-tested, Firefox manifest-reviewed; site limits and in-page surfaces remain |
+| Distribution | **Debian package built and validated**; RPM spec, Arch `PKGBUILD`, and a Flatpak manifest are present but have not been built here |
 | Runtime parity verification | impossible against the reference without a device; parity is defined by the acceptance suite |
 
 The current build is useful as a real, persistent focus planner: profiles,
@@ -94,6 +95,11 @@ dashboard and Settings page report the adapter state rather than pretending.
   proxy with a fixed command allowlist and a 1 MiB frame limit, installed per
   user without root. Site limits and in-page surfaces are reported as
   limitations, not approximated.
+- Distribution packaging: a `make install` layout under `/usr` with launchers,
+  desktop entry, AppStream metadata, scalable icon, and a disabled-by-default
+  systemd user unit; a Debian builder that assembles and validates a `.deb`;
+  RPM and Arch specs; and a Flatpak manifest. The Debian package is built and
+  inspected here; the other formats are unbuilt specs, stated as such.
 - The dashboard only says enforcement is active when the extension heartbeat is
   fresh and reports a loaded policy; otherwise it explains what is missing.
 - A five-step first-run wizard: purpose, a goal (Social, Work, Study, Sleep,
@@ -169,6 +175,29 @@ marker. Re-running never resets profiles or commitments.
 On distributions where the Python GTK bindings are packaged separately, install
 `python3-gi`, `gir1.2-gtk-4.0`, and `gir1.2-adw-1` first. The app deliberately
 does not use `pip` for PyGObject.
+
+### Install from a package
+
+The repository builds a Debian package without root:
+
+```sh
+packaging/deb/build.sh
+sudo apt install ./packaging/out/stayproductive_*_*.deb
+```
+
+The same tree can be staged manually with
+`sudo make -C packaging install PREFIX=/usr`. Installed files go to `/usr/bin`,
+`/usr/lib/stayproductive`, `/usr/share/applications`, `/usr/share/metainfo`,
+`/usr/share/stayproductive` (GNOME and browser companions), and a
+`stayproductive.service` user unit that stays **disabled** until you enable it.
+`make -C packaging uninstall` removes the files and leaves profiles, history,
+and commitments alone.
+
+RPM, Arch, and Flatpak files are included in `packaging/`; only the Debian
+package was built and inspected on this machine, so the others are documented
+specifications rather than tested artifacts. The Flatpak build additionally
+cannot run the browser native host or install the GNOME extension from inside
+the sandbox. See [`packaging/README.md`](packaging/README.md).
 
 ### Enable desktop blocking on GNOME
 
@@ -286,6 +315,7 @@ The GNOME matching helpers and browser extension have compositor-free tests:
 gjs -m integrations/gnome/tests/matching.test.js
 node --test integrations/browser-extension/tests/*.test.mjs
 python3 -m unittest discover -s integrations/browser-extension/tests -v
+python3 -m unittest discover -s packaging/tests -v
 PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests
 ```
 

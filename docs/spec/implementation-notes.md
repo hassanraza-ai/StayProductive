@@ -714,6 +714,36 @@ over the Unix socket. It covers locked profile mutations, rejected pause, refuse
 early finish, restart persistence, the private state-file mode, socket privacy
 and single-instance behaviour, and a policy refreshed with no client.
 
+### Packaging and install layout (`F-PLAT-12`)
+
+`packaging/` installs a relocatable tree with `make install DESTDIR=… PREFIX=…`.
+The installed launchers bake in `$(PREFIX)/lib/stayproductive`; the daemon and
+the X11 adapter are found through `PATH`, exactly as in the source checkout.
+The systemd user unit is installed but never enabled by the package: autostart
+remains the explicit Settings action, which rewrites the same unit with the
+resolved binary path. The app also ships the GNOME extension under
+`/usr/share/stayproductive/gnome-extension` and the WebExtension plus native
+host under `/usr/share/stayproductive/browser-extension`, so a packaged install
+does not need the repository checkout.
+
+`packaging/deb/build.sh` assembles a staging tree and calls `dpkg-deb`; the
+result declares Python 3.10+, PyGObject, GTK 4, libadwaita, and systemd, and
+recommends (does not require) GNOME Shell. The RPM spec and Arch `PKGBUILD`
+invoke the same `make install`, so their file lists cannot drift from the deb.
+The Flatpak manifest targets `org.gnome.Platform//49` with the Rust SDK
+extension and narrow finish arguments; it is a documented starting point, not a
+tested artifact. A Flatpak cannot hand a native-messaging host to a browser
+outside its sandbox and cannot install the host GNOME extension itself, so the
+deb/rpm/Arch builds remain the full-coverage installs.
+
+Known limits: only the Debian package was built on this machine; RPM, Arch, and
+Flatpak need `rpmbuild`, `makepkg`, and `flatpak-builder`, which are absent.
+The package does not run `update-desktop-database`, `gtk-update-icon-cache`, or
+`systemctl --user daemon-reload` from a maintainer script, because those act on
+the system and a per-user service rather than package contents; desktop
+environments regenerate their caches on the next login. Package removal leaves
+`state.db`, exports, and browser host files alone.
+
 ### What is still inert
 
 The engine stores and explains site daily limits, but does not yet decrement
@@ -778,6 +808,8 @@ cargo test
 gjs -m integrations/gnome/tests/matching.test.js
 node --test integrations/browser-extension/tests/*.test.mjs
 python3 -m unittest discover -s integrations/browser-extension/tests -v
+python3 -m unittest discover -s packaging/tests -v
+make -C packaging check
 PYTHONPATH=crates/ui python3 -m unittest discover -s crates/ui/tests
 gnome-extensions pack integrations/gnome/stayproductive@hassanraza.ai --out-dir /tmp
 cargo build --release -p stayproductive-daemon

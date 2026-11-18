@@ -1,0 +1,7 @@
+#!/bin/sh
+# Installed X11 enforcement adapter launcher.
+set -eu
+
+PYTHONPATH="@LIBDIR@${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+exec python3 -m stayproductive.x11_adapter "$@"

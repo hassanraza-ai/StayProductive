@@ -1,0 +1,28 @@
+# Maintainer: StayProductive contributors <maintainers@stayproductive.invalid>
+pkgname=stayproductive
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Local-first focus sessions and distraction blocking"
+arch=('x86_64' 'aarch64')
+url="https://github.com/hassanraza-ai/StayProductive"
+license=('Apache-2.0')
+depends=('python' 'python-gobject' 'gtk4' 'libadwaita' 'systemd')
+makedepends=('rust' 'cargo' 'desktop-file-utils')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/StayProductive-$pkgver"
+  cargo build --release --locked -p stayproductive-daemon
+}
+
+check() {
+  cd "$srcdir/StayProductive-$pkgver"
+  desktop-file-validate packaging/desktop/io.github.stayproductive.StayProductive.desktop
+}
+
+package() {
+  cd "$srcdir/StayProductive-$pkgver"
+  make -C packaging install DESTDIR="$pkgdir" PREFIX=/usr
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
