@@ -188,6 +188,19 @@ class EngineSocketTest(unittest.TestCase):
         self.assertIs(self.daemon.requests[3]["confirm"], True)
         self.assertEqual(self.daemon.requests[4]["path"], "/tmp/backup.zip")
 
+    def test_browser_calls_carry_the_page_and_no_storage_intent(self) -> None:
+        engine = self.engine()
+        engine.browser_policy()
+        engine.browser_decision("https://bad.example.com/GAME", title="Games")
+
+        commands = [request["cmd"] for request in self.daemon.requests]
+        self.assertEqual(commands, ["browser_policy", "browser_decision"])
+        decision = self.daemon.requests[1]
+        self.assertEqual(decision["url"], "https://bad.example.com/GAME")
+        self.assertEqual(decision["title"], "Games")
+        self.assertEqual(decision["app"], "browser")
+        self.assertNotIn("store", decision)
+
 
 if __name__ == "__main__":
     unittest.main()

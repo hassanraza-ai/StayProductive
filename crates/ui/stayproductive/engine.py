@@ -310,6 +310,24 @@ class Engine:
 
         return self.request("import_data", path=path)
 
+    def browser_policy(self) -> dict[str, Any]:
+        """Host and keyword rules the browser extension can apply up front."""
+
+        return self.request("browser_policy")
+
+    def browser_decision(
+        self, url: str, *, title: str | None = None, app: str = "browser"
+    ) -> dict[str, Any]:
+        """Ask the daemon whether this navigation is blocked.
+
+        The URL is used for this decision only; the daemon does not store it.
+        """
+
+        payload: dict[str, Any] = {"url": url, "app": app}
+        if title:
+            payload["title"] = title
+        return self.request("browser_decision", **payload)
+
     # --------------------------------------------------------------- lifecycle
     def shutdown_service(self) -> None:
         """Ask the daemon to stop. Only used for explicit service handover."""
