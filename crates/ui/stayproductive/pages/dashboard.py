@@ -49,6 +49,10 @@ class DashboardPage:
         self.hero.append(self.hero_title)
         self.hero_subtitle = w.label("", "muted")
         self.hero.append(self.hero_subtitle)
+        self.intention_label = w.label("", "muted")
+        self.intention_label.set_wrap(True)
+        self.intention_label.set_visible(False)
+        self.hero.append(self.intention_label)
 
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         actions.set_margin_top(4)
@@ -317,6 +321,15 @@ class DashboardPage:
             self.commit_metric[0].set_label("None")
             self.commit_metric[1].set_label("No strict session")
 
+        intention = active[0].get("intention") if active else None
+        if isinstance(intention, dict) and intention.get("cue") and intention.get("response"):
+            self.intention_label.set_label(
+                f"When {intention['cue']}, {intention['response']}."
+            )
+            self.intention_label.set_visible(True)
+        else:
+            self.intention_label.set_visible(False)
+
         today_stats = (snapshot.get("stats") or {}).get("today") or {}
         self.today_time.set_label(duration_text(today_stats.get("seconds", 0)))
         blocks = int(today_stats.get("blocks", 0) or 0)
@@ -327,7 +340,11 @@ class DashboardPage:
         ranking = today_stats.get("apps") or []
         if not ranking:
             self.today_top.append(
-                w.label("No tracked screen time yet today.", "muted small")
+                w.label(
+                    "No tracked time yet today. Time shows up after an adapter "
+                    "reports an app you added to a profile.",
+                    "muted small",
+                )
             )
         for entry in ranking[:3]:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)

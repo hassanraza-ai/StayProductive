@@ -2036,6 +2036,54 @@ fn an_unlock_records_one_pickup_and_a_reached_limit_blocks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn an_if_then_plan_is_stored_with_the_profile_and_a_half_plan_is_refused() {
+    let (dir, path) = temp_state();
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "intention": {
+                    "cue": "I open a chat app during work hours",
+                    "response": "I leave it until the profile window ends"
+                }
+            }
+        }),
+    );
+    let plan = &created["profiles"][0]["intention"];
+    assert_eq!(plan["cue"], "I open a chat app during work hours");
+    assert_eq!(plan["response"], "I leave it until the profile window ends");
+    let profile_id = created["profiles"][0]["id"].as_str().unwrap().to_owned();
+    let kept = service.ok(
+        "update_profile",
+        json!({
+            "profile_id": profile_id,
+            "profile": {"name": "Focus", "activation": "manual"}
+        }),
+    );
+    assert_eq!(
+        kept["profiles"][0]["intention"]["cue"],
+        "I open a chat app during work hours"
+    );
+    let refused = service.request(
+        "update_profile",
+        json!({
+            "profile_id": profile_id,
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "intention": {"cue": "I open a chat app", "response": ""}
+            }
+        }),
+    );
+    assert_eq!(refused["ok"], false, "{refused}");
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn write_lock_heartbeat(heartbeat: &Path, locked: bool, suspended: bool) {
     let body = json!({
         "adapter": "gnome-extension",

@@ -41,6 +41,9 @@ surfaces, DNS filtering, and non-X11/GNOME compositors are still missing. The
 GNOME extension does not yet report screen lock, so pickups are counted from
 the X11 adapter (and from any heartbeat that includes `locked`). The
 dashboard and Settings page report the adapter state rather than pretending.
+The design note in [`docs/design/evidence-based-focus.md`](docs/design/evidence-based-focus.md)
+records the research behind if-then plans, progress records, pauses, and
+breaks, and the claims the interface does not make.
 
 ### Implemented today
 
@@ -118,6 +121,8 @@ dashboard and Settings page report the adapter state rather than pretending.
   inspected here; the other formats are unbuilt specs, stated as such.
 - The dashboard only says enforcement is active when the extension heartbeat is
   fresh and reports a loaded policy; otherwise it explains what is missing.
+- An optional if-then plan on a profile ("when this happens, I will…"),
+  shown again on the dashboard. It is a reminder, not an enforced rule.
 - A five-step first-run wizard: purpose, a goal (Social, Work, Study, Sleep,
   Custom), an honest capability list, one editable starter profile, and a done
   screen. It appears only on a clean state, creates exactly one profile, and can

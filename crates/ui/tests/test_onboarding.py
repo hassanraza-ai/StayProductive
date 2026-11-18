@@ -193,6 +193,23 @@ class StarterProfileCreatorTest(unittest.TestCase):
             self.assertEqual(len(engine.created), 1)
             self.assertTrue(onboarding_complete(snapshot))
 
+    def test_starter_profile_keeps_an_if_then_plan_only_when_both_sides_are_set(self) -> None:
+        goal = GOAL_BY_KEY["custom"]
+        blank = starter_profile(goal, [], selected_apps=[], name="Focus", cue="  ", response="")
+        self.assertNotIn("intention", blank)
+        planned = starter_profile(
+            goal,
+            [],
+            selected_apps=[],
+            name="Focus",
+            cue=" a chat app opens ",
+            response=" I leave it ",
+        )
+        self.assertEqual(
+            planned["intention"],
+            {"cue": "a chat app opens", "response": "I leave it"},
+        )
+
     def test_a_ux_01_a_failed_creation_can_be_retried(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             snapshot = {"state_path": str(Path(temp) / "state.json")}

@@ -37,9 +37,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use stayproductive_core::{
     Activation, AppKey, AppRule, ClockSettings, Commitment, CommitmentKind, CountLimit, DateRange,
-    DayPattern, DeactivationMethod, Event, HostPattern, HourlyPattern, Keyword, LimitPeriod,
-    PauseReason, Profile, ProfileId, ReasonCode, Restriction, RuleSet, Schedule, SiteAction, State,
-    Store, Target, Timestamp, UsageLedger, Window, day_period, decide, month_period, week_period,
+    DayPattern, DeactivationMethod, Event, HostPattern, HourlyPattern, ImplementationIntention,
+    Keyword, LimitPeriod, PauseReason, Profile, ProfileId, ReasonCode, Restriction, RuleSet,
+    Schedule, SiteAction, State, Store, Target, Timestamp, UsageLedger, Window, day_period, decide,
+    month_period, week_period,
 };
 
 mod export;
@@ -1889,6 +1890,16 @@ struct ProfileSpec {
     allow_sites: Vec<String>,
     #[serde(default)]
     pickup_limit: Option<PickupSpec>,
+    #[serde(default)]
+    intention: Option<IntentionSpec>,
+}
+
+#[derive(Deserialize)]
+struct IntentionSpec {
+    #[serde(default)]
+    cue: String,
+    #[serde(default)]
+    response: String,
 }
 
 fn default_true() -> bool {
@@ -1970,6 +1981,9 @@ fn apply_profile_spec(profile: &mut Profile, spec: &ProfileSpec, now: Timestamp)
     profile.strict_eligible = spec.strict_eligible;
     profile.schedule = spec.schedule.as_ref().map(schedule_from_spec).transpose()?;
     profile.rules = rules_from_spec(spec)?;
+    if let Some(intention) = &spec.intention {
+        profile.intention = intention_from_spec(intention)?;
+    }
     profile.updated_at = now;
     profile.validate().map_err(|e| e.to_string())
 }
@@ -2040,6 +2054,17 @@ fn rules_from_spec(spec: &ProfileSpec) -> DResult<RuleSet> {
         );
     }
     Ok(rules)
+}
+
+fn intention_from_spec(spec: &IntentionSpec) -> DResult<Option<ImplementationIntention>> {
+    let cue = spec.cue.trim();
+    let response = spec.response.trim();
+    if cue.is_empty() && response.is_empty() {
+        return Ok(None);
+    }
+    ImplementationIntention::new(cue, response)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 fn schedule_from_spec(spec: &ScheduleSpec) -> DResult<Schedule> {
@@ -2170,6 +2195,10 @@ fn profile_view(state: &State, profile: &Profile, now: Timestamp) -> Value {
         "pickup_limit": profile.rules.pickup_limit.map(|limit| json!({
             "count": limit.count,
             "per": match limit.per { LimitPeriod::Daily => "daily", LimitPeriod::Hourly => "hourly" },
+        })),
+        "intention": profile.intention.as_ref().map(|plan| json!({
+            "cue": plan.cue,
+            "response": plan.response,
         })),
         "active": state.profile_is_active(profile, now),
         "ends_at": state.profile_end(profile, now),

@@ -1,4 +1,4 @@
-"""Stats: local screen time, top distractions, and block history."""
+"""Stats: local screen time, where time went, and block history."""
 
 from __future__ import annotations
 
@@ -67,9 +67,11 @@ class StatsPage:
         self.root.append(metrics)
 
         top = w.Card(spacing=12)
-        top.append(w.label("Top distractions", "card-title"))
+        top.append(w.label("Where time went", "card-title"))
         self.range_note = w.label(
-            "Apps with rules, ranked by foreground time in the selected range.",
+            "Apps you chose to track, ranked by foreground time. The comparison "
+            "is with the previous period of the same length. This is a record, "
+            "not a grade.",
             "muted",
         )
         top.append(self.range_note)
@@ -173,15 +175,19 @@ class StatsPage:
 
         label = next(label for key, label in RANGES if key == self.range_key)
         self.range_note.set_label(
-            f"Apps with rules, ranked by foreground time {'today' if self.range_key == 'today' else f'this {label.lower()}'}. "
-            "Trend compares the same length of time before it."
+            f"Apps you chose to track, ranked by foreground time "
+            f"{'today' if self.range_key == 'today' else f'this {label.lower()}'}. "
+            "The comparison is with the previous period of the same length."
         )
 
         w.clear(self.ranking_list)
         ranking = stats.get("apps") or []
         if not ranking:
             self.ranking_list.append(
-                w.label("No tracked screen time in this range.", "muted small")
+                w.label(
+                    "No tracked time in this range. Only apps on a profile are counted.",
+                    "muted small",
+                )
             )
         for entry in ranking[:8]:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
