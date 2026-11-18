@@ -289,8 +289,20 @@ class Engine:
     def deactivate_profile(self) -> dict[str, Any]:
         return self.request("deactivate_profile")
 
-    def pause_profile(self, profile_id: str, minutes: int) -> dict[str, Any]:
-        return self.request("pause_profile", profile_id=profile_id, minutes=minutes)
+    def duplicate_profile(self, profile_id: str, name: str) -> dict[str, Any]:
+        return self.request("duplicate_profile", profile_id=profile_id, name=name)
+
+    def pause_profile(
+        self,
+        profile_id: str,
+        minutes: int,
+        *,
+        until_end_of_day: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"profile_id": profile_id, "minutes": minutes}
+        if until_end_of_day:
+            payload["until_end_of_day"] = True
+        return self.request("pause_profile", **payload)
 
     def resume_profile(self, profile_id: str) -> dict[str, Any]:
         return self.request("resume_profile", profile_id=profile_id)

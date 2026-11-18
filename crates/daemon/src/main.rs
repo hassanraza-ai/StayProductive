@@ -29,6 +29,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod clock;
+
 use chrono::{NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 use serde::Deserialize;
@@ -57,6 +59,14 @@ struct Daemon {
     /// Whether the first policy of this run has been written. Blocks that are
     /// already active at startup were recorded before and are not duplicated.
     policy_seeded: bool,
+    /// Previous wall and monotonic samples, for clock-jump detection.
+    last_wall: Option<Timestamp>,
+    last_mono: Option<Instant>,
+    /// Last lock and suspend bits from a fresh observer. `None` means this
+    /// process has not seen a heartbeat yet, so the first sample is not an
+    /// unlock.
+    session_locked: Option<bool>,
+    session_suspended: Option<bool>,
 }
 
 fn require_rule_edits_allowed(state: &State, now: Timestamp) -> DResult<()> {
@@ -667,6 +677,11 @@ struct Heartbeat {
     fresh: bool,
     /// The block overlay is showing; no usage accrues behind it.
     blocked: bool,
+    /// The session is locked. Missing from older heartbeats, which means
+    /// unlocked so a writer that does not know about lock cannot invent one.
+    locked: bool,
+    /// The session is suspending. Not a pickup.
+    suspended: bool,
     /// Normalized app ids of the focused window, empty when nothing is
     /// attributable.
     focus: Vec<AppKey>,
@@ -697,6 +712,14 @@ fn read_heartbeat(file: &str, adapter: &str, now: Timestamp) -> Option<Heartbeat
         Some(value) => value.as_i64().is_some_and(|value| value != 0),
         None => false,
     };
+    let locked = value
+        .get("locked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let suspended = value
+        .get("suspended")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let focus = value
         .get("focus")
         .and_then(Value::as_array)
@@ -714,6 +737,8 @@ fn read_heartbeat(file: &str, adapter: &str, now: Timestamp) -> Option<Heartbeat
     Some(Heartbeat {
         fresh,
         blocked,
+        locked,
+        suspended,
         focus,
         focus_since,
     })
@@ -840,7 +865,62 @@ impl Daemon {
             shutdown: false,
             policy_apps: BTreeSet::new(),
             policy_seeded: false,
+            last_wall: None,
+            last_mono: None,
+            session_locked: None,
+            session_suspended: None,
         }
+    }
+
+    /// Compare this wall sample with the monotonic clock and close an open
+    /// interval when the wall clock stepped (`A-DATA-02`).
+    fn note_clock(&mut self, now: Timestamp) {
+        let mono = Instant::now();
+        if let (Some(previous_wall), Some(previous_mono)) = (self.last_wall, self.last_mono)
+            && let Some((old, new)) = clock::clock_discontinuity(
+                previous_wall,
+                previous_mono,
+                now,
+                mono,
+                Duration::from_secs(2),
+            )
+        {
+            self.state.handle_clock_jump(old, new);
+        }
+        self.last_wall = Some(now);
+        self.last_mono = Some(mono);
+    }
+
+    /// Record one pickup on the falling edge of a fresh lock bit.
+    ///
+    /// A missing heartbeat leaves the previous bit alone, so a dropped file
+    /// cannot look like an unlock. Suspend closes the interval and is not a
+    /// pickup (`A-LIM-04`, `A-STA-05`).
+    fn note_session(&mut self, heartbeat: &Option<Heartbeat>, now: Timestamp) {
+        let Some(heartbeat) = heartbeat else {
+            return;
+        };
+        if !heartbeat.fresh {
+            return;
+        }
+        if heartbeat.suspended {
+            if self.session_suspended != Some(true) {
+                self.state.observe(&Event::SessionSuspended, now);
+            }
+        } else if self.session_suspended == Some(true) {
+            self.state.observe(&Event::Resumed, now);
+        }
+        self.session_suspended = Some(heartbeat.suspended);
+        match (self.session_locked, heartbeat.locked) {
+            (Some(true), false) => {
+                self.state.observe(&Event::ScreenUnlocked, now);
+            }
+            (_, true) if self.session_locked != Some(true) => {
+                self.state.observe(&Event::ScreenLocked, now);
+            }
+            _ => {}
+        }
+        self.session_locked = Some(heartbeat.locked);
     }
 
     fn greeting(&self) -> String {
@@ -904,6 +984,7 @@ impl Daemon {
             }
         }
         let now = Utc::now();
+        self.note_clock(now);
         let tracked = self.track_usage(now);
         let command_dirty = !matches!(
             command,
@@ -950,6 +1031,23 @@ impl Daemon {
                     self.state.remove_profile(id).map_err(|e| e.to_string())?;
                     Ok(self.snapshot())
                 }
+                "duplicate_profile" => {
+                    require_rule_edits_allowed(&self.state, now)?;
+                    let id = parse_ulid(request, "profile_id")?;
+                    let name = request
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_owned();
+                    if name.is_empty() {
+                        return Err("profile name is required".into());
+                    }
+                    self.state
+                        .duplicate_profile(id, name, now)
+                        .map_err(|e| e.to_string())?;
+                    Ok(self.snapshot())
+                }
                 "activate_profile" => {
                     require_rule_edits_allowed(&self.state, now)?;
                     let id = parse_ulid(request, "profile_id")?;
@@ -972,8 +1070,12 @@ impl Daemon {
                 }
                 "pause_profile" => {
                     let id = parse_ulid(request, "profile_id")?;
+                    let until_end_of_day =
+                        request.get("until_end_of_day").and_then(Value::as_bool) == Some(true);
                     let minutes = request.get("minutes").and_then(Value::as_u64).unwrap_or(0);
-                    let until = if minutes == 0 {
+                    let until = if until_end_of_day {
+                        Some(day_period(now, &self.state.settings).end)
+                    } else if minutes == 0 {
                         None
                     } else {
                         Some(now + chrono::TimeDelta::minutes(minutes as i64))
@@ -1223,6 +1325,7 @@ impl Daemon {
     /// policy, and persist when either changed. This is what keeps tracking and
     /// schedule starts working while the GTK window is closed.
     fn pulse(&mut self, now: Timestamp) -> DResult<()> {
+        self.note_clock(now);
         let tracked = self.track_usage(now);
         let recorded = self.refresh_policy(now);
         if tracked || recorded {
@@ -1239,8 +1342,15 @@ impl Daemon {
     /// ledger changed, so the caller knows to persist.
     fn track_usage(&mut self, now: Timestamp) -> bool {
         let heartbeat = observer_heartbeat(now);
+        self.note_session(&heartbeat, now);
         let focus = match &heartbeat {
-            Some(hb) if hb.fresh && !hb.blocked && !hb.focus.is_empty() => {
+            Some(hb)
+                if hb.fresh
+                    && !hb.blocked
+                    && !hb.locked
+                    && !hb.suspended
+                    && !hb.focus.is_empty() =>
+            {
                 // Attribution must use the profile's own app key, or the
                 // engine's usage queries would look at a different app.
                 self.resolve_focus(&hb.focus)

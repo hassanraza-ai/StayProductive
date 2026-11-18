@@ -1769,3 +1769,204 @@ fn a_data_04_a_confirmed_reset_clears_rules_and_history_but_keeps_commitments() 
     restarted.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn duplicate_profile_copies_rules_and_refuses_a_clash_or_a_lock() {
+    let (dir, path) = temp_state();
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "block"}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+
+    let copied = service.ok(
+        "duplicate_profile",
+        json!({"profile_id": profile_id, "name": "Focus copy"}),
+    );
+    let profiles = copied["profiles"].as_array().expect("profiles");
+    assert_eq!(profiles.len(), 2);
+    let copy = profiles
+        .iter()
+        .find(|profile| profile["name"] == "Focus copy")
+        .expect("copy");
+    assert_ne!(copy["id"], profile_id);
+    assert_eq!(copy["apps"][0]["key"], "firefox");
+    assert_eq!(copy["apps"][0]["action"], "block");
+
+    let clash = service.request(
+        "duplicate_profile",
+        json!({"profile_id": profile_id, "name": "focus"}),
+    );
+    assert_eq!(clash["ok"], false, "duplicate name: {clash}");
+
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+    service.ok(
+        "start_strict",
+        json!({"minutes": 30, "cooldown_minutes": 5}),
+    );
+    let locked = service.request(
+        "duplicate_profile",
+        json!({"profile_id": profile_id, "name": "Another copy"}),
+    );
+    assert_eq!(locked["ok"], false, "strict session: {locked}");
+    assert!(
+        locked["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("locked") || error.contains("commitment")),
+        "{locked}"
+    );
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pause_for_fifteen_minutes_until_end_of_day_and_until_resume() {
+    let (dir, path) = temp_state();
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "block"}]
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    let paused = service.ok(
+        "pause_profile",
+        json!({"profile_id": profile_id, "minutes": 15}),
+    );
+    let profile = &paused["profiles"][0];
+    assert_eq!(profile["paused"], true);
+    let until = chrono::DateTime::parse_from_rfc3339(
+        profile["paused_until"].as_str().expect("paused until"),
+    )
+    .expect("paused until timestamp")
+    .with_timezone(&chrono::Utc);
+    let expected = chrono::Utc::now() + chrono::TimeDelta::minutes(15);
+    assert!(
+        (until - expected).num_seconds().abs() < 5,
+        "15 minute pause ended at {until}, expected near {expected}"
+    );
+    assert!(
+        policy_apps(&dir.join("enforcement.json")).is_empty(),
+        "a paused profile does not block"
+    );
+
+    service.ok("resume_profile", json!({"profile_id": profile_id}));
+    service.ok(
+        "set_settings",
+        json!({"start_of_day": "04:00", "timezone": "UTC"}),
+    );
+    let today = service.ok(
+        "pause_profile",
+        json!({"profile_id": profile_id, "until_end_of_day": true}),
+    );
+    let until = chrono::DateTime::parse_from_rfc3339(
+        today["profiles"][0]["paused_until"]
+            .as_str()
+            .expect("end of day"),
+    )
+    .expect("end of day timestamp")
+    .with_timezone(&chrono::Utc);
+    let now = chrono::Utc::now();
+    let today_boundary = now.date_naive().and_hms_opt(4, 0, 0).unwrap().and_utc();
+    let boundary = if now < today_boundary {
+        today_boundary
+    } else {
+        today_boundary + chrono::TimeDelta::days(1)
+    };
+    assert_eq!(until, boundary, "rest of today ends at the next 04:00 UTC");
+
+    service.ok("resume_profile", json!({"profile_id": profile_id}));
+    let indefinite = service.ok(
+        "pause_profile",
+        json!({"profile_id": profile_id, "minutes": 0}),
+    );
+    assert_eq!(indefinite["profiles"][0]["paused"], true);
+    assert!(indefinite["profiles"][0]["paused_until"].is_null());
+    let resumed = service.ok("resume_profile", json!({"profile_id": profile_id}));
+    assert_eq!(resumed["profiles"][0]["paused"], false);
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_unlock_records_one_pickup_and_a_reached_limit_blocks() {
+    let (dir, path) = temp_state();
+    let runtime = dir.join("stayproductive");
+    std::fs::create_dir_all(&runtime).expect("runtime directory");
+    let heartbeat = runtime.join("gnome-extension.json");
+
+    let mut service = Service::start(&path);
+    let created = service.ok(
+        "create_profile",
+        json!({
+            "profile": {
+                "name": "Focus",
+                "activation": "manual",
+                "apps": [{"key": "firefox", "action": "daily_limit", "minutes": 600}],
+                "pickup_limit": {"count": 1, "per": "daily"}
+            }
+        }),
+    );
+    let profile_id = created["profiles"][0]["id"]
+        .as_str()
+        .expect("profile id")
+        .to_owned();
+    service.ok("activate_profile", json!({"profile_id": profile_id}));
+
+    write_lock_heartbeat(&heartbeat, true);
+    let locked = service.ok("snapshot", json!({}));
+    assert_eq!(locked["stats"]["today"]["pickups"], 0);
+
+    write_lock_heartbeat(&heartbeat, false);
+    let unlocked = service.ok("snapshot", json!({}));
+    assert_eq!(unlocked["stats"]["today"]["pickups"], 1);
+    let policy = policy_apps(&dir.join("enforcement.json"));
+    assert!(
+        policy
+            .iter()
+            .any(|entry| entry["reason"] == "R-PICKUP" && entry["app"] == "firefox"),
+        "policy after one pickup: {policy:?}"
+    );
+
+    write_lock_heartbeat(&heartbeat, false);
+    let again = service.ok("snapshot", json!({}));
+    assert_eq!(again["stats"]["today"]["pickups"], 1);
+
+    service.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn write_lock_heartbeat(heartbeat: &Path, locked: bool) {
+    let body = json!({
+        "adapter": "gnome-extension",
+        "active": true,
+        "policy_loaded": true,
+        "blocked": false,
+        "focus": ["firefox"],
+        "locked": locked,
+        "suspended": false,
+        "checked_at": chrono::Utc::now().to_rfc3339(),
+    });
+    std::fs::write(heartbeat, body.to_string()).expect("write lock heartbeat");
+}

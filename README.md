@@ -37,7 +37,9 @@ the engine's usage ledger, and a reached limit blocks like any other rule.
 Website host rules and keywords work in Chrome/Chromium through the bundled
 extension (see below): host blocks are applied before the request, and a
 keyword-blocked page is replaced after it commits. Site time limits, in-page
-surfaces, DNS filtering, and non-X11/GNOME compositors are still missing; the
+surfaces, DNS filtering, and non-X11/GNOME compositors are still missing. The
+GNOME extension does not yet report screen lock, so pickups are counted from
+the X11 adapter (and from any heartbeat that includes `locked`). The
 dashboard and Settings page report the adapter state rather than pretending.
 
 ### Implemented today
@@ -73,6 +75,8 @@ dashboard and Settings page report the adapter state rather than pretending.
   attributes intervals to the core usage ledger, and daily/hourly app limits
   enforce for real, even with the GTK window closed. Usage survives restart,
   stops behind the block overlay or a locked session, and drives launch limits.
+A locked-to-unlocked heartbeat counts one pickup, and a reached pickup limit
+blocks with `R-PICKUP`.
 - Stats: today, week, and month screen time; top distractions ranked by time
   with share and previous-period trend; block, pickup, and launch counts; and
   block history with reason codes and end times. The dashboard shows today's
@@ -118,9 +122,9 @@ dashboard and Settings page report the adapter state rather than pretending.
 ### Not implemented yet
 
 Site time limits and in-page surfaces (Shorts/Reels/Stories, adult filtering),
-pickup limits, DNS filtering, non-X11/GNOME compositor adapters, tray
+DNS filtering, non-X11/GNOME compositor adapters, tray
 integration, usage timeline charts, a separate seven-day report, site usage,
-runtime pickup events, low-time notifications, restoring usage counters from a
+low-time notifications, restoring usage counters from a
 backup, full translation catalogs, and manual screen-reader/high-contrast
 verification. Keyword blocking happens after navigation commits because
 `declarativeNetRequest` has no keyword filter, so a frame may paint first; host
@@ -216,8 +220,9 @@ the sandbox. See [`packaging/README.md`](packaging/README.md).
 The extension is optional and local. It enforces application `block` rules,
 application quick blocks, and daily/hourly application usage limits (by
 reporting the focused app so the daemon can attribute foreground time); sites
-and keywords are covered by the browser extension below, while launch and
-pickup limits still need a logind hookup. The daemon keeps refreshing the policy
+and keywords are covered by the browser extension below. Launch limits follow
+foreground entries. Pickup limits follow a heartbeat `locked` edge, which the
+X11 adapter writes; the GNOME extension does not send it yet. The daemon keeps refreshing the policy
 while it runs, including when the window is closed, so enforcement continues
 until the daemon is stopped.
 See [`integrations/gnome/README.md`](integrations/gnome/README.md)

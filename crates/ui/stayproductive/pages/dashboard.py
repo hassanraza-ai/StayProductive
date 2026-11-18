@@ -59,11 +59,7 @@ class DashboardPage:
             on_click=lambda _button: self.window.switch_page("profiles"),
         )
         actions.append(self.primary_action)
-        self.pause_action = w.button(
-            "Pause for 15 min",
-            "media-playback-pause-symbolic",
-            on_click=self._pause_active,
-        )
+        self.pause_action = w.pause_menu(self._pause_active)
         actions.append(self.pause_action)
         actions.append(
             w.button(
@@ -274,7 +270,7 @@ class DashboardPage:
         self.pause_action.set_tooltip_text(
             "Pausing is blocked by the active strict session."
             if pause_blocked
-            else "Pause the active profile for 15 minutes."
+            else "Pause the active profile. It resumes at the time you pick."
         )
 
         enforcement = snapshot.get("enforcement", {})
@@ -400,14 +396,16 @@ class DashboardPage:
         self._enforcement_dismissed = True
         self.enforcement_warning.set_visible(False)
 
-    def _pause_active(self) -> None:
+    def _pause_active(self, minutes: int, until_end_of_day: bool) -> None:
         active = self.window.snapshot.get("active_profiles", [])
         if not active:
             return
         try:
-            self.window.engine.pause_profile(active[0]["id"], 15)
+            self.window.engine.pause_profile(
+                active[0]["id"], minutes, until_end_of_day=until_end_of_day
+            )
             self.window.refresh()
-            self.window.toast("Paused for 15 minutes")
+            self.window.toast(w.pause_toast(minutes, until_end_of_day))
         except Exception as error:  # noqa: BLE001
             self.window.show_error("Could not pause", error_text(error))
 

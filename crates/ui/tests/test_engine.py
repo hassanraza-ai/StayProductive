@@ -207,6 +207,22 @@ class EngineSocketTest(unittest.TestCase):
         self.assertEqual(decision["app"], "browser")
         self.assertNotIn("store", decision)
 
+    def test_duplicate_and_pause_send_the_chosen_fields(self) -> None:
+        engine = self.engine()
+        engine.duplicate_profile("01ARZ3NDEKTSV4RRFFQ69G5FAV", "Focus copy")
+        engine.pause_profile("01ARZ3NDEKTSV4RRFFQ69G5FAV", 15)
+        engine.pause_profile("01ARZ3NDEKTSV4RRFFQ69G5FAV", 0, until_end_of_day=True)
+        engine.pause_profile("01ARZ3NDEKTSV4RRFFQ69G5FAV", 0)
+
+        duplicate, quarter, today, indefinite = self.daemon.requests[-4:]
+        self.assertEqual(duplicate["cmd"], "duplicate_profile")
+        self.assertEqual(duplicate["name"], "Focus copy")
+        self.assertEqual(quarter["minutes"], 15)
+        self.assertNotIn("until_end_of_day", quarter)
+        self.assertIs(today["until_end_of_day"], True)
+        self.assertEqual(indefinite["minutes"], 0)
+        self.assertNotIn("until_end_of_day", indefinite)
+
     def test_reset_sends_confirmation_and_the_current_schema(self) -> None:
         engine = self.engine()
         engine.snapshot()

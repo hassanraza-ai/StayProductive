@@ -22,7 +22,8 @@ extension does the same for native Wayland and XWayland. The observer reports
 the focused app, the daemon attributes foreground intervals to the engine's
 usage ledger, and a reached limit produces a policy entry like any other block.
 It does **not** yet enforce sites system-wide, site time limits, in-page
-surfaces, launch/pickup limits, or other compositors. A Manifest V3 browser
+surfaces, or other compositors. Pickup limits are enforced when a heartbeat
+reports the screen unlocking; the GNOME extension does not yet send that bit. A Manifest V3 browser
 extension is implemented for Chrome/Chromium and Firefox (reviewed, not yet
 loaded there): it applies host rules before the request through
 `declarativeNetRequest`, asks the daemon for every navigation, and replaces a
@@ -34,7 +35,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-PROF-01 | Create, rename, duplicate, delete profiles | P0 | core + SQLite | domain §3 | A-PROF-01 | wip |
+| F-PROF-01 | Create, rename, duplicate, delete profiles | P0 | core + SQLite | domain §3 | A-PROF-01 | done |
 | F-PROF-02 | Activate a profile manually; deactivate it | P0 | D-Bus + UI | sched §6 | A-PROF-02 | wip |
 | F-PROF-03 | Only one manually activated profile at a time | P0 | engine invariant | domain §4 | A-PROF-03 | wip |
 | F-PROF-04 | Profile templates (Focus, Sleep, Detox, Exam, …) | P1 | bundled presets | sched §7 | A-PROF-04 | wip |
@@ -56,7 +57,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | F-LIM-01 | Daily usage limit per app | P0 | event log + counters | block §4 | A-LIM-01 | wip |
 | F-LIM-02 | Hourly usage limit per app | P0 | event log + counters | block §4 | A-LIM-02 | wip |
 | F-LIM-03 | Daily/hourly launch limits | P1 | tracker | block §4 | A-LIM-03 | done |
-| F-LIM-04 | Daily/hourly pickup (unlock) limits | P1 | logind | block §4 | A-LIM-04 | wip |
+| F-LIM-04 | Daily/hourly pickup (unlock) limits | P1 | logind | block §4 | A-LIM-04 | done |
 | F-LIM-05 | Limits survive restart and crash | P0 | persisted events | block §7 | A-LIM-05 | wip |
 | F-LIM-06 | Counter day boundary honours start-of-day | P0 | period calculator | sched §2 | A-LIM-06 | wip |
 | F-LIM-07 | Low-time alerts at thresholds | P1 | notifications | block §8 | A-LIM-07 | todo |
@@ -71,8 +72,8 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | F-SCH-04 | Full-day and one-time/custom windows | P1 | scheduler | sched §3 | A-SCH-04 | wip |
 | F-SCH-05 | Hourly pattern | P1 | scheduler | sched §3 | A-SCH-05 | wip |
 | F-SCH-06 | Start-of-day offset | P0 | period calculator | sched §2 | A-SCH-06 | wip |
-| F-SCH-07 | Pause profile for 1/5/10/15/30 min, 1 h, today | P0 | engine state | sched §5 | A-SCH-07 | wip |
-| F-SCH-08 | Indefinite pause (no duration) | P1 | engine state | sched §5 | A-SCH-08 | wip |
+| F-SCH-07 | Pause profile for 1/5/10/15/30 min, 1 h, today | P0 | engine state | sched §5 | A-SCH-07 | done |
+| F-SCH-08 | Indefinite pause (no duration) | P1 | engine state | sched §5 | A-SCH-08 | done |
 | F-SCH-09 | Extend an active block | P1 | engine state | sched §5 | A-SCH-09 | wip |
 | F-SCH-10 | Schedule change detection (no restart needed) | P0 | scheduler invalidation | sched §4 | A-SCH-10 | wip |
 | F-SCH-11 | Location activation | P2 | GeoClue2 | sched §6 | A-SCH-11 | decision |
@@ -116,7 +117,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | F-STA-02 | Today / week / month totals | P1 | queries | ux §7 | A-STA-02 | done |
 | F-STA-03 | Top distractions ranking | P1 | queries | ux §7 | A-STA-03 | done |
 | F-STA-04 | Usage timeline | P2 | queries + chart | ux §7 | A-STA-04 | todo |
-| F-STA-05 | Pickup and launch counts | P1 | logind/tracker | ux §7 | A-STA-05 | wip |
+| F-STA-05 | Pickup and launch counts | P1 | logind/tracker | ux §7 | A-STA-05 | done |
 | F-STA-06 | Seven-day report and comparison | P2 | report view | ux §7 | A-STA-06 | wip |
 | F-STA-07 | Block/deny history with reasons | P1 | event log | block §7 | A-STA-07 | done |
 | F-STA-08 | Export and delete usage data | P0 | store | ux §8 | A-STA-08 | done |
@@ -187,7 +188,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | Full reset (`F-DATA-04`) | `a_data_04_reset_needs_confirmation_and_strict_commitments_refuse_it` proves an unconfirmed reset is refused, an active commitment blocks the confirmed reset, and rules/quick blocks/settings stay intact; `a_data_04_a_confirmed_reset_clears_rules_and_history_but_keeps_commitments` clears every profile, quick block, and ledger count, restores default clock settings, and proves the reset survives a daemon restart. `test_engine.py` checks the client's `confirm` intent; `test_accessibility.py` checks the Settings page wires the action to a destructive confirmation |
 | Stats ranges (`F-STA-02`) | `a_sta_02_day_week_month_totals_use_the_clock_boundaries` checks today/week/month against a 04:00 start-of-day, week and month boundaries, and DST-length weeks; `stats_report_today_week_month_rankings_and_counts` seeds the real daemon state and checks the snapshot totals add up; the Stats page renders all three ranges |
 | Top distractions (`F-STA-03`) | `a_sta_03_ranking_is_by_time_with_stable_ties` proves ranking order and tie stability; the daemon snapshot carries seconds, share, and previous-period seconds; the Stats page shows the ranked list and trend |
-| Pickups and launches (`F-STA-05`) | `a_sta_05_pickups_and_launches_count_once_per_event` proves one pickup per unlock and one launch per foreground entry; launch counts are persisted, shown in Stats, and drive launch-limit blocks end-to-end. **Pickups have no runtime source yet** because neither adapter heartbeat reports unlock transitions, so the row stays `wip` |
+| Pickups and launches (`F-STA-05`) | `a_sta_05_pickups_and_launches_count_once_per_event` proves one pickup per unlock and one launch per foreground entry. `an_unlock_records_one_pickup_and_a_reached_limit_blocks` writes a locked heartbeat and then an unlocked one against the real daemon: the pickup count rises by one, a second unlocked heartbeat does not add another, and a limit of one produces an `R-PICKUP` policy entry. The X11 adapter already writes `locked`; a heartbeat that omits it is treated as unlocked and does not invent a pickup |
 | Block history (`F-STA-07`) | The stats protocol test seeds a `R-LIMIT-DAILY` block and checks the snapshot history keeps the target, reason, and end time and has no title; the Stats page renders target, reason code, and timestamp |
 | Restore (`F-UX-12`) | `a_clean_install_restores_an_export` exports from one daemon and imports into a second clean one, checking the restored profile, clock settings, and active strict session; a non-archive is refused with no state change; the restore survives restart. Unit tests refuse a newer manifest version and keep the longer active commitment when merging into a used install. Usage counters are **not** re-imported, so the row stays `wip` |
 | Keyboard and a11y (`F-UX-10`) | `crates/ui/tests/test_accessibility.py` starts Xvfb, builds the real window, profile editor, and onboarding dialog with a fake engine, and walks the tree: every control we place has an explicit or native accessible label and is focusable; all six sidebar rows are labelled, described, and switch pages through `<Control>1`…`6`; `<Control>N`/`<Control>?` are bound; the status dot is `PRESENTATION`; reduced motion sets a zero transition. An unlabelled icon button raises at construction. GTK-internal composite controls are excluded |

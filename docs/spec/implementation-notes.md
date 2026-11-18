@@ -309,9 +309,10 @@ top three distractions with a link to Stats.
 Limits: there is no timeline chart or per-hour/per-day bar (`F-STA-04`), and the
 seven-day report is the week range with a trend rather than a separate printable
 report (`F-STA-06` stays `wip`). Site usage is not recorded because no adapter
-reports site intervals. Pickups are stored by the core and shown in Stats, but
-neither adapter heartbeat reports lock/unlock transitions yet, so a real
-session records launches and blocks but no pickups (`F-STA-05` stays `wip`).
+reports site intervals. The X11 heartbeat includes `locked`. The daemon records
+one pickup when that bit falls, and a reached limit is an `R-PICKUP` policy
+entry (`F-STA-05`, `F-LIM-04`). The GNOME extension does not send `locked` yet,
+so a GNOME-only session still records no pickups.
 Evidence: the core acceptance tests cover range boundaries, DST-length weeks,
 ranking ties, and one launch per foreground entry; the daemon protocol test
 seeds a real state file and checks the computed snapshot; the Stats page is
@@ -536,8 +537,9 @@ exporting `DISPLAY`/`XAUTHORITY` into the systemd user manager; importing them
 when autostart is enabled covers the current manager, but a session that never
 exports them will start the daemon without an adapter and report `unavailable`.
 The adapter covers application windows only; sites and keywords still need the
-browser extension. Launch limits are tracked from foreground entries; pickup
-limits have no unlock source. Usage limits and the Stats totals are recorded per
+browser extension. Launch limits are tracked from foreground entries. Pickup
+limits use the heartbeat `locked` bit, which the X11 adapter writes and the
+GNOME extension does not. Usage limits and the Stats totals are recorded per
 application.
 
 ### Browser extension (`F-PLAT-08`, `F-RULE-02`, `F-RULE-03`, `F-CON-06`)
@@ -783,8 +785,9 @@ The engine stores and explains site daily limits, but does not yet decrement
 them because there is no per-site interval tracker (the browser extension must
 first report site visits). Launch limits are enforced by the engine once
 launches are counted, but the extension does not yet report background
-launches, only foreground entries; pickup limits likewise need the
-logind/tracker adapter. Application daily and hourly limits are now enforced
+launches, only foreground entries. A fresh heartbeat whose `locked` bit falls
+records one pickup, and a reached pickup limit is written into the enforcement
+policy as `R-PICKUP`. Application daily and hourly limits are now enforced
 end-to-end through the GNOME extension or the X11 adapter observer. The UI
 labels the rest as configuration rather than claiming they are enforced. Site
 time limits need a per-site interval tracker, in-page surfaces need a content
@@ -817,14 +820,14 @@ only.
 - **D-Bus name and tray/CLI** — the boundary is newline JSON over a Unix socket;
   systemd can own the daemon, but there is no `org.stayproductive.Daemon1` name,
   tray, or CLI yet.
-- **Usage timeline charts, pickup events, notifications, full backup/restore of
+- **Usage timeline charts, notifications, full backup/restore of
   counters, localisation catalogs, manual screen-reader and high-contrast
   verification**. Export and history deletion exist, and profiles, settings, and
   commitments can be restored from an export (see *Data export and deletion*);
   usage counters are exported but not re-imported. Today/week/month totals, top
-  distractions, launch counts, and block history are in Stats; the timeline and
-  a separate seven-day report do not exist, site usage is not tracked, and
-  pickups have no adapter source yet. Keyboard navigation and explicit
+  distractions, launch counts, pickup counts, and block history are in Stats;
+  the timeline and a separate seven-day report do not exist, and site usage is
+  not tracked. Pickups are counted from a heartbeat `locked` edge. Keyboard navigation and explicit
   accessible names are in place (see *Keyboard navigation and screen readers*);
   an Orca pass, real key injection, and contrast-theme review are still manual.
 - **Low-time alerts** (`A-LIM-07` / `A-PLAT-11`).
