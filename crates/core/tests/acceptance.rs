@@ -954,3 +954,205 @@ fn app_rule_launch_limit_can_be_constructed_directly() {
     let _ = CountLimit::new(2, LimitPeriod::Hourly).unwrap();
     let _ = HostPattern::new("example.com").unwrap();
 }
+
+#[test]
+fn a_data_01_sqlite_migration_preserves_profiles_rules_and_history() {
+    use stayproductive_core::{
+        ClockSettings, Commitment, CommitmentKind, DeactivationMethod, QuickBlock, ReasonCode,
+        Restriction, Store,
+    };
+    use std::collections::BTreeSet;
+    use std::fs;
+
+    let dir = std::env::temp_dir().join(format!(
+        "stayproductive-store-{}",
+        stayproductive_core::Ulid::new()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let legacy = dir.join("state.json");
+    let database = dir.join("state.db");
+
+    let mut state = State::fixture();
+    let profile = Profile::new("Focus", thu(8, 0))
+        .unwrap()
+        .block_app("firefox")
+        .unwrap()
+        .daily_limit("social", Duration::from_secs(30 * 60))
+        .unwrap()
+        .allow_app("editor")
+        .unwrap()
+        .block_site("*.example.com")
+        .unwrap()
+        .allow_site("good.example.com")
+        .unwrap()
+        .block_keyword("games")
+        .unwrap()
+        .with_pickup_limit(20, LimitPeriod::Daily)
+        .unwrap()
+        .with_schedule(
+            Schedule::days(
+                stayproductive_core::DayPattern::day(Weekday::Thu),
+                vec![Window::new(time(9, 0), time(17, 0))],
+            )
+            .unwrap(),
+        )
+        .with_priority(7);
+    let profile_id = manual(&mut state, profile, thu(8, 0));
+
+    state
+        .usage
+        .foreground(AppKey::new("social").unwrap(), thu(10, 0));
+    state.usage.close_foreground(thu(10, 12));
+    state.usage.screen_unlocked(thu(10, 13));
+    state.usage.blocked(
+        Target::App(AppKey::new("social").unwrap()),
+        ReasonCode::LimitDaily,
+        thu(10, 14),
+        Some(thu(11, 0)),
+        Some(profile_id),
+    );
+    state.quick_blocks.push(QuickBlock {
+        target: Target::Site(stayproductive_core::Host::new("news.example.com").unwrap()),
+        until: thu(12, 0),
+        created_at: thu(10, 30),
+    });
+    state.extensions.insert(profile_id, thu(18, 0));
+    state.commitments.push(
+        Commitment::new(
+            CommitmentKind::Strict,
+            thu(9, 0),
+            Some(thu(11, 0)),
+            DeactivationMethod::Cooldown(Duration::from_secs(300)),
+        )
+        .with_restrictions(BTreeSet::from([Restriction::BlockEdits])),
+    );
+
+    fs::write(
+        &legacy,
+        serde_json::json!({"version": 1, "state": state}).to_string(),
+    )
+    .unwrap();
+    let before = state.clone();
+
+    let (store, opened) = Store::open(
+        &database,
+        Some(&legacy),
+        State::new(ClockSettings::default()),
+    )
+    .unwrap();
+    assert_eq!(opened.schema_version, stayproductive_core::SCHEMA_VERSION);
+    let backup = opened.imported_from.expect("json import recorded");
+    assert!(backup.exists(), "the old JSON is kept as a backup");
+    assert!(!legacy.exists(), "the JSON is not imported twice");
+    assert!(database.exists());
+    drop(store);
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let rules: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM rules WHERE profile_id = ?1",
+            [profile_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rules, 7, "app, limit, allowlist, site, keyword, pickup");
+    let schedules: i64 = conn
+        .query_row("SELECT COUNT(*) FROM schedules", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(schedules, 1);
+    let intervals: i64 = conn
+        .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(intervals, 1);
+    drop(conn);
+
+    let (_store, reopened) = Store::open(
+        &database,
+        Some(&legacy),
+        State::new(ClockSettings::default()),
+    )
+    .unwrap();
+    assert!(reopened.imported_from.is_none(), "no second import");
+    let restored = reopened.state;
+    assert_eq!(restored.profiles, before.profiles, "every profile and rule");
+    assert_eq!(restored.settings, before.settings);
+    assert_eq!(restored.manual_active, before.manual_active);
+    assert_eq!(restored.commitments, before.commitments);
+    assert_eq!(restored.quick_blocks, before.quick_blocks);
+    assert_eq!(restored.extensions, before.extensions);
+    assert_eq!(restored.usage.intervals(), before.usage.intervals());
+    assert_eq!(restored.usage.launches(), before.usage.launches());
+    assert_eq!(restored.usage.pickups(), before.usage.pickups());
+    assert_eq!(restored.usage.blocks(), before.usage.blocks());
+    assert_eq!(
+        restored.usage.last_heartbeat(),
+        before.usage.last_heartbeat()
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_data_01_a_failed_write_leaves_the_database_unchanged() {
+    use stayproductive_core::{ClockSettings, QuickBlock, Store};
+    use std::fs;
+
+    let dir = std::env::temp_dir().join(format!(
+        "stayproductive-store-{}",
+        stayproductive_core::Ulid::new()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("state.db");
+
+    let (mut store, opened) =
+        Store::open(&database, None, State::new(ClockSettings::default())).unwrap();
+    let mut state = opened.state;
+    state
+        .add_profile(Profile::new("Focus", thu(8, 0)).unwrap())
+        .unwrap();
+    store.save(&state).unwrap();
+
+    // The same target twice violates the primary key inside the transaction.
+    state.quick_blocks.push(QuickBlock {
+        target: Target::App(AppKey::new("firefox").unwrap()),
+        until: thu(9, 0),
+        created_at: thu(8, 0),
+    });
+    state.quick_blocks.push(state.quick_blocks[0].clone());
+    assert!(store.save(&state).is_err(), "the transaction must fail");
+    drop(store);
+
+    let (_store, reopened) =
+        Store::open(&database, None, State::new(ClockSettings::default())).unwrap();
+    assert_eq!(reopened.state.profiles.len(), 1, "the profile survives");
+    assert!(reopened.state.quick_blocks.is_empty(), "no partial write");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_data_01_a_newer_schema_is_refused_instead_of_guessed() {
+    use stayproductive_core::{ClockSettings, Store};
+    use std::fs;
+
+    let dir = std::env::temp_dir().join(format!(
+        "stayproductive-store-{}",
+        stayproductive_core::Ulid::new()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let database = dir.join("state.db");
+    let (store, _opened) =
+        Store::open(&database, None, State::new(ClockSettings::default())).unwrap();
+    drop(store);
+
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    conn.execute(
+        "INSERT INTO schema_version(version, applied_at, note) VALUES (99, 'now', 'future')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let result = Store::open(&database, None, State::new(ClockSettings::default()));
+    assert!(result.is_err(), "a newer schema must not be opened");
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -154,7 +154,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 
 | ID | Behaviour | P | Linux mechanism | Spec | Test | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| F-DATA-01 | Atomic migrations; never lose rules/history | P0 | SQLite | domain §6 | A-DATA-01 | todo |
+| F-DATA-01 | Atomic migrations; never lose rules/history | P0 | SQLite | domain §6 | A-DATA-01 | done |
 | F-DATA-02 | Clock change and DST handled without double counting | P0 | monotonic + wall clock | block §7 | A-DATA-02 | wip |
 | F-DATA-03 | Daemon/UI version skew tolerated | P1 | IPC versioning | arch §8 | A-DATA-03 | todo |
 | F-DATA-04 | Full local reset with confirmation | P1 | store | ux §8 | A-DATA-04 | todo |
@@ -165,7 +165,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | --- | --- |
 | `cargo fmt --check` | pass |
 | `cargo clippy --all-targets -- -D warnings` | pass |
-| `cargo test` | pass, including 35 acceptance tests and the daemon protocol tests |
+| `cargo test` | pass, including 38 acceptance tests and the daemon protocol tests |
 | `cargo build --release -p stayproductive-daemon` | pass |
 | GTK app launch | pass on X11/XWayland with GTK 4 and libadwaita |
 | Dashboard, profiles, schedules, strict, stats, settings | rendered from live daemon state and manually inspected under Xvfb |
@@ -177,6 +177,7 @@ active only when an adapter heartbeat is fresh and has loaded a valid policy.
 | Allowlist override (`F-RULE-04`) | `a_rule_04_allowlist_overrides_a_non_strict_rule` proves an app that is both blocked and allowlisted returns `R-ALLOW`; `allowlisted_app_is_never_put_in_the_enforcement_policy` in `crates/daemon/tests/protocol.rs` creates a blocking profile with an app allowlist, activates it, reports the app as focused, and checks the policy stays empty and no block history is recorded |
 | Launch limits (`F-LIM-03`) | `a_lim_03_launch_limit_ignores_quick_switches_and_blocks_the_third_launch` covers the 5 s anti-thrash window and the third launch; `launch_limit_blocks_from_the_persisted_launch_count` seeds two counted launches, starts the real daemon, and checks a `R-LAUNCH` policy entry ending at the end of the hour |
 | Export and delete (`F-STA-08`) | `export_and_delete_usage_data` in `crates/daemon/tests/protocol.rs` exports a versioned zip, parses its central directory (offsets and CRC), checks the manifest version, profiles, settings, and monthly usage entries, refuses an unconfirmed delete, and proves the deletion survives restart; the archive also opens cleanly in Python's `zipfile`; `test_engine.py` checks the client's `include_usage`/`path`/`confirm` intent; the Stats page shows both actions with a destructive confirmation |
+| SQLite migration (`F-DATA-01`) | `a_data_01_sqlite_migration_preserves_profiles_rules_and_history` writes the old JSON wrapper with profiles, app/site/keyword/allowlist rules, a schedule, a commitment, quick blocks, extensions, intervals, launches, a pickup, and a block, then opens the store: every field round-trips, `schema_version` is 1, the `rules`/`schedules`/`usage_events` projections exist, and the JSON is renamed to a backup. `a_data_01_a_failed_write_leaves_the_database_unchanged` pushes a duplicate quick-block target and proves the transaction rolls back. `a_data_01_a_newer_schema_is_refused_instead_of_guessed` inserts schema 99 and proves the open fails |
 | Stats ranges (`F-STA-02`) | `a_sta_02_day_week_month_totals_use_the_clock_boundaries` checks today/week/month against a 04:00 start-of-day, week and month boundaries, and DST-length weeks; `stats_report_today_week_month_rankings_and_counts` seeds the real daemon state and checks the snapshot totals add up; the Stats page renders all three ranges |
 | Top distractions (`F-STA-03`) | `a_sta_03_ranking_is_by_time_with_stable_ties` proves ranking order and tie stability; the daemon snapshot carries seconds, share, and previous-period seconds; the Stats page shows the ranked list and trend |
 | Pickups and launches (`F-STA-05`) | `a_sta_05_pickups_and_launches_count_once_per_event` proves one pickup per unlock and one launch per foreground entry; launch counts are persisted, shown in Stats, and drive launch-limit blocks end-to-end. **Pickups have no runtime source yet** because neither adapter heartbeat reports unlock transitions, so the row stays `wip` |

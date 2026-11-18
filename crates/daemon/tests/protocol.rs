@@ -156,12 +156,13 @@ fn strict_commitment_locks_rules_and_survives_restart() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path)
-            .expect("state file")
+        let database = path.with_file_name("state.db");
+        let mode = std::fs::metadata(&database)
+            .expect("database file")
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o600, "state file must be private");
+        assert_eq!(mode, 0o600, "database file must be private");
     }
 
     let mut restarted = Service::start(&path);
@@ -579,6 +580,14 @@ fn stats_report_today_week_month_rankings_and_counts() {
     let service = Service::start(&path);
     let mut service = service;
     let snapshot = service.ok("snapshot", json!({}));
+    assert!(
+        snapshot["data_path"]
+            .as_str()
+            .expect("database path")
+            .ends_with("state.db"),
+        "the snapshot reports the SQLite file: {}",
+        snapshot["data_path"]
+    );
     let today = &snapshot["stats"]["today"];
     assert!(
         today["seconds"].as_u64().unwrap() >= 500,

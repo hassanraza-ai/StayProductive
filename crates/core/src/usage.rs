@@ -177,6 +177,42 @@ impl UsageLedger {
         Self::default()
     }
 
+    /// Rebuild a ledger from persisted parts.
+    ///
+    /// The append-only event tail is deliberately not restored: it is a
+    /// bounded debugging aid, not accounting data.
+    pub fn from_persisted(
+        intervals: Vec<UsageInterval>,
+        open: Option<(AppKey, Timestamp)>,
+        launches: Vec<LaunchRecord>,
+        pickups: Vec<Timestamp>,
+        blocks: Vec<BlockRecord>,
+        last_exit: BTreeMap<AppKey, Timestamp>,
+        last_heartbeat: Option<Timestamp>,
+    ) -> Self {
+        Self {
+            intervals,
+            open: open.map(|(app, start)| OpenForeground { app, start }),
+            launches,
+            pickups,
+            blocks,
+            events: Vec::new(),
+            last_exit,
+            last_heartbeat,
+            next_event_id: 0,
+        }
+    }
+
+    /// The open foreground interval, if one is being tracked.
+    pub fn open_foreground(&self) -> Option<(&AppKey, Timestamp)> {
+        self.open.as_ref().map(|open| (&open.app, open.start))
+    }
+
+    /// When each application last left the foreground.
+    pub fn last_exits(&self) -> &BTreeMap<AppKey, Timestamp> {
+        &self.last_exit
+    }
+
     /// All closed intervals.
     pub fn intervals(&self) -> &[UsageInterval] {
         &self.intervals

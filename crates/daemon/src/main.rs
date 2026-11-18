@@ -1,8 +1,9 @@
 //! The StayProductive local state service.
 //!
-//! The daemon owns the core `State` and persists it atomically as JSON under
-//! `$XDG_DATA_HOME/stayproductive/state.json`. It speaks newline-delimited JSON:
-//! one request per line and one response per line.
+//! The daemon owns the core `State` and persists it in SQLite under
+//! `$XDG_DATA_HOME/stayproductive/state.db` (an older `state.json` is imported
+//! once). It speaks newline-delimited JSON: one request per line and one
+//! response per line.
 //!
 //! Two transports are supported:
 //!
@@ -30,30 +31,25 @@ use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use stayproductive_core::{
     Activation, AppKey, AppRule, ClockSettings, Commitment, CommitmentKind, CountLimit, DateRange,
     DayPattern, DeactivationMethod, Event, HostPattern, HourlyPattern, Keyword, LimitPeriod,
     PauseReason, Profile, ProfileId, ReasonCode, Restriction, RuleSet, Schedule, SiteAction, State,
-    Target, Timestamp, UsageLedger, Window, day_period, decide, month_period, week_period,
+    Store, Target, Timestamp, UsageLedger, Window, day_period, decide, month_period, week_period,
 };
 
 mod export;
 
 type DResult<T> = Result<T, String>;
 
-const FORMAT_VERSION: u32 = 1;
-
-#[derive(Serialize, Deserialize)]
-struct Persisted {
-    version: u32,
-    state: State,
-}
-
 struct Daemon {
     state: State,
+    /// The legacy JSON path, kept for the socket name and for the UI's
+    /// `state_path` field. The database lives beside it.
     path: PathBuf,
+    store: Store,
     shutdown: bool,
     /// Apps present in the last written policy, to record newly engaged
     /// blocks in the usage history.
@@ -356,27 +352,14 @@ fn state_path() -> PathBuf {
     data_home.join("stayproductive/state.json")
 }
 
-fn load_state(path: &Path) -> State {
-    let Ok(text) = fs::read_to_string(path) else {
-        return fresh_state();
-    };
-    match serde_json::from_str::<Persisted>(&text) {
-        Ok(persisted) if persisted.version == FORMAT_VERSION => persisted.state,
-        Ok(_) => {
-            backup(path);
-            fresh_state()
-        }
-        Err(error) => {
-            eprintln!("stayproductive: state file is invalid: {error}");
-            backup(path);
-            fresh_state()
-        }
+/// The SQLite path beside the historical JSON path.
+fn database_path(state: &Path) -> PathBuf {
+    if let Ok(path) = env::var("STAYPRODUCTIVE_DB")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
     }
-}
-
-fn backup(path: &Path) {
-    let backup = path.with_extension(format!("invalid-{}.json", Utc::now().timestamp()));
-    let _ = fs::rename(path, backup);
+    state.with_file_name("state.db")
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> DResult<()> {
@@ -820,13 +803,36 @@ fn system_timezone() -> Tz {
 
 impl Daemon {
     fn new(path: PathBuf) -> Self {
-        let mut state = load_state(&path);
+        let database = database_path(&path);
+        let (store, opened) = match Store::open(&database, Some(&path), fresh_state()) {
+            Ok(value) => value,
+            Err(error) => {
+                // Starting empty on a corrupt or newer database would quietly
+                // drop rules and could weaken enforcement. Refuse instead.
+                eprintln!(
+                    "stayproductive-daemon: cannot open {}: {error}",
+                    database.display()
+                );
+                std::process::exit(1);
+            }
+        };
+        if let Some(imported) = &opened.imported_from {
+            eprintln!(
+                "stayproductive-daemon: imported {} into {} (schema {}); old file kept at {}",
+                path.display(),
+                database.display(),
+                opened.schema_version,
+                imported.display()
+            );
+        }
+        let mut state = opened.state;
         // A crash can leave a foreground interval open; close it at the last
         // heartbeat so restored usage is never over-counted.
         state.recover();
         Self {
             state,
             path,
+            store,
             shutdown: false,
             policy_apps: BTreeSet::new(),
             policy_seeded: false,
@@ -837,6 +843,7 @@ impl Daemon {
         json!({
             "event": "ready",
             "state_path": self.path.display().to_string(),
+            "data_path": self.store.path().display().to_string(),
         })
         .to_string()
     }
@@ -1296,13 +1303,8 @@ impl Daemon {
         recorded
     }
 
-    fn persist(&self) -> DResult<()> {
-        let payload = Persisted {
-            version: FORMAT_VERSION,
-            state: self.state.clone(),
-        };
-        let encoded = serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?;
-        write_private(&self.path, &encoded)
+    fn persist(&mut self) -> DResult<()> {
+        self.store.save(&self.state).map_err(|e| e.to_string())
     }
 
     fn policy_path(&self) -> PathBuf {
@@ -1489,6 +1491,7 @@ impl Daemon {
             "stats": self.stats(now),
             "enforcement": enforcement,
             "state_path": self.path.display().to_string(),
+            "data_path": self.store.path().display().to_string(),
         })
     }
 

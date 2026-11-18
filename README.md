@@ -20,9 +20,9 @@ resources, or assets from the reference app are included or licensed.
 | Behavioural analysis (static) | complete, see `docs/parity/` |
 | Product specification | complete for P0/P1, see `docs/spec/` |
 | Linux architecture | decided, see `docs/architecture/` |
-| Core engine | **implemented** — profiles, rules, limits, schedules, commitments, 32 acceptance scenarios |
-| Local state service | **implemented** — versioned atomic JSON, profiles, quick blocks, strict cool-down, settings |
-| Desktop UI | **implemented** — dashboard, profiles and editor, schedules, strict session, activity, settings |
+| Core engine | **implemented** — profiles, rules, limits, schedules, commitments, 38 acceptance scenarios |
+| Local state service | **implemented** — SQLite with forward migrations, profiles, quick blocks, strict cool-down, settings |
+| Desktop UI | **implemented** — dashboard, profiles and editor, schedules, strict session, stats, settings |
 | Desktop enforcement | **implemented for GNOME app windows** — opt-in Shell extension covering app blocks, quick blocks, and daily/hourly app usage limits; sites, keywords, and other compositors remain |
 | Runtime parity verification | impossible against the reference without a device; parity is defined by the acceptance suite |
 
@@ -46,14 +46,14 @@ and Settings page report the adapter state rather than pretending.
   (`stayproductive.service`, `Restart=always`) restarts a killed daemon, and
   Settings offers opt-in autostart. The unit is written per user; nothing is
   enabled without an explicit action.
-- Versioned state at
-  `$XDG_DATA_HOME/stayproductive/state.json` (fallback
-  `~/.local/share/stayproductive/state.json`), written atomically with mode
-  `0600`, parent directory `0700`.
+- SQLite state at `$XDG_DATA_HOME/stayproductive/state.db` (fallback
+  `~/.local/share/stayproductive/state.db`), with WAL, `0600` mode, and a
+  `0700` parent. A pre-SQLite `state.json` is imported once and kept as a
+  timestamped backup; migrations are numbered and transactional.
 - GTK 4 + libadwaita UI: dashboard, profile CRUD and editor (installed-app
   chooser by display name, sites, keywords, allowlists, limits, pickup limits,
   six schedule kinds), schedules, quick blocks, strict sessions with a real
-  cool-down, activity, and settings.
+  cool-down, stats, and settings.
 - Keyboard and screen-reader support: Control+1…6 switch pages in sidebar
   order, Control+N creates a profile, Control+? lists every shortcut; icon-only
   buttons and sidebar rows carry explicit accessible names, the decorative
@@ -95,11 +95,10 @@ and Settings page report the adapter state rather than pretending.
 ### Not implemented yet
 
 Website and keyword enforcement, the browser extension, site time limits,
-launch/pickup limits, non-GNOME compositor adapters, tray integration, DNS
-helper, SQLite history/migrations, usage timeline charts, a separate seven-day
-report, site usage, runtime pickup events, low-time notifications, restoring
-usage counters from a backup, full translation catalogs, and manual
-screen-reader/high-contrast verification.
+pickup limits, non-GNOME compositor adapters, tray integration, DNS helper,
+usage timeline charts, a separate seven-day report, site usage, runtime pickup
+events, low-time notifications, restoring usage counters from a backup, full
+translation catalogs, and manual screen-reader/high-contrast verification.
 Notifications and the DNS helper are listed in
 onboarding but deliberately unavailable, so nothing is enabled by clicking
 through the wizard. Autostart is implemented through the systemd user unit, but
@@ -116,12 +115,15 @@ Prerequisites: Rust stable, Python 3.10+, PyGObject, GTK 4, and libadwaita 1.
 ```
 
 The launcher builds the release state service if needed, starts or connects to
-the background daemon, then opens the GTK window. To use a different state file
-(for testing or a portable profile):
+the background daemon, then opens the GTK window. To use a different data
+location (for testing or a portable profile), point `STAYPRODUCTIVE_STATE` at
+the file name; the database is created beside it:
 
 ```sh
-STAYPRODUCTIVE_STATE=/tmp/stayproductive-test.json ./stayproductive
+STAYPRODUCTIVE_STATE=/tmp/stayproductive-test/state.json ./stayproductive
 ```
+
+`STAYPRODUCTIVE_DB` overrides the database path directly.
 
 Closing the window no longer stops blocking: the daemon stays connected to the
 same socket below `$XDG_RUNTIME_DIR/stayproductive/`. Relaunching reuses it. To
@@ -135,12 +137,12 @@ If you started it without systemd, send `shutdown` over the socket or kill the
 `stayproductive-daemon --socket` process; it removes its socket on exit. The
 state is persisted either way. There is no account, network call, or telemetry.
 
-Custom state files get a hashed socket name so a test instance never talks to the
+Custom data paths get a hashed socket name so a test instance never talks to the
 login daemon. `STAYPRODUCTIVE_SOCKET` overrides the socket path entirely.
 
 Autostart is opt-in: turn on **Settings → Background service → Start at login**,
 or choose **Set up** in the onboarding capability step. It requires a running
-systemd user manager and the default data file, and reports why it is
+systemd user manager and the default data path, and reports why it is
 unavailable otherwise.
 
 On a clean state the first-run wizard opens automatically and offers a goal-based
@@ -302,9 +304,10 @@ equivalent exists, the spec says so instead of pretending. See
 ## Implementation stack
 
 - **Core**: Rust, no runtime, no desktop dependency.
-- **Local state service**: Rust binary that owns `State` and persists versioned
-  JSON atomically. The desktop transport is newline-delimited JSON over a
-  same-user Unix socket, owned by a systemd user unit; stdio remains for tests.
+- **Local state service**: Rust binary that owns `State` and persists it in
+  SQLite with transactional, forward-only migrations. The desktop transport is
+  newline-delimited JSON over a same-user Unix socket, owned by a systemd user
+  unit; stdio remains for tests.
   The D-Bus surface in the architecture document replaces it without moving
   decision logic out of `core`.
 - **Desktop UI**: GTK 4 + libadwaita through PyGObject. The Python layer only
@@ -318,10 +321,10 @@ equivalent exists, the spec says so instead of pretending. See
 - **Packaging**: the systemd user unit is written by the app today; Flatpak (user
   mode, no system-wide blocking), `.deb`, `.rpm`, and Arch packages are planned.
 
-The architecture document still specifies SQLite, D-Bus, and gtk-rs as the
-target M1 stack. The runnable build uses JSON and PyGObject as a deliberate,
-documented first step; both are behind the same daemon boundary and can be
-replaced without changing the core engine.
+The architecture document still specifies D-Bus and gtk-rs as the target M1
+stack. The runnable build uses newline JSON over a Unix socket and PyGObject as
+a deliberate, documented first step; both are behind the same daemon boundary
+and can be replaced without changing the core engine.
 
 All features are free. There is no paywall, account requirement, telemetry, or
 cloud dependency; sync and accountability are optional and self-hostable.

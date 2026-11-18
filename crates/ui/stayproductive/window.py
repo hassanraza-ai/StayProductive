@@ -388,7 +388,7 @@ class MainWindow(Adw.ApplicationWindow):
         about.present(self)
 
     def _copy_data_path(self) -> None:
-        path = self.snapshot.get("state_path")
+        path = self.snapshot.get("data_path") or self.snapshot.get("state_path")
         if not path:
             return
         clipboard = self.get_display().get_clipboard()

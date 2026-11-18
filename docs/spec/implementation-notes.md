@@ -2,11 +2,10 @@
 
 Status: **M0 core implemented; runnable local UI and autonomous state service.**
 The pure engine, scheduler, period calculator, usage ledger, and domain model
-live in `crates/core`. `crates/daemon` owns state, persists it atomically as
-JSON, and runs behind a same-user Unix socket under a systemd user unit.
-`crates/ui` is a GTK 4 + libadwaita front end. Desktop adapters beyond GNOME,
-SQLite, and D-Bus are not implemented yet; those are tracked in the parity
-matrix.
+live in `crates/core`. `crates/daemon` owns state, persists it in SQLite, and
+runs behind a same-user Unix socket under a systemd user unit. `crates/ui` is a
+GTK 4 + libadwaita front end. Desktop adapters beyond GNOME and D-Bus are not
+implemented yet; those are tracked in the parity matrix.
 
 These notes record decisions the existing specs left implicit. Anything marked
 **TODO(spec)** is deliberately unfinished and must not be read as implemented.
@@ -110,17 +109,38 @@ through systemd when that is manageable, otherwise it spawns a detached session
 `systemctl --user stop stayproductive.service` or a `shutdown` request; the
 daemon removes its socket on exit.
 
-Persistence is deliberately simpler than the target SQLite store:
+### Persistence and migrations (`F-DATA-01`)
 
-- `$STAYPRODUCTIVE_STATE`, then
-  `$XDG_DATA_HOME/stayproductive/state.json`, then
-  `$HOME/.local/share/stayproductive/state.json`;
-- `{"version":1,"state":{...}}` wrapper;
-- write to a sibling `json.tmp`, set mode `0600`, then rename over the target;
-- parent directory created and set to `0700` on Unix;
-- a newer or unreadable wrapper is renamed to `state.invalid-<timestamp>.json`
-  and a fresh state starts. This preserves the bytes but is not yet a user-facing
-  migration/repair flow, so it remains a TODO.
+`state.db` lives beside the historical `state.json`, under
+`$XDG_DATA_HOME/stayproductive` unless `$STAYPRODUCTIVE_STATE` points at a
+different file. `$STAYPRODUCTIVE_DB` can override the database path for tests
+and portable instances. The database runs in WAL mode with `synchronous=FULL`
+and foreign keys on; the file is `0600` and its directory `0700` on Unix.
+
+Schema 1 has `schema_version`, `settings`, `profiles`, `rules`, `schedules`,
+`commitments`, `quick_blocks`, `extensions`, `usage_events`, `usage_launches`,
+`usage_pickups`, `usage_blocks`, `usage_meta`, `meta`, and `audit_log`.
+Profiles and commitments are stored as their serialized domain value so a round
+trip cannot drop a field. `rules`, `schedules`, and the usage tables are written
+in the same transaction as projections; the engine still reads the serialized
+value. The separate `challenges`, `saved_qr`, `pauses`, `breaks`, and
+`usage_hourly` tables from the target schema are not created until the features
+that fill them exist. A clean-shutdown `state.json` recovery snapshot is also
+still missing; the database is the only persisted copy.
+
+Every save deletes and rewrites the projections in one transaction, so a
+constraint failure leaves the previous state intact. Migrations are
+forward-only. Before an upgrade the database file is copied to
+`state.v<old>-<timestamp>.backup`; a database whose `schema_version` is newer
+than the build is refused rather than opened with unknown columns, and the
+daemon exits instead of starting empty.
+
+The previous build wrote `{"version":1,"state":{...}}` to `state.json`. On the
+first SQLite start the daemon imports it in the same transaction that creates
+the schema, records the step in `audit_log`, and renames the JSON to
+`state.migrated-<timestamp>.json` so it can never be imported twice. An
+unreadable legacy file is left in place for manual recovery and a fresh state
+starts.
 
 The service has no network listener, no root privileges, and no D-Bus name yet.
 Those belong to M1. Keeping the transport narrow makes the transition to D-Bus a
@@ -652,8 +672,10 @@ largest missing pieces.
   TODO(spec).
 - **Content surfaces** (`A-CON-01`…`A-CON-05`) — the engine has no surface rule
   set or surface matching yet.
-- **SQLite persistence, migrations, and history** (`F-DATA-01`) — the current
-  store is versioned JSON with atomic replace; it has no queryable ledger yet.
+- **Remaining SQLite target tables** — `challenges`, `saved_qr`, `pauses`,
+  `breaks`, and `usage_hourly` are not separate tables yet, and a clean-shutdown
+  `state.json` checksum snapshot is not written. The ledger itself is queryable
+  in `usage_events`, `usage_launches`, `usage_pickups`, and `usage_blocks`.
 - **Desktop enforcement beyond X11 and GNOME** — the supervised X11 adapter and
   the GNOME extension cover application windows only; sway/i3, Hyprland, KWin,
   website, keyword, and site-limit enforcement still need adapters. The UI

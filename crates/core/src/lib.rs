@@ -15,6 +15,7 @@ pub mod ids;
 pub mod period;
 pub mod reason;
 pub mod schedule;
+pub mod store;
 pub mod time;
 pub mod usage;
 
@@ -34,6 +35,7 @@ pub use reason::ReasonCode;
 pub use schedule::{
     DateRange, DayPattern, HourlyPattern, Schedule, ScheduleKind, ScheduleStatus, Window,
 };
+pub use store::{Opened, SCHEMA_VERSION, Store};
 pub use time::Timestamp;
 pub use usage::{
     BlockRecord, EventSource, LaunchRecord, UsageEvent, UsageInterval, UsageKind, UsageLedger,
